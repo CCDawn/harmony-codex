@@ -284,6 +284,7 @@ struct Index {
 
   private sessionScroller: Scroller = new Scroller();
   private sessionScrollGeneration: number = 0;
+  private historyScrollAnchorKey: string = '';
   private pollTimer: number = -1;
   private dashboardTimer: number = -1;
   private desktopMonitorTimer: number = -1;
@@ -979,7 +980,7 @@ struct Index {
             .height(12)
             .color(this.themeColor('#1F6FEB'))
         } else {
-          Text(this.modelShortLabel(this.sessionModel))
+          Text(this.modelHeaderLabel())
             .fontSize(this.scaledFontSize(11))
             .fontWeight(FontWeight.Bold)
             .fontColor(this.themeColor('#17202A'))
@@ -996,7 +997,7 @@ struct Index {
       .justifyContent(FlexAlign.Center)
       .alignItems(VerticalAlign.Center)
     }
-      .width(166)
+      .width(132)
       .height(30)
       .backgroundColor(this.reasoningEffortMenuVisible ? this.themeColor('#EAF2FF') : this.themeColor('#FFFFFF'))
       .border({ width: 1, color: this.reasoningEffortMenuVisible ? this.themeColor('#BBD2FF') : this.themeColor('#DDE3EA') })
@@ -1012,6 +1013,7 @@ struct Index {
 
   @Builder
   ReasoningEffortMenu() {
+    Scroll() {
     Column({ space: 8 }) {
       Text('模型')
         .fontSize(this.scaledFontSize(11))
@@ -1100,14 +1102,23 @@ struct Index {
           })
       }, (effort: string) => effort.length > 0 ? effort : 'auto')
     }
-    .width(226)
+    .width('100%')
     .padding(8)
+    }
+    .width(226)
+    .constraintSize({ maxHeight: Math.max(120, this.sessionWindowHeightVp() - 120) })
+    .scrollBar(BarState.Auto)
     .backgroundColor(this.themeColor('#FFFFFF'))
     .border({ width: 1, color: this.themeColor('#DDE3EA') })
     .borderRadius(14)
     .shadow({ radius: 14, color: this.themeColor('#1F232824'), offsetX: 0, offsetY: 5 })
     .margin({ top: 42, right: 0 })
     .zIndex(9)
+  }
+
+  private modelHeaderLabel(): string {
+    if (this.normalizeModel(this.sessionModel).length === 0) { return '自动'; }
+    return this.modelShortLabel(this.sessionModel).replace(/^GPT-[0-9.]+-/i, '').replace(/^GPT-/i, '');
   }
 
   @Builder
@@ -1841,29 +1852,34 @@ struct Index {
               .fontSize(this.scaledFontSize(14))
               .fontWeight(FontWeight.Medium)
               .fontColor(this.themeColor('#17202A'))
-            Scroll(this.sessionScroller) {
-              Column({ space: 3 }) {
-                ForEach(this.visibleNewSessionEntries(), (entry: CodexSessionEntry) => {
-                  this.SessionEntryCard(entry)
-                }, (entry: CodexSessionEntry) => this.sessionEntryKey(entry))
-                ForEach(this.visibleOptimisticSessionMessages(), (message: OptimisticSessionMessage) => {
-                  this.OptimisticSessionMessageCard(message)
-                }, (message: OptimisticSessionMessage) => message.id)
-                ForEach(this.visibleFailedSessionMessages(), (message: FailedSessionMessage) => {
-                  this.FailedSessionMessageCard(message)
-                }, (message: FailedSessionMessage) => message.id)
+            Stack({ alignContent: Alignment.BottomEnd }) {
+              Scroll(this.sessionScroller) {
+                Column({ space: 3 }) {
+                  ForEach(this.visibleNewSessionEntries(), (entry: CodexSessionEntry) => {
+                    this.SessionEntryCard(entry)
+                  }, (entry: CodexSessionEntry) => this.sessionEntryKey(entry))
+                  ForEach(this.visibleOptimisticSessionMessages(), (message: OptimisticSessionMessage) => {
+                    this.OptimisticSessionMessageCard(message)
+                  }, (message: OptimisticSessionMessage) => message.id)
+                  ForEach(this.visibleFailedSessionMessages(), (message: FailedSessionMessage) => {
+                    this.FailedSessionMessageCard(message)
+                  }, (message: FailedSessionMessage) => message.id)
+                }
+                .width('100%')
               }
-              .width('100%')
+              .height('100%')
+              .scrollBar(BarState.Auto)
+              .edgeEffect(EdgeEffect.Spring)
+              .onWillScroll((xOffset: number, yOffset: number, scrollState: ScrollState, scrollSource: ScrollSource) => {
+                this.handleSessionWillScroll(yOffset, scrollSource);
+              })
+              .onScrollEdge((edge: Edge) => {
+                this.handleSessionScrollEdge(edge);
+              })
+              this.SessionJumpToBottomButton()
             }
             .layoutWeight(1)
-            .scrollBar(BarState.Auto)
-            .edgeEffect(EdgeEffect.Spring)
-            .onWillScroll((xOffset: number, yOffset: number, scrollState: ScrollState, scrollSource: ScrollSource) => {
-              this.handleSessionWillScroll(yOffset, scrollSource);
-            })
-            .onScrollEdge((edge: Edge) => {
-              this.handleSessionScrollEdge(edge);
-            })
+            .width('100%')
           }
           .layoutWeight(1)
           .width('100%')
@@ -1919,30 +1935,41 @@ struct Index {
         .justifyContent(FlexAlign.Center)
         .alignItems(HorizontalAlign.Center)
       } else {
-        Scroll(this.sessionScroller) {
-          Column({ space: 3 }) {
-            this.SessionHistoryLoader()
-            ForEach(this.visibleSessionEntries(), (entry: CodexSessionEntry) => {
-              this.SessionEntryCard(entry)
-            }, (entry: CodexSessionEntry) => this.sessionEntryKey(entry))
-            ForEach(this.visibleOptimisticSessionMessages(), (message: OptimisticSessionMessage) => {
-              this.OptimisticSessionMessageCard(message)
-            }, (message: OptimisticSessionMessage) => message.id)
-            ForEach(this.visibleFailedSessionMessages(), (message: FailedSessionMessage) => {
-              this.FailedSessionMessageCard(message)
-            }, (message: FailedSessionMessage) => message.id)
+        Stack({ alignContent: Alignment.BottomEnd }) {
+          Scroll(this.sessionScroller) {
+            Column({ space: 3 }) {
+              this.SessionHistoryLoader()
+              ForEach(this.visibleSessionEntries(), (entry: CodexSessionEntry) => {
+                Column() {
+                  this.SessionEntryCard(entry)
+                }
+                .width('100%')
+                .onAreaChange((oldArea: Area, newArea: Area) => {
+                  this.restoreHistoryScrollAnchor(this.sessionEntryKey(entry), oldArea, newArea);
+                })
+              }, (entry: CodexSessionEntry) => this.sessionEntryKey(entry))
+              ForEach(this.visibleOptimisticSessionMessages(), (message: OptimisticSessionMessage) => {
+                this.OptimisticSessionMessageCard(message)
+              }, (message: OptimisticSessionMessage) => message.id)
+              ForEach(this.visibleFailedSessionMessages(), (message: FailedSessionMessage) => {
+                this.FailedSessionMessageCard(message)
+              }, (message: FailedSessionMessage) => message.id)
+            }
+            .width('100%')
           }
-          .width('100%')
+          .height('100%')
+          .scrollBar(BarState.Auto)
+          .edgeEffect(EdgeEffect.Spring)
+          .onWillScroll((xOffset: number, yOffset: number, scrollState: ScrollState, scrollSource: ScrollSource) => {
+            this.handleSessionWillScroll(yOffset, scrollSource);
+          })
+          .onScrollEdge((edge: Edge) => {
+            this.handleSessionScrollEdge(edge);
+          })
+          this.SessionJumpToBottomButton()
         }
         .layoutWeight(1)
-        .scrollBar(BarState.Auto)
-        .edgeEffect(EdgeEffect.Spring)
-        .onWillScroll((xOffset: number, yOffset: number, scrollState: ScrollState, scrollSource: ScrollSource) => {
-          this.handleSessionWillScroll(yOffset, scrollSource);
-        })
-        .onScrollEdge((edge: Edge) => {
-          this.handleSessionScrollEdge(edge);
-        })
+        .width('100%')
 
         if (this.shouldShowSessionFloatingStatus()) {
           this.SessionFloatingStatusPanel()
@@ -1954,6 +1981,33 @@ struct Index {
     .layoutWeight(1)
     .width('100%')
     .height('100%')
+  }
+
+  @Builder
+  SessionJumpToBottomButton() {
+    if (!this.sessionAutoFollowBottom) {
+      Button() {
+        Row({ space: 6 }) {
+          Text('↓')
+            .fontSize(this.scaledFontSize(20))
+            .fontColor(this.themeColor('#1F6FEB'))
+          Text('回到底部')
+            .fontSize(this.scaledFontSize(13))
+            .fontColor(this.themeColor('#17202A'))
+        }
+        .padding({ left: 14, right: 14 })
+      }
+      .height(44)
+      .backgroundColor(this.themeColor('#FFFFFF'))
+      .border({ width: 1, color: this.themeColor('#DDE3EA') })
+      .borderRadius(22)
+      .margin({ right: 12, bottom: 12 })
+      .accessibilityText('回到底部，跟随最新消息')
+      .onClick(() => {
+        this.scrollSessionToBottom(0);
+        this.log('info', 'ui.session_scroll.jump_to_bottom', 'source=button');
+      })
+    }
   }
 
   @Builder
@@ -6062,6 +6116,7 @@ struct Index {
   }
 
   private scrollSessionToBottom(delayMs: number = 50): void {
+    this.historyScrollAnchorKey = '';
     this.sessionAutoFollowBottom = true;
     const generation = this.bumpSessionScrollGeneration();
     [delayMs, delayMs + 180, delayMs + 520, delayMs + 1050, delayMs + 1800].forEach((delay: number) => {
@@ -6158,6 +6213,9 @@ struct Index {
         hasMoreAfter: current.sync?.hasMoreAfter ?? older.sync.hasMoreAfter,
         entryCount: entries.length
       } : current.sync;
+      const visibleEntries = this.visibleSessionEntries();
+      this.historyScrollAnchorKey = entries.length > current.entries.length && visibleEntries.length > 0
+        ? this.sessionEntryKey(visibleEntries[0]) : '';
       this.selectedSession = this.sessionDetailWithEntries(current, entries, mergedSync);
       this.log(
         'info',
@@ -6174,6 +6232,16 @@ struct Index {
     } finally {
       this.isLoadingOlderSessionEntries = false;
     }
+  }
+
+  private restoreHistoryScrollAnchor(key: string, oldArea: Area, newArea: Area): void {
+    if (this.historyScrollAnchorKey !== key) {
+      return;
+    }
+    const delta = Number(newArea.position.y) - Number(oldArea.position.y);
+    this.historyScrollAnchorKey = '';
+    this.sessionScroller.scrollBy(0, delta);
+    this.log('info', 'session.history.anchor_restored', `delta=${delta}`);
   }
 
   private mergeSessionDetailPreservingHistory(
@@ -8114,13 +8182,14 @@ struct Index {
       const system: SystemRepairStatus = await BridgeClient.repairSystemLink(this.normalizedBridgeUrl(), this.bridgeToken, targetSessionId, 'hard', true);
       this.applySystemRepairStatus(system, targetSessionId);
       const status = system.desktop;
-      this.message = status?.desktopLive ? 'Codex 已重启并恢复链路' : this.systemRepairMessageText(system);
+      const restarted = system.repairMode === 'hard' && system.repaired === true && status?.desktopLive === true;
+      this.message = restarted ? 'Codex 已重启并恢复链路' : this.systemRepairMessageText(system);
       this.log(status?.desktopLive ? 'info' : 'warn', 'system.repair.hard_completed', `source=${source}; action=${system.recommendedAction ?? ''}; mode=${system.repairMode ?? ''}; repaired=${system.repaired === true}; desktopLive=${status?.desktopLive === true}; state=${this.desktopLiveState}; cdpPort=${this.desktopLiveCdpPort}; reason=${this.desktopLiveReason}`);
       await this.refreshDashboard(true);
       if (this.selectedSession !== null) {
         await this.loadSessionDetail(this.selectedSession.id);
       }
-      return status?.desktopLive === true;
+      return restarted;
     } catch (error) {
       this.message = `重启 Codex 失败：${this.errorText(error)}`;
       this.log('error', 'system.repair.hard_failed', `source=${source}; message=${this.errorText(error)}`);

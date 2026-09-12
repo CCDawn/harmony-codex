@@ -401,10 +401,10 @@ test('automatic reasoning effort displays the desktop default strength', () => {
   assert.match(sourceText, /@State availableModels: CodexModelOption\[\] = \[\]/);
   assert.match(sourceText, /@State desktopDefaultReasoningEffort: string = ''/);
   assert.match(sourceText, /BridgeClient\.getCodexSettings/);
-  assert.match(headerButtonBody, /Text\(this\.modelShortLabel\(this\.sessionModel\)\)/);
+  assert.match(headerButtonBody, /Text\(this\.modelHeaderLabel\(\)\)/);
   assert.match(headerButtonBody, /· \$\{this\.reasoningEffortShortLabel\(this\.sessionReasoningEffort\)\}/);
   assert.doesNotMatch(headerButtonBody, /思考·/);
-  assert.match(headerButtonBody, /\.width\(166\)/);
+  assert.match(headerButtonBody, /\.width\(132\)/);
   assert.doesNotMatch(headerButtonBody, /Text\('思'\)/);
   assert.match(shortLabelBody, /this\.normalizeReasoningEffort\(value\)/);
   assert.match(shortLabelBody, /this\.desktopDefaultReasoningEffort/);
@@ -1103,6 +1103,37 @@ test('refreshing a recent page with a wider snapshot keeps latest messages at th
   assert.deepEqual(merge(history.slice(0, 80), history.slice(80)), history);
 });
 
+test('phone only reports restart success after an executed hard repair', async () => {
+  const body = methodBody('repairDesktopLiveHardFromPhone');
+  for (const repaired of [false, true]) {
+    const system = { repairMode: 'hard', repaired, desktop: { desktopLive: true } };
+    const run = new Function('BridgeClient', `${stripTypeScriptTypes(`async function run(source) {${body}}`)}; return run;`)({
+      async repairSystemLink() { return system; }
+    });
+    const state = { desktopLiveRestarting: false, isNewSessionDraft: true, selectedSession: null,
+      normalizedBridgeUrl() { return ''; }, log() {}, applySystemRepairStatus() {},
+      systemRepairMessageText() { return '本次未执行重启'; }, async refreshDashboard() {} };
+    assert.equal(await run.call(state, 'test'), repaired);
+    assert.equal(state.message, repaired ? 'Codex 已重启并恢复链路' : '本次未执行重启');
+    assert.equal(state.desktopLiveRestarting, false);
+  }
+});
+
+test('prepending history compensates the retained message displacement exactly once', () => {
+  const body = methodBody('restoreHistoryScrollAnchor');
+  const restore = new Function(`${stripTypeScriptTypes(`function restore(key, oldArea, newArea) {${body}}`)}; return restore;`)();
+  let offset = 48;
+  const state = { historyScrollAnchorKey: 'retained-message', sessionAutoFollowBottom: false,
+    sessionScroller: { scrollBy(x, delta) { assert.equal(x, 0); offset += delta; } }, log() {} };
+  restore.call(state, 'other-message', { position: { y: 100 } }, { position: { y: 1600 } });
+  assert.equal(offset, 48);
+  restore.call(state, 'retained-message', { position: { y: 100 } }, { position: { y: 1600 } });
+  assert.equal(1600 - offset, 100 - 48, 'message stays at the same viewport position');
+  restore.call(state, 'retained-message', { position: { y: 100 } }, { position: { y: 1600 } });
+  assert.equal(offset, 1548);
+  assert.equal(state.sessionAutoFollowBottom, false);
+});
+
 test('conversation history loads older cursor pages at the top without re-enabling bottom follow', () => {
   const sourceText = source();
   const clientText = fs.readFileSync(
@@ -1252,4 +1283,23 @@ test('session sidebar distinguishes an authorization failure from a genuinely em
   assert.match(sidebarBody, /检查 Bridge 地址和访问凭证后下拉重试/);
   assert.match(refreshBody, /this\.sessionsLoadError = ''/);
   assert.match(refreshBody, /this\.sessionsLoadError = this\.errorText\(err\)/);
+});
+
+
+test('model header distinguishes automatic choice and shortens known model names', () => {
+  const body = methodBody('modelHeaderLabel');
+  const label = new Function(body);
+  for (const [name, expected] of [['', '自动'], ['GPT-6-Astra', 'Astra'], ['GPT-5.5', '5.5'], ['custom-model', 'custom-model']]) {
+    assert.equal(label.call({ sessionModel: name, normalizeModel: x => x, modelShortLabel: x => x }), expected);
+  }
+});
+
+test('model menu scrolls all options under a viewport height limit', () => {
+  const menu = methodBody('ReasoningEffortMenu');
+  assert.match(menu, /Scroll\(\)/);
+  assert.match(menu, /maxHeight/);
+  assert.match(menu, /modelOptionValues/);
+  assert.match(menu, /reasoningEffortValues/);
+  assert.doesNotMatch(methodBody('ReasoningEffortHeaderButton'), /bindSheet/);
+  assert.doesNotMatch(source(), /ModelSettingsContent|shouldShowModelSheet/);
 });

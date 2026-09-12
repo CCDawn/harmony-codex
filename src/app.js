@@ -485,7 +485,7 @@ async function route({ request, response, config, store, outbox, eventBus, logge
       diagnostics: desktopLiveDiagnostics,
       sessionId
     });
-    if (initial.desktop?.desktopLive === true) {
+    if (initial.desktop?.desktopLive === true && requestedMode !== 'hard') {
       sendJson(response, 200, {
         system: {
           ...initial,
@@ -532,6 +532,7 @@ async function route({ request, response, config, store, outbox, eventBus, logge
     sendJson(response, 200, {
       system: {
         ...after,
+        message: desktop.recoveryError || after.message,
         repaired: desktop.recoveryOk === true,
         repairMode: mode
       }
@@ -1813,12 +1814,20 @@ async function recoverDesktopLiveManually({ adapter, sessionId = '', logger, rec
     throw error;
   }
   try {
-    await recovery.recover({
+    const result = await recovery.recover({
       sessionId,
       logger,
       reason: `manual:${reason || initial.reason || initial.message || initial.status || 'unknown'}`,
       mode: hard ? 'hard' : 'soft'
     });
+    if (result?.skipped === true || (hard && (result?.attempted !== true || result?.ok !== true || result?.mode !== 'hard'))) {
+      return decorateDesktopLiveStatus({
+        ...initial,
+        recoveryAttempted: result?.attempted === true,
+        recoveryOk: false,
+        recoveryError: hard ? '本次未完成 Codex 重启，请等待当前恢复结束后重试。' : '本次恢复未执行，请稍后重试。'
+      });
+    }
   } catch (error) {
     return decorateDesktopLiveStatus({
       ...initial,

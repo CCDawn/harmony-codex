@@ -3356,6 +3356,36 @@ test('reports soft recovery failure without running an existing phone thread tas
   }
 });
 
+for (const scenario of [
+  { name: 'confirmed hard restart runs while online', mode: 'hard', confirmed: true, result: { attempted: true, ok: true, mode: 'hard' }, calls: 1, repaired: true },
+  { name: 'unconfirmed hard restart stays blocked while online', mode: 'hard', confirmed: false, calls: 0, repaired: false },
+  { name: 'soft repair keeps an online desktop running', mode: 'soft', confirmed: false, calls: 0, repaired: false },
+  { name: 'cooldown is not reported as a completed hard restart', mode: 'hard', confirmed: true, result: { attempted: false, skipped: true, reason: 'cooldown' }, calls: 1, repaired: false },
+  { name: 'inflight soft recovery is not reported as a hard restart', mode: 'hard', confirmed: true, result: { attempted: true, ok: true, mode: 'soft' }, calls: 1, repaired: false }
+]) {
+  test(`system repair ${scenario.name}`, async () => {
+    const config = createTestConfig();
+    let calls = 0;
+    config.desktopLiveRecovery = { async recover() { calls++; return scenario.result; } };
+    const adapter = { async getDesktopLiveStatus() {
+      return { ok: true, desktopLive: true, status: 'verified', sessionVerified: true };
+    } };
+    const { server } = createApp({ config, adapter });
+    server.listen(0, '127.0.0.1');
+    await once(server, 'listening');
+    try {
+      const response = await fetch(`http://127.0.0.1:${server.address().port}/system/repair/run`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ mode: scenario.mode, confirmHardRestart: scenario.confirmed })
+      });
+      const { system } = await response.json();
+      assert.equal(response.status, 200);
+      assert.equal(calls, scenario.calls);
+      assert.equal(system.repaired, scenario.repaired);
+    } finally { server.close(); }
+  });
+}
+
 test('manually recovers desktop live from explicit recover endpoint', async () => {
   const config = createTestConfig();
   let recovered = false;
@@ -3573,6 +3603,7 @@ test('manual desktop recovery can hard-restart CDP when requested by the phone',
     async recover(input) {
       recoveryMode = input.mode;
       recovered = true;
+      return { attempted: true, ok: true, mode: input.mode };
     }
   };
   const adapter = {

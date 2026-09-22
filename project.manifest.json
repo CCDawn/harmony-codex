@@ -1,5 +1,5 @@
 {
-  "name": "codex-harmony-remote",
+  "name": "harmony-codex",
   "description": "HarmonyOS remote client and relay tooling for operating Codex Desktop from a phone.",
   "agentEntry": "AGENTS.md",
   "bootstrap": "docs/agent/BOOTSTRAP.md",

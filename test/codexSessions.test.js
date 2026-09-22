@@ -1,4 +1,4 @@
-﻿import assert from 'node:assert/strict';
+import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -59,7 +59,7 @@ test('CodexSessionStore lists desktop sidebar sessions and filters internal work
   const unsavedSmokeSessionId = '019e-unsaved-smoke-session';
   const unsavedUserSessionId = '019e-unsaved-user-session';
   const projectRoot = 'C:\\Users\\agent\\Desktop\\ExampleProject';
-  const unsavedProjectRoot = 'C:\\Users\\agent\\Desktop\\codex-harmony-remote';
+  const unsavedProjectRoot = 'C:\\Users\\agent\\Desktop\\harmony-codex';
 
   await fs.writeFile(path.join(codexHome, '.codex-global-state.json'), JSON.stringify({
     'electron-workspace-root-labels': {
@@ -117,7 +117,7 @@ test('CodexSessionStore lists desktop sidebar sessions and filters internal work
   ].join('\n'), 'utf8');
   insert.run(userSessionId, `\\\\?\\${userSessionPath}`, '对话开发负责人', `\\\\?\\${projectRoot}`, 1779948000000, 1779948000, 'user', 'vscode', 0, '用户消息', '预览', 0);
   insert.run(workerSessionId, '', 'Run worker prompt', `\\\\?\\${projectRoot}`, 1779949000000, 1779949000, 'subagent', '{"subagent":true}', 0, 'worker', 'worker', 1);
-  insert.run(execSessionId, '', '请检查当前项目', 'C:\\Users\\agent\\Desktop\\codex-harmony-remote', 1779949500000, 1779949500, null, 'exec', 0, 'exec', 'exec', 1);
+  insert.run(execSessionId, '', '请检查当前项目', 'C:\\Users\\agent\\Desktop\\harmony-codex', 1779949500000, 1779949500, null, 'exec', 0, 'exec', 'exec', 1);
   insert.run(unsavedSmokeSessionId, `\\\\?\\${smokeSessionPath}`, '?????:desktop live smoke ok????????', `\\\\?\\${unsavedProjectRoot}`, 1779949600000, 1779949600, 'user', 'vscode', 0, 'desktop live smoke ok', 'desktop live smoke ok', 0);
   insert.run(unsavedUserSessionId, `\\\\?\\${unsavedUserSessionPath}`, '请只回复：中文链路正常', `\\\\?\\${unsavedProjectRoot}`, 1779949700000, 1779949700, 'user', 'vscode', 0, '请只回复：中文链路正常', '请只回复：中文链路正常', 1);
   db.close();
@@ -328,7 +328,7 @@ test('CodexSessionStore treats fresh assistant-only rollout tails as running', a
   const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-home-running-tail-'));
   const runningSessionId = '019e-running-tail-only';
   const staleSessionId = '019e-stale-tail-only';
-  const projectRoot = 'C:\\Users\\agent\\Desktop\\codex-harmony-remote';
+  const projectRoot = 'C:\\Users\\agent\\Desktop\\harmony-codex';
   const freshAt = new Date(Date.now() - 30_000);
   const staleAt = new Date(Date.now() - 30 * 60_000);
 
@@ -399,7 +399,7 @@ test('CodexSessionStore treats fresh assistant-only rollout tails as running', a
 test('CodexSessionStore does not keep stale unfinished commentary running forever', async () => {
   const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-home-stale-commentary-'));
   const sessionId = '019e-stale-user-commentary';
-  const projectRoot = 'C:\\Users\\agent\\Desktop\\codex-harmony-remote';
+  const projectRoot = 'C:\\Users\\agent\\Desktop\\harmony-codex';
   const progressAt = new Date(Date.now() - 30 * 60_000);
   const userAt = new Date(progressAt.getTime() - 120_000);
 
@@ -460,7 +460,7 @@ test('CodexSessionStore does not keep stale unfinished commentary running foreve
 test('CodexSessionStore does not keep stale task_started records running forever', async () => {
   const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-home-stale-task-started-'));
   const sessionId = '019e-stale-task-started';
-  const projectRoot = 'C:\\Users\\agent\\Desktop\\codex-harmony-remote';
+  const projectRoot = 'C:\\Users\\agent\\Desktop\\harmony-codex';
   const taskStartedAt = new Date(Date.now() - 45 * 60_000);
   const userAt = new Date(taskStartedAt.getTime() + 1_000);
   const toolAt = new Date(taskStartedAt.getTime() + 60_000);
@@ -523,7 +523,7 @@ test('CodexSessionStore does not keep stale task_started records running forever
 test('CodexSessionStore treats final answers without task_complete as completed', async () => {
   const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-home-final-without-complete-'));
   const sessionId = '019e-final-without-complete';
-  const projectRoot = 'C:\\Users\\agent\\Desktop\\codex-harmony-remote';
+  const projectRoot = 'C:\\Users\\agent\\Desktop\\harmony-codex';
   const taskStartedAt = new Date(Date.now() - 5 * 60_000);
   const userAt = new Date(taskStartedAt.getTime() + 1_000);
   const finalAt = new Date(taskStartedAt.getTime() + 60_000);
@@ -1713,7 +1713,7 @@ test('CodexSessionStore recent sync expands backward to include the latest user 
 test('CodexSessionStore archives the thread from desktop lists while preserving its rollout file', async () => {
   const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-home-delete-'));
   const sessionId = '019e-delete-session';
-  const projectRoot = 'C:\\Users\\agent\\Desktop\\codex-harmony-remote';
+  const projectRoot = 'C:\\Users\\agent\\Desktop\\harmony-codex';
   const sessionDir = path.join(codexHome, 'sessions', '2026', '06', '08');
   await fs.mkdir(sessionDir, { recursive: true });
   const rolloutPath = path.join(sessionDir, `rollout-2026-06-08T10-00-00-${sessionId}.jsonl`);

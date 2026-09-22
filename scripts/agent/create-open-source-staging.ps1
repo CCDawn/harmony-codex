@@ -11,7 +11,7 @@ $ErrorActionPreference = 'Stop'
 $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
 if ([string]::IsNullOrWhiteSpace($OutputPath)) {
   $desktop = [Environment]::GetFolderPath('Desktop')
-  $OutputPath = Join-Path $desktop 'codex-harmony-remote-open-source'
+  $OutputPath = Join-Path $desktop 'harmony-codex-open-source'
 }
 $OutputPath = [System.IO.Path]::GetFullPath($OutputPath)
 

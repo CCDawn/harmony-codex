@@ -30,7 +30,7 @@ Manual equivalent:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\agent\create-open-source-staging.ps1 -ForceClean
-cd "$HOME\Desktop\codex-harmony-remote-open-source"
+cd "$HOME\Desktop\harmony-codex-open-source"
 powershell -ExecutionPolicy Bypass -File .\scripts\agent\scan-open-source.ps1
 npm test
 ```
@@ -44,11 +44,11 @@ git init
 git add .
 git status --short
 git commit -m "chore: prepare agent-first open source release"
-gh repo create <owner>/codex-harmony-remote --private --source . --remote origin --push
+gh repo create <owner>/harmony-codex --private --source . --remote origin --push
 ```
 
 After GitHub-side scanning and one more local review, switch to public:
 
 ```powershell
-gh repo edit <owner>/codex-harmony-remote --visibility public
+gh repo edit <owner>/harmony-codex --visibility public
 ```

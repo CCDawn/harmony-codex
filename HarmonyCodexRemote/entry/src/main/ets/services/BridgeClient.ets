@@ -1,5 +1,8 @@
 import { http } from '@kit.NetworkKit';
-import { BridgeOutboxItem, BridgeProject, BridgeRuntimeStatus, BridgeTask, BridgeTaskSummary, BridgeUserInput, CodexAccountUsage, CodexRuntimeSnapshot, CodexSessionDetail, CodexSessionFingerprint, CodexSessionSummary, DesktopLiveStatus, DesktopScreenshotImage, MobileFileUpload, MobileImageUpload, RemoteSessionFile, SessionSettings, SlashIndexItem, SystemLinkStatus, SystemRepairStatus } from '../model/BridgeModels';
+import { CredentialRuntime } from '../config/CredentialRuntime';
+import { TotpGenerator } from '../utils/TotpGenerator';
+import { CompanionMessagesResponse, CompanionProfile, CompanionProfileResponse } from '../model/CompanionModels';
+import { BridgeOutboxItem, BridgeProject, BridgeRuntimeStatus, BridgeTask, BridgeTaskSummary, BridgeUserInput, CodexAccountUsage, CodexRuntimeSnapshot, CodexSessionDetail, CodexSessionFingerprint, CodexSessionSummary, DesktopLiveStatus, DesktopScreenshotImage, MobileFileUpload, MobileImageUpload, RemoteSessionFile, SessionSettings, SlashIndexItem, SystemLinkStatus, SystemRepairStatus, VoiceTranscriptEntry } from '../model/BridgeModels';
 
 interface ProjectsResponse {
   projects?: BridgeProject[];
@@ -164,6 +167,10 @@ export class BridgeClient {
     if (token.trim().length > 0) {
       headers['X-Codex-Bridge-Token'] = token.trim();
     }
+    const bridgeOtp = await TotpGenerator.currentCode(CredentialRuntime.getRuntimeTotpSecret());
+    if (bridgeOtp.length > 0) {
+      headers['X-Codex-Bridge-OTP'] = bridgeOtp;
+    }
     try {
       const response = await client.request(url, {
           method,
@@ -177,6 +184,9 @@ export class BridgeClient {
         });
       const raw = typeof response.result === 'string' ? response.result : String(response.result ?? '');
       if (response.responseCode < 200 || response.responseCode >= 300) {
+        if (response.responseCode === 401 && BridgeClient.is2faRequired(response.header)) {
+          throw new Error('桥接返回异常 HTTP 401：动态验证码缺失或不正确，请核对手机端与电脑端的 TOTP 密钥配置');
+        }
         throw new Error(`桥接返回异常 HTTP ${response.responseCode}：${BridgeClient.formatErrorBody(raw)}`);
       }
       return raw;
@@ -186,6 +196,23 @@ export class BridgeClient {
       } catch (_) {
       }
     }
+  }
+
+  private static is2faRequired(header: Object | undefined): boolean {
+    if (!header) {
+      return false;
+    }
+    try {
+      const headers = header as Record<string, string>;
+      const keys = Object.keys(headers);
+      for (const key of keys) {
+        if (key.toLowerCase() === 'x-codex-bridge-2fa') {
+          return String(headers[key] ?? '').trim().toLowerCase() === 'required';
+        }
+      }
+    } catch (_) {
+    }
+    return false;
   }
 
   private static formatErrorBody(raw: string): string {
@@ -322,6 +349,81 @@ export class BridgeClient {
       throw new Error('桥接服务没有返回会话历史');
     }
     return parsed.session;
+  }
+
+  static async getCompanionComputerStatus(baseUrl: string, assistantId: string, roomId: string, token: string): Promise<string> {
+    return BridgeClient.request(http.RequestMethod.GET,
+      `${baseUrl}/companion/computer/status?assistantId=${encodeURIComponent(assistantId)}&roomId=${encodeURIComponent(roomId)}`,
+      '', token, { connectTimeout: 10000, readTimeout: 35000, retries: 0 });
+  }
+
+  static async startCompanionComputerSession(baseUrl: string, assistantId: string, roomId: string,
+    threadId: string, environmentId: string, sdp: string, token: string): Promise<string> {
+    return BridgeClient.request(http.RequestMethod.POST, `${baseUrl}/companion/computer/sessions`,
+      JSON.stringify({ assistantId, roomId, threadId, environmentId, sdp }), token,
+      { connectTimeout: 10000, readTimeout: 45000, retries: 0 });
+  }
+
+  static async getCompanionProfile(baseUrl: string, token: string = ''): Promise<CompanionProfile> {
+    const raw = await BridgeClient.request(
+      http.RequestMethod.GET,
+      `${baseUrl}/companion/profile`,
+      '',
+      token,
+      { connectTimeout: 10000, readTimeout: 30000, retries: 1, retryDelayMs: 800 }
+    );
+    const parsed = JSON.parse(raw) as CompanionProfileResponse;
+    const profile = parsed.profile;
+    if (!profile || typeof profile.id !== 'string' || profile.id.trim().length === 0
+      || typeof profile.name !== 'string' || profile.name.trim().length === 0
+      || typeof profile.roomId !== 'string' || profile.roomId.trim().length === 0) {
+      throw new Error('桥接服务没有返回熊大个人助手资料');
+    }
+    return {
+      id: profile.id.trim(),
+      name: profile.name.trim(),
+      roomId: profile.roomId.trim(),
+      avatarUrl: typeof profile.avatarUrl === 'string' && profile.avatarUrl.trim().length > 0
+        ? profile.avatarUrl.trim() : null
+    };
+  }
+
+  static async getCompanionMessages(
+    baseUrl: string,
+    profileId: string,
+    roomId: string,
+    token: string = '',
+    beforeCursor: string = ''
+  ): Promise<CompanionMessagesResponse> {
+    const params = [
+      `profileId=${encodeURIComponent(profileId.trim())}`,
+      `roomId=${encodeURIComponent(roomId.trim())}`
+    ];
+    if (beforeCursor.trim().length > 0) {
+      params.push(`before=${encodeURIComponent(beforeCursor.trim())}`);
+    }
+    const raw = await BridgeClient.request(
+      http.RequestMethod.GET,
+      `${baseUrl}/companion/messages?${params.join('&')}`,
+      '',
+      token,
+      { connectTimeout: 10000, readTimeout: 30000, retries: 1, retryDelayMs: 800 }
+    );
+    const parsed = JSON.parse(raw) as CompanionMessagesResponse;
+    const entries: VoiceTranscriptEntry[] = (parsed.entries ?? [])
+      .filter((entry: VoiceTranscriptEntry) => typeof entry.itemId === 'string'
+        && entry.itemId.trim().length > 0 && typeof entry.text === 'string')
+      .map((entry: VoiceTranscriptEntry): VoiceTranscriptEntry => ({
+        itemId: entry.itemId,
+        role: entry.role === 'user' ? 'user' : 'assistant',
+        text: entry.text,
+        final: entry.final === true
+      }));
+    return {
+      entries,
+      nextCursor: typeof parsed.nextCursor === 'string' && parsed.nextCursor.trim().length > 0
+        ? parsed.nextCursor : null
+    };
   }
 
   static async deleteSession(baseUrl: string, sessionId: string, token: string = ''): Promise<void> {
@@ -481,7 +583,7 @@ export class BridgeClient {
   }
 
   static async interruptCodexRun(baseUrl: string, runId: string, token: string = ''): Promise<BridgeTask> {
-    const raw = await BridgeClient.request(http.RequestMethod.POST, `${baseUrl}/api/codex/runs/${runId}/interrupt?confirm=1`, '{}', token);
+    const raw = await BridgeClient.request(http.RequestMethod.POST, `${baseUrl}/api/codex/runs/${runId}/interrupt`, '{}', token);
     const parsed = JSON.parse(raw) as RunResponse;
     if (!parsed.run) {
       throw new Error('Codex 没有返回中断后的运行状态');
@@ -490,7 +592,7 @@ export class BridgeClient {
   }
 
   static async interruptCodexThread(baseUrl: string, threadId: string, token: string = ''): Promise<BridgeTask> {
-    const raw = await BridgeClient.request(http.RequestMethod.POST, `${baseUrl}/api/codex/threads/${threadId}/interrupt?confirm=1`, '{}', token);
+    const raw = await BridgeClient.request(http.RequestMethod.POST, `${baseUrl}/api/codex/threads/${threadId}/interrupt`, '{}', token);
     const parsed = JSON.parse(raw) as RunResponse;
     if (!parsed.run) {
       throw new Error('Codex 没有返回会话中断状态');
@@ -508,7 +610,7 @@ export class BridgeClient {
   }
 
   static async interruptTask(baseUrl: string, taskId: string, token: string = ''): Promise<BridgeTask> {
-    const raw = await BridgeClient.request(http.RequestMethod.POST, `${baseUrl}/tasks/${taskId}/interrupt?confirm=1`, '{}', token);
+    const raw = await BridgeClient.request(http.RequestMethod.POST, `${baseUrl}/tasks/${taskId}/interrupt`, '{}', token);
     const parsed = JSON.parse(raw) as TaskResponse;
     if (!parsed.task) {
       throw new Error('桥接服务没有返回中断后的任务状态');

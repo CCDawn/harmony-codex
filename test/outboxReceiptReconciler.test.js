@@ -14,6 +14,28 @@ function sampleItem(overrides = {}) {
   };
 }
 
+test('desktop receipt requires this exact submission in official history, not task creation or an older identical prompt', async () => {
+  const at = new Date().toISOString();
+  const task = { id: 'task-1', status: 'running' };
+  const entries = [{ role: 'user', text: '远程提交内容', timestamp: new Date(Date.parse(at) - 1).toISOString() }];
+  const reconcile = createOutboxReceiptReconciler({ store: { getTask: () => task }, sessions: { getSession: async () => ({ entries }) } });
+  const item = sampleItem({ lastAttemptAt: at, resultId: 'task-1', result: { run: task, deliveryPending: true } });
+  assert.equal((await reconcile(item)).status, 'unknown');
+  entries.push({ role: 'user', text: 'another insertion', timestamp: at });
+  assert.equal((await reconcile(item)).status, 'unknown');
+  entries.push({ role: 'user', text: item.text, timestamp: at });
+  const receipt = await reconcile(item);
+  assert.equal(receipt.status, 'submitted');
+  assert.equal(receipt.result.run.id, task.id);
+});
+
+test('desktop task transport failure without official input is uncertain, never delivered', async () => {
+  const reconcile = createOutboxReceiptReconciler({ store: { getTask: () => ({ status: 'failed', error: 'CDP timeout' }) }, sessions: { getSession: async () => ({ entries: [] }) } });
+  const result = await reconcile(sampleItem({ resultId: 'task-1', result: { deliveryPending: true } }));
+  assert.equal(result.status, 'uncertain');
+  assert.match(result.error, /CDP timeout/);
+});
+
 test('outbox receipt reconciler prefers an exact persisted submission receipt', async () => {
   const reconcile = createOutboxReceiptReconciler({
     threadService: {

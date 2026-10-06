@@ -244,6 +244,13 @@ export class CodexThreadService {
 
   async listProjects({ limit = 500 } = {}) {
     await this.projectCatalog.initialize();
+    if (typeof this.sessions?.listDesktopProjects === 'function') {
+      const projects = await this.sessions.listDesktopProjects();
+      await this.projectCatalog.observeSessions(projects.map((project) => ({
+        projectRoot: project.root,
+        projectLabel: project.name
+      })));
+    }
     let appServerThreads = [];
     if (this.allowIndependentAppServer) {
       try {
@@ -418,25 +425,21 @@ export class CodexThreadService {
       officialArchived = true;
     }
 
-    let deletion = {
+    if (!officialArchived) {
+      const error = new Error('桌面归档通道不可用，无法删除会话。');
+      error.statusCode = 503;
+      throw error;
+    }
+
+    const deletion = {
       id: threadId,
       deletedFiles: [],
       preservedFiles: [],
-      archivedThreadCount: 0,
+      archivedThreadCount: 1,
       removedIndexRecords: 0,
       removedGlobalStateEntries: 0,
       deletedAt: new Date().toISOString()
     };
-    if (this.sessions && typeof this.sessions.deleteSession === 'function') {
-      try {
-        deletion = await this.sessions.deleteSession(threadId);
-      } catch (error) {
-        if (!officialArchived || Number(error?.statusCode ?? 0) !== 404) {
-          throw error;
-        }
-      }
-    }
-
     this.liveSessions.delete(threadId);
     this.activeRunsByThreadId.delete(threadId);
     for (const [turnId, runId] of [...this.activeRunsByTurnId.entries()]) {
@@ -749,6 +752,9 @@ export class CodexThreadService {
     if (submissionKey) {
       this.runsBySubmissionId.set(submissionKey, run.id);
     }
+    // The phone renders the live user bubble from run.prompt; steering reuses the
+    // same run, so the prompt must carry the latest steered text.
+    run.prompt = prompt;
     run.updatedAt = new Date().toISOString();
     this.persistRuns();
     return this.serializeRun(run);

@@ -388,6 +388,12 @@ export interface CodexRuntimeSnapshot {
   sessions: CodexRuntimeSession[];
 }
 
+export interface CodexSessionAgentRef {
+  name: string;
+  status: string;
+  report?: string;
+}
+
 export interface CodexSessionToolItem {
   id: string;
   name: string;
@@ -396,6 +402,9 @@ export interface CodexSessionToolItem {
   detail: string;
   status: string;
   retryCount?: number;
+  args?: string;
+  taskName?: string;
+  agents?: CodexSessionAgentRef[];
 }
 
 export interface CodexSessionEntry {
@@ -460,4 +469,13 @@ export interface CodexSessionDetail {
   entries: CodexSessionEntry[];
   entryCount: number;
   sync?: CodexSessionSync;
+}
+
+export type VoiceCallStatus = 'idle' | 'connecting' | 'ready' | 'active' | 'closing' | 'error';
+
+export interface VoiceTranscriptEntry {
+  itemId?: string;
+  role: string;
+  text: string;
+  final: boolean;
 }

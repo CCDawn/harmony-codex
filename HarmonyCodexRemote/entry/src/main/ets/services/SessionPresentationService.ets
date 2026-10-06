@@ -1,4 +1,4 @@
-import { CodexSessionEntry, CodexSessionToolItem } from '../model/BridgeModels';
+import { CodexSessionAgentRef, CodexSessionEntry, CodexSessionToolItem } from '../model/BridgeModels';
 
 export interface SessionMarkdownInlineSegment {
   id: string;
@@ -21,6 +21,9 @@ export interface SessionToolPresentationItem {
   detail: string;
   status: string;
   retryCount?: number;
+  args?: string;
+  taskName?: string;
+  agents?: CodexSessionAgentRef[];
 }
 
 interface InlineToken {
@@ -171,7 +174,10 @@ function mergeSessionToolItems(
         target: source.target,
         detail: retryDetail(failed, source),
         status: 'completed',
-        retryCount: (failed.retryCount ?? 0) + 1
+        retryCount: (failed.retryCount ?? 0) + 1,
+        args: source.args ?? failed.args,
+        taskName: source.taskName ?? failed.taskName,
+        agents: source.agents ?? failed.agents
       };
       return;
     }
@@ -182,7 +188,10 @@ function mergeSessionToolItems(
       target: source.target,
       detail: source.detail,
       status: source.status,
-      retryCount: source.retryCount
+      retryCount: source.retryCount,
+      args: source.args,
+      taskName: source.taskName,
+      agents: source.agents
     });
   });
   return merged;
@@ -376,7 +385,10 @@ function normalizeToolItem(item: CodexSessionToolItem, index: number): SessionTo
     target: item.target.length > 0 ? item.target : item.name,
     detail: item.detail,
     status: item.status.length > 0 ? item.status : 'completed',
-    retryCount: item.retryCount
+    retryCount: item.retryCount,
+    args: item.args,
+    taskName: item.taskName,
+    agents: item.agents
   };
 }
 

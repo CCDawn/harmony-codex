@@ -5,6 +5,34 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { CodexThreadService } from '../src/codexThreadService.js';
+import { CodexDesktopCdpAdapter } from '../src/codexDesktopCdpAdapter.js';
+
+test('desktop project catalog exposes empty and nested saved projects to the shared task store', async () => {
+  const root = process.cwd();
+  const child = path.join(root, 'src');
+  const projects = [{ id: 'parent', name: 'Parent', root }];
+  const service = new CodexThreadService({
+    projects, allowIndependentAppServer: false, runStatePath: null,
+    sessions: { async listDesktopProjects() { return [{ root: child, name: 'Empty nested' }]; } },
+    desktopThreadListProvider: async () => ({ data: [] })
+  });
+  const listed = await service.listProjects();
+  assert.equal(listed.length, 2);
+  assert.equal(listed[1].root, child);
+  assert.equal(listed[1].name, 'Empty nested');
+  assert.equal(projects[1].id, listed[1].id);
+  assert.equal(service.resolveProject(listed[1].id).root, child);
+  const calls = [];
+  const adapter = new CodexDesktopCdpAdapter({ client: {
+    async request(method, params) {
+      calls.push({ method, params });
+      return { thread: { id: 'selected-project-thread', cwd: params.cwd } };
+    }
+  } });
+  await adapter.startThread({ model: '' }, service.resolveProject(listed[1].id), () => {});
+  assert.equal(calls[0].method, 'thread/start');
+  assert.equal(calls[0].params.cwd, child);
+});
 
 test('CodexThreadService starts a thread, sends a turn, and exposes live session state', async () => {
   const client = new FakeAppServerClient();
@@ -121,6 +149,7 @@ test('CodexThreadService steers an active turn without creating a second run', a
   });
 
   assert.equal(steered.id, started.run.id);
+  assert.equal(steered.prompt, '补充检查移动端截图');
   assert.equal(service.listRuns().length, 1);
   assert.equal(service.findRunBySubmission({
     kind: 'existing_thread',
@@ -1227,7 +1256,7 @@ test('CodexThreadService blocks deleting a running thread and clears local snaps
 
   const deletion = await service.deleteThread('019e-thread');
   assert.equal(deletion.archivedThreadCount, 1);
-  assert.deepEqual(deleted, ['019e-thread']);
+  assert.deepEqual(deleted, []);
   assert.equal(service.liveSessions.has('019e-thread'), false);
   assert.equal(client.calls.some((call) => call.method === 'thread/archive' && call.params.threadId === '019e-thread'), true);
 });
@@ -1320,6 +1349,9 @@ test('CodexThreadService archives a completed strict desktop thread before hidin
       },
       async deleteSession(threadId) {
         deleted.push(threadId);
+        const error = new Error('拒绝删除 Codex 会话目录之外的文件');
+        error.statusCode = 403;
+        throw error;
         return {
           id: threadId,
           deletedFiles: [],
@@ -1336,9 +1368,29 @@ test('CodexThreadService archives a completed strict desktop thread before hidin
   const result = await service.deleteThread('019e-thread');
 
   assert.deepEqual(archived, ['019e-thread']);
-  assert.deepEqual(deleted, ['019e-thread']);
+  assert.deepEqual(deleted, []);
   assert.equal(result.officialArchived, true);
-  assert.deepEqual(result.preservedFiles, ['C:\\Users\\agent\\.codex\\sessions\\rollout-019e-thread.jsonl']);
+  assert.deepEqual(result.preservedFiles, []);
+});
+
+test('deletion without an official archive channel fails without changing local state', async () => {
+  const service = new CodexThreadService({
+    allowIndependentAppServer: false,
+    sessions: { async deleteSession() { assert.fail('must not mutate official files'); } }
+  });
+  service.liveSessions.set('019e-thread', { id: '019e-thread' });
+  await assert.rejects(service.deleteThread('019e-thread'), { statusCode: 503 });
+  assert.equal(service.liveSessions.has('019e-thread'), true);
+});
+
+test('official archive errors remain failures and preserve the local visible snapshot', async () => {
+  const service = new CodexThreadService({
+    allowIndependentAppServer: false,
+    archiveThreadProvider: async () => { throw new Error('archive unavailable'); }
+  });
+  service.liveSessions.set('019e-thread', { id: '019e-thread' });
+  await assert.rejects(service.deleteThread('019e-thread'), /archive unavailable/);
+  assert.equal(service.liveSessions.has('019e-thread'), true);
 });
 
 class FakeAppServerClient extends EventEmitter {

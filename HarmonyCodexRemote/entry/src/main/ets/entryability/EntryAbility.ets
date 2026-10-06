@@ -1,3 +1,4 @@
+import { CompanionComputerLifecycle } from '../services/CompanionComputerLifecycle';
 import { AbilityConstant, Configuration, ConfigurationConstant, UIAbility, Want } from '@kit.AbilityKit';
 import { window } from '@kit.ArkUI';
 import {
@@ -65,6 +66,7 @@ export default class EntryAbility extends UIAbility {
   }
 
   onForeground(): void {
+    CompanionComputerLifecycle.setForeground(true);
     void AppBackgroundRuntimeService.ensureRunning(this.context, 'ability_foreground')
       .catch((error: Error) => {
         console.error('[CodexRemote] Background runtime failed: ability_foreground: ' + error.message);
@@ -72,6 +74,7 @@ export default class EntryAbility extends UIAbility {
   }
 
   onBackground(): void {
+    CompanionComputerLifecycle.setForeground(false);
     void AppBackgroundRuntimeService.ensureRunning(this.context, 'ability_background')
       .catch((error: Error) => {
         console.error('[CodexRemote] Background runtime failed: ability_background: ' + error.message);

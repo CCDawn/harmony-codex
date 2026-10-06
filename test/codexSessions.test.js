@@ -1,10 +1,21 @@
-import assert from 'node:assert/strict';
+﻿import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
 import { CodexSessionStore } from '../src/codexSessions.js';
+
+test('desktop projects include saved workspaces without any threads', async () => {
+  const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-empty-projects-'));
+  const root = path.join(codexHome, 'empty');
+  await fs.writeFile(path.join(codexHome, '.codex-global-state.json'), JSON.stringify({
+    'electron-saved-workspace-roots': [root],
+    'electron-workspace-root-labels': { [root]: 'Empty project' }
+  }));
+  const store = new CodexSessionStore({ codexHome });
+  assert.deepEqual(await store.listDesktopProjects(), [{ root, name: 'Empty project' }]);
+});
 
 test('desktop presentation decorates only protocol results without reading session files', async () => {
   const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-presentation-'));
@@ -59,7 +70,7 @@ test('CodexSessionStore lists desktop sidebar sessions and filters internal work
   const unsavedSmokeSessionId = '019e-unsaved-smoke-session';
   const unsavedUserSessionId = '019e-unsaved-user-session';
   const projectRoot = 'C:\\Users\\agent\\Desktop\\ExampleProject';
-  const unsavedProjectRoot = 'C:\\Users\\agent\\Desktop\\harmony-codex';
+  const unsavedProjectRoot = 'C:\\Users\\agent\\Desktop\\codex-harmony-remote';
 
   await fs.writeFile(path.join(codexHome, '.codex-global-state.json'), JSON.stringify({
     'electron-workspace-root-labels': {
@@ -117,7 +128,7 @@ test('CodexSessionStore lists desktop sidebar sessions and filters internal work
   ].join('\n'), 'utf8');
   insert.run(userSessionId, `\\\\?\\${userSessionPath}`, '对话开发负责人', `\\\\?\\${projectRoot}`, 1779948000000, 1779948000, 'user', 'vscode', 0, '用户消息', '预览', 0);
   insert.run(workerSessionId, '', 'Run worker prompt', `\\\\?\\${projectRoot}`, 1779949000000, 1779949000, 'subagent', '{"subagent":true}', 0, 'worker', 'worker', 1);
-  insert.run(execSessionId, '', '请检查当前项目', 'C:\\Users\\agent\\Desktop\\harmony-codex', 1779949500000, 1779949500, null, 'exec', 0, 'exec', 'exec', 1);
+  insert.run(execSessionId, '', '请检查当前项目', 'C:\\Users\\agent\\Desktop\\codex-harmony-remote', 1779949500000, 1779949500, null, 'exec', 0, 'exec', 'exec', 1);
   insert.run(unsavedSmokeSessionId, `\\\\?\\${smokeSessionPath}`, '?????:desktop live smoke ok????????', `\\\\?\\${unsavedProjectRoot}`, 1779949600000, 1779949600, 'user', 'vscode', 0, 'desktop live smoke ok', 'desktop live smoke ok', 0);
   insert.run(unsavedUserSessionId, `\\\\?\\${unsavedUserSessionPath}`, '请只回复：中文链路正常', `\\\\?\\${unsavedProjectRoot}`, 1779949700000, 1779949700, 'user', 'vscode', 0, '请只回复：中文链路正常', '请只回复：中文链路正常', 1);
   db.close();
@@ -328,7 +339,7 @@ test('CodexSessionStore treats fresh assistant-only rollout tails as running', a
   const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-home-running-tail-'));
   const runningSessionId = '019e-running-tail-only';
   const staleSessionId = '019e-stale-tail-only';
-  const projectRoot = 'C:\\Users\\agent\\Desktop\\harmony-codex';
+  const projectRoot = 'C:\\Users\\agent\\Desktop\\codex-harmony-remote';
   const freshAt = new Date(Date.now() - 30_000);
   const staleAt = new Date(Date.now() - 30 * 60_000);
 
@@ -399,7 +410,7 @@ test('CodexSessionStore treats fresh assistant-only rollout tails as running', a
 test('CodexSessionStore does not keep stale unfinished commentary running forever', async () => {
   const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-home-stale-commentary-'));
   const sessionId = '019e-stale-user-commentary';
-  const projectRoot = 'C:\\Users\\agent\\Desktop\\harmony-codex';
+  const projectRoot = 'C:\\Users\\agent\\Desktop\\codex-harmony-remote';
   const progressAt = new Date(Date.now() - 30 * 60_000);
   const userAt = new Date(progressAt.getTime() - 120_000);
 
@@ -460,7 +471,7 @@ test('CodexSessionStore does not keep stale unfinished commentary running foreve
 test('CodexSessionStore does not keep stale task_started records running forever', async () => {
   const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-home-stale-task-started-'));
   const sessionId = '019e-stale-task-started';
-  const projectRoot = 'C:\\Users\\agent\\Desktop\\harmony-codex';
+  const projectRoot = 'C:\\Users\\agent\\Desktop\\codex-harmony-remote';
   const taskStartedAt = new Date(Date.now() - 45 * 60_000);
   const userAt = new Date(taskStartedAt.getTime() + 1_000);
   const toolAt = new Date(taskStartedAt.getTime() + 60_000);
@@ -523,7 +534,7 @@ test('CodexSessionStore does not keep stale task_started records running forever
 test('CodexSessionStore treats final answers without task_complete as completed', async () => {
   const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-home-final-without-complete-'));
   const sessionId = '019e-final-without-complete';
-  const projectRoot = 'C:\\Users\\agent\\Desktop\\harmony-codex';
+  const projectRoot = 'C:\\Users\\agent\\Desktop\\codex-harmony-remote';
   const taskStartedAt = new Date(Date.now() - 5 * 60_000);
   const userAt = new Date(taskStartedAt.getTime() + 1_000);
   const finalAt = new Date(taskStartedAt.getTime() + 60_000);
@@ -583,12 +594,13 @@ test('CodexSessionStore treats final answers without task_complete as completed'
   assert.equal(session?.activityUpdatedAt, finalAt.toISOString());
 });
 
-test('CodexSessionStore treats turn_aborted markers as terminal control records', async () => {
+for (const format of ['marker', 'event']) {
+test(`CodexSessionStore treats turn_aborted ${format} as terminal control records`, async () => {
   const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-home-turn-aborted-'));
   const sessionId = '019e-turn-aborted';
   const projectRoot = 'C:\\Users\\agent\\Desktop\\ExampleProject';
-  const taskStartedAt = new Date(Date.now() - 30 * 60_000);
-  const assistantAt = new Date(taskStartedAt.getTime() + 60_000);
+  const taskStartedAt = new Date(Date.now() - 60_000);
+  const assistantAt = new Date(taskStartedAt.getTime() + 10_000);
   const abortedAt = new Date(Date.now() - 5_000);
 
   await fs.writeFile(path.join(codexHome, '.codex-global-state.json'), JSON.stringify({
@@ -608,7 +620,9 @@ test('CodexSessionStore treats turn_aborted markers as terminal control records'
   await fs.writeFile(rolloutPath, [
     JSON.stringify({ timestamp: taskStartedAt.toISOString(), type: 'event_msg', payload: { type: 'task_started' } }),
     JSON.stringify({ timestamp: assistantAt.toISOString(), type: 'event_msg', payload: { type: 'agent_message', message: '已经处理完主要内容。' } }),
-    JSON.stringify({ timestamp: abortedAt.toISOString(), type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: '<turn_aborted>\nThe user interrupted the previous turn on purpose.\n</turn_aborted>' }] } }),
+    JSON.stringify(format === 'event'
+      ? { timestamp: abortedAt.toISOString(), type: 'event_msg', payload: { type: 'turn_aborted', reason: 'interrupted', turn_id: 'turn-test' } }
+      : { timestamp: abortedAt.toISOString(), type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: '<turn_aborted>\nThe user interrupted the previous turn on purpose.\n</turn_aborted>' }] } }),
     ''
   ].join('\n'), 'utf8');
   await fs.utimes(rolloutPath, abortedAt, abortedAt);
@@ -648,8 +662,11 @@ test('CodexSessionStore treats turn_aborted markers as terminal control records'
   assert.equal(session?.canInterrupt, false);
   assert.equal(session?.terminalReason, 'interrupted');
   assert.equal(session?.activityUpdatedAt, abortedAt.toISOString());
+  assert.equal(detail.activityStatus, 'interrupted');
+  assert.equal(detail.runtimeState, 'interrupted');
   assert.equal(detail.entries.some((entry) => String(entry.text ?? '').includes('turn_aborted')), false);
 });
+}
 
 test('CodexSessionStore verifies large rollout targets without reading the whole file', async () => {
   const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-home-large-rollout-'));
@@ -805,9 +822,7 @@ test('CodexSessionStore tails visible conversation entries with compact tool sta
   ]);
   assert.equal(detail.entries.filter((entry) => entry.role === 'tool').length, 1);
   const toolEntry = detail.entries.find((entry) => entry.role === 'tool');
-  assert.match(toolEntry?.text ?? '', /1\. npm test/);
-  assert.match(toolEntry?.text ?? '', /输出：Exit code: 0/);
-  assert.match(toolEntry?.text ?? '', /Wall time: 1\.2 seconds/);
+  assert.equal(toolEntry?.text, '已运行 15 条命令');
   assert.equal(toolEntry?.toolItems?.length, 15);
   assert.deepEqual(toolEntry?.toolItems?.[0], {
     id: 'shell_command-2026-05-28T02:01:00Z',
@@ -896,6 +911,255 @@ test('CodexSessionStore preserves concrete tool identity and pairs reversed outp
       status: 'completed'
     }
   ]);
+});
+
+test('CodexSessionStore carries delegate args and agent rosters through merged tool runs', async () => {
+  const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-home-delegate-args-'));
+  const sessionId = '019e-delegate-args';
+  await fs.writeFile(path.join(codexHome, 'session_index.jsonl'), [
+    JSON.stringify({ id: sessionId, thread_name: '委派参数会话', updated_at: '2026-05-28T04:00:00Z' }),
+    ''
+  ].join('\n'), 'utf8');
+
+  const sessionDir = path.join(codexHome, 'sessions', '2026', '05', '28');
+  await fs.mkdir(sessionDir, { recursive: true });
+  const delegateMessage = '检查 q1_live_status 的进度\n第二行：汇总风险\n第三行：给出建议';
+  const rosterOutput = JSON.stringify({
+    agents: [
+      { agent_name: '/root/q1_live_status', agent_status: 'running' },
+      { agent_name: '/root/q2_report', agent_status: { completed: 'DONE_WITH_CONCERNS\n\nFindings: 1) 配额吃紧；2) 有一个用例被跳过。' } },
+      { agent_name: '/root/q3_broken', agent_status: { failed: '连接超时' } }
+    ]
+  });
+  await fs.writeFile(path.join(sessionDir, `rollout-2026-05-28T12-00-00-${sessionId}.jsonl`), [
+    JSON.stringify({ timestamp: '2026-05-28T04:00:00Z', type: 'event_msg', payload: { type: 'user_message', message: '盯一下子代理' } }),
+    JSON.stringify({
+      timestamp: '2026-05-28T04:00:01Z',
+      type: 'response_item',
+      payload: { type: 'function_call', name: 'shell_command', call_id: 'call_shell', arguments: '{"command":"npm test"}' }
+    }),
+    JSON.stringify({
+      timestamp: '2026-05-28T04:00:02Z',
+      type: 'response_item',
+      payload: { type: 'function_call_output', call_id: 'call_shell', output: 'Exit code: 0\nWall time: 1.2 seconds' }
+    }),
+    JSON.stringify({
+      timestamp: '2026-05-28T04:00:03Z',
+      type: 'response_item',
+      payload: {
+        type: 'function_call',
+        name: 'followup_task',
+        call_id: 'call_follow',
+        arguments: JSON.stringify({ task_name: 'q1_live_status', message: delegateMessage, fork_turns: 2 })
+      }
+    }),
+    JSON.stringify({
+      timestamp: '2026-05-28T04:00:04Z',
+      type: 'response_item',
+      payload: { type: 'function_call_output', call_id: 'call_follow', output: rosterOutput }
+    }),
+    ''
+  ].join('\n'), 'utf8');
+
+  const store = new CodexSessionStore({ codexHome });
+  const detail = await store.getSession(sessionId);
+  const toolEntry = detail.entries.find((entry) => entry.role === 'tool');
+
+  assert.equal(toolEntry?.text, '已运行 1 条命令');
+  assert.equal(toolEntry?.toolItems?.length, 2);
+  const followupItem = toolEntry?.toolItems?.[1];
+  assert.equal(followupItem?.name, 'followup_task');
+  assert.equal(followupItem?.args, delegateMessage);
+  assert.equal(followupItem?.taskName, 'q1_live_status');
+  assert.deepEqual(followupItem?.agents, [
+    { name: '/root/q1_live_status', status: 'running' },
+    { name: '/root/q2_report', status: 'completed', report: 'DONE_WITH_CONCERNS\n\nFindings: 1) 配额吃紧；2) 有一个用例被跳过。' },
+    { name: '/root/q3_broken', status: 'failed', report: '连接超时' }
+  ]);
+  const shellItem = toolEntry?.toolItems?.[0];
+  assert.equal(shellItem?.args, undefined);
+  assert.equal(shellItem?.agents, undefined);
+});
+
+test('CodexSessionStore truncates delegate args and falls back to raw arguments for spawn_agent', async () => {
+  const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-home-spawn-args-'));
+  const sessionId = '019e-spawn-args';
+  await fs.writeFile(path.join(codexHome, 'session_index.jsonl'), [
+    JSON.stringify({ id: sessionId, thread_name: '委派截断会话', updated_at: '2026-05-28T05:00:00Z' }),
+    ''
+  ].join('\n'), 'utf8');
+
+  const sessionDir = path.join(codexHome, 'sessions', '2026', '05', '28');
+  await fs.mkdir(sessionDir, { recursive: true });
+  const longMessage = '长'.repeat(900);
+  await fs.writeFile(path.join(sessionDir, `rollout-2026-05-28T13-00-00-${sessionId}.jsonl`), [
+    JSON.stringify({ timestamp: '2026-05-28T05:00:00Z', type: 'event_msg', payload: { type: 'user_message', message: '派活' } }),
+    JSON.stringify({
+      timestamp: '2026-05-28T05:00:01Z',
+      type: 'response_item',
+      payload: {
+        type: 'function_call',
+        name: 'spawn_agent',
+        call_id: 'call_spawn_long',
+        arguments: JSON.stringify({ task_name: 'long_runner', message: longMessage })
+      }
+    }),
+    JSON.stringify({
+      timestamp: '2026-05-28T05:00:02Z',
+      type: 'response_item',
+      payload: { type: 'function_call_output', call_id: 'call_spawn_long', output: 'ok' }
+    }),
+    JSON.stringify({
+      timestamp: '2026-05-28T05:00:03Z',
+      type: 'response_item',
+      payload: { type: 'function_call', name: 'spawn_agent', call_id: 'call_spawn_raw', arguments: '快速检查构建日志' }
+    }),
+    JSON.stringify({
+      timestamp: '2026-05-28T05:00:04Z',
+      type: 'response_item',
+      payload: { type: 'function_call_output', call_id: 'call_spawn_raw', output: 'ok' }
+    }),
+    ''
+  ].join('\n'), 'utf8');
+
+  const store = new CodexSessionStore({ codexHome });
+  const detail = await store.getSession(sessionId);
+  const toolEntry = detail.entries.find((entry) => entry.role === 'tool');
+  const items = toolEntry?.toolItems ?? [];
+
+  assert.equal(items.length, 2);
+  assert.equal(items[0]?.args, '长'.repeat(800));
+  assert.equal(items[0]?.args?.includes('...'), false);
+  assert.equal(items[0]?.taskName, 'long_runner');
+  assert.equal(items[1]?.args, '快速检查构建日志');
+  assert.equal(items[1]?.taskName, undefined);
+});
+
+test('CodexSessionStore drops encrypted delegate args but keeps plaintext task_name', async () => {
+  const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-home-spawn-encrypted-'));
+  const sessionId = '019e-spawn-encrypted';
+  await fs.writeFile(path.join(codexHome, 'session_index.jsonl'), [
+    JSON.stringify({ id: sessionId, thread_name: '委派密文会话', updated_at: '2026-05-28T05:00:00Z' }),
+    ''
+  ].join('\n'), 'utf8');
+
+  const sessionDir = path.join(codexHome, 'sessions', '2026', '05', '28');
+  await fs.mkdir(sessionDir, { recursive: true });
+  const fernetBlob = `gAAAAAB${'A'.repeat(200)}`;
+  await fs.writeFile(path.join(sessionDir, `rollout-2026-05-28T13-00-00-${sessionId}.jsonl`), [
+    JSON.stringify({ timestamp: '2026-05-28T05:00:00Z', type: 'event_msg', payload: { type: 'user_message', message: '派活' } }),
+    JSON.stringify({
+      timestamp: '2026-05-28T05:00:01Z',
+      type: 'response_item',
+      payload: {
+        type: 'function_call',
+        name: 'spawn_agent',
+        call_id: 'call_spawn_enc',
+        arguments: JSON.stringify({ task_name: 'capillary_sources', prompt: fernetBlob })
+      }
+    }),
+    JSON.stringify({
+      timestamp: '2026-05-28T05:00:02Z',
+      type: 'response_item',
+      payload: { type: 'function_call_output', call_id: 'call_spawn_enc', output: '{"task_name":"/root/capillary_sources"}' }
+    }),
+    ''
+  ].join('\n'), 'utf8');
+
+  const store = new CodexSessionStore({ codexHome });
+  const detail = await store.getSession(sessionId);
+  const toolEntry = detail.entries.find((entry) => entry.role === 'tool');
+  const items = toolEntry?.toolItems ?? [];
+
+  assert.equal(items.length, 1);
+  assert.equal(items[0]?.args, undefined);
+  assert.equal(items[0]?.taskName, 'capillary_sources');
+});
+
+test('CodexSessionStore omits agents field when tool output has no parsable agent roster', async () => {
+  const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-home-agents-omit-'));
+  const sessionId = '019e-agents-omit';
+  await fs.writeFile(path.join(codexHome, 'session_index.jsonl'), [
+    JSON.stringify({ id: sessionId, thread_name: '无花名册会话', updated_at: '2026-05-28T06:00:00Z' }),
+    ''
+  ].join('\n'), 'utf8');
+
+  const sessionDir = path.join(codexHome, 'sessions', '2026', '05', '28');
+  await fs.mkdir(sessionDir, { recursive: true });
+  await fs.writeFile(path.join(sessionDir, `rollout-2026-05-28T14-00-00-${sessionId}.jsonl`), [
+    JSON.stringify({ timestamp: '2026-05-28T06:00:00Z', type: 'event_msg', payload: { type: 'user_message', message: '等一下子代理' } }),
+    JSON.stringify({
+      timestamp: '2026-05-28T06:00:01Z',
+      type: 'response_item',
+      payload: { type: 'function_call', name: 'wait_agent', call_id: 'call_wait', arguments: '{"task_name":"/root/q1","timeout_seconds":5}' }
+    }),
+    JSON.stringify({
+      timestamp: '2026-05-28T06:00:02Z',
+      type: 'response_item',
+      payload: { type: 'function_call_output', call_id: 'call_wait', output: '{"message":"Wait timed out.","timed_out":true}' }
+    }),
+    JSON.stringify({
+      timestamp: '2026-05-28T06:00:03Z',
+      type: 'response_item',
+      payload: { type: 'function_call', name: 'list_agents', call_id: 'call_list_broken', arguments: '{}' }
+    }),
+    JSON.stringify({
+      timestamp: '2026-05-28T06:00:04Z',
+      type: 'response_item',
+      payload: { type: 'function_call_output', call_id: 'call_list_broken', output: '{"agents": [{' }
+    }),
+    ''
+  ].join('\n'), 'utf8');
+
+  const store = new CodexSessionStore({ codexHome });
+  const detail = await store.getSession(sessionId);
+  const toolEntry = detail.entries.find((entry) => entry.role === 'tool');
+  const items = toolEntry?.toolItems ?? [];
+
+  assert.equal(items.length, 2);
+  assert.equal(items[0]?.name, 'wait_agent');
+  assert.equal(items[0]?.agents, undefined);
+  assert.equal(items[1]?.name, 'list_agents');
+  assert.equal(items[1]?.agents, undefined);
+});
+
+test('CodexSessionStore drops image_resize_notice messages from visible entries', async () => {
+  const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-home-resize-notice-'));
+  const sessionId = '019e-resize-notice';
+  await fs.writeFile(path.join(codexHome, 'session_index.jsonl'), [
+    JSON.stringify({ id: sessionId, thread_name: '缩略通知会话', updated_at: '2026-05-28T07:00:00Z' }),
+    ''
+  ].join('\n'), 'utf8');
+
+  const sessionDir = path.join(codexHome, 'sessions', '2026', '05', '28');
+  await fs.mkdir(sessionDir, { recursive: true });
+  const noticeBlock = '<image_resize_notice>\nImage 1 of 1 in the preceding tool output was resized from 2066x2882 to 1344x1875 pixels.\n</image_resize_notice>';
+  await fs.writeFile(path.join(sessionDir, `rollout-2026-05-28T15-00-00-${sessionId}.jsonl`), [
+    JSON.stringify({ timestamp: '2026-05-28T07:00:00Z', type: 'event_msg', payload: { type: 'user_message', message: '看看截图' } }),
+    JSON.stringify({
+      timestamp: '2026-05-28T07:00:01Z',
+      type: 'response_item',
+      payload: { type: 'message', role: 'developer', content: [{ type: 'input_text', text: noticeBlock }] }
+    }),
+    JSON.stringify({
+      timestamp: '2026-05-28T07:00:02Z',
+      type: 'response_item',
+      payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: `截图已处理\n\n${noticeBlock}\n\n请查收。` }] }
+    }),
+    ''
+  ].join('\n'), 'utf8');
+
+  const store = new CodexSessionStore({ codexHome });
+  const detail = await store.getSession(sessionId);
+
+  assert.equal(detail.entries.length, 2);
+  assert.equal(detail.entries[0].role, 'user');
+  assert.equal(detail.entries[0].text, '看看截图');
+  assert.equal(detail.entries[1].role, 'assistant');
+  assert.equal(detail.entries[1].text, '截图已处理\n\n请查收。');
+  for (const entry of detail.entries) {
+    assert.doesNotMatch(entry.text ?? '', /image_resize_notice/);
+  }
 });
 
 test('CodexSessionStore appends one live activity for running rollout detail and clears it after completion', async () => {
@@ -1681,6 +1945,101 @@ test('CodexSessionStore syncs recent, older, and appended session pages by file 
   assert.ok(Number(beyondCurrentFile.sync.cursorEnd) >= Number(appended.sync.cursorEnd) + 5000);
 });
 
+test('CodexSessionStore resolves single-session summaries from the index without a desktop database', async () => {
+  const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-home-single-index-'));
+  const sessionId = '019e-single-index';
+  await fs.writeFile(path.join(codexHome, 'session_index.jsonl'), [
+    JSON.stringify({ id: sessionId, thread_name: '索引单会话', updated_at: '2026-05-28T02:00:00Z' }),
+    ''
+  ].join('\n'), 'utf8');
+
+  const sessionDir = path.join(codexHome, 'sessions', '2026', '05', '28');
+  await fs.mkdir(sessionDir, { recursive: true });
+  await fs.writeFile(path.join(sessionDir, `rollout-2026-05-28T10-00-00-${sessionId}.jsonl`), [
+    JSON.stringify({ timestamp: '2026-05-28T02:00:01Z', type: 'event_msg', payload: { type: 'user_message', message: '索引读取' } }),
+    ''
+  ].join('\n'), 'utf8');
+
+  const store = new CodexSessionStore({ codexHome });
+  const detail = await store.getSession(sessionId);
+  assert.equal(detail.title, '索引单会话');
+  assert.equal(detail.source, 'session-index');
+  assert.equal(detail.detailAvailable, true);
+  assert.equal(detail.entries[0].text, '索引读取');
+
+  const synced = await store.getSessionSync(sessionId);
+  assert.equal(synced.title, '索引单会话');
+  assert.equal(synced.source, 'session-index');
+  assert.equal(synced.detailAvailable, true);
+});
+
+test('CodexSessionStore resolves desktop summaries by id with index title precedence', async () => {
+  const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-home-single-desktop-'));
+  const sessionId = '019e-single-desktop';
+  const indexOnlyId = '019e-single-index-only';
+  const projectRoot = 'C:\\Users\\agent\\Desktop\\SingleProject';
+
+  await fs.writeFile(path.join(codexHome, '.codex-global-state.json'), JSON.stringify({
+    'electron-workspace-root-labels': { [projectRoot]: 'SingleProject' },
+    'electron-saved-workspace-roots': [projectRoot],
+    'thread-workspace-root-hints': { [sessionId]: projectRoot },
+    'pinned-thread-ids': [sessionId]
+  }), 'utf8');
+  await fs.writeFile(path.join(codexHome, 'session_index.jsonl'), [
+    JSON.stringify({ id: sessionId, thread_name: '索引里的新标题', updated_at: '2026-05-28T02:00:00Z' }),
+    JSON.stringify({ id: indexOnlyId, thread_name: '只在索引里的会话', updated_at: '2026-05-28T02:00:00Z' }),
+    ''
+  ].join('\n'), 'utf8');
+
+  const sessionDir = path.join(codexHome, 'sessions', '2026', '05', '28');
+  await fs.mkdir(sessionDir, { recursive: true });
+  const rolloutPath = path.join(sessionDir, `rollout-2026-05-28T10-00-00-${sessionId}.jsonl`);
+  await fs.writeFile(rolloutPath, [
+    JSON.stringify({ timestamp: '2026-05-28T02:00:01Z', type: 'event_msg', payload: { type: 'user_message', message: '桌面单会话读取' } }),
+    ''
+  ].join('\n'), 'utf8');
+
+  const db = new DatabaseSync(path.join(codexHome, 'state_5.sqlite'));
+  db.exec(`
+    CREATE TABLE threads (
+      id TEXT,
+      rollout_path TEXT,
+      title TEXT,
+      cwd TEXT,
+      updated_at_ms INTEGER,
+      updated_at INTEGER,
+      thread_source TEXT,
+      source TEXT,
+      archived INTEGER,
+      first_user_message TEXT,
+      preview TEXT,
+      has_user_event INTEGER
+    )
+  `);
+  const insert = db.prepare(`
+    INSERT INTO threads
+      (id, rollout_path, title, cwd, updated_at_ms, updated_at, thread_source, source, archived, first_user_message, preview, has_user_event)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  insert.run(sessionId, `\\\\?\\${rolloutPath}`, '数据库旧标题', `\\\\?\\${projectRoot}`, 1779948000000, 1779948000, 'user', 'vscode', 0, '用户消息', '预览', 1);
+  db.close();
+
+  const store = new CodexSessionStore({ codexHome });
+  const detail = await store.getSession(sessionId);
+  assert.equal(detail.title, '索引里的新标题');
+  assert.equal(detail.projectLabel, 'SingleProject');
+  assert.equal(detail.sidebarSection, 'project');
+  assert.equal(detail.pinned, true);
+  assert.equal(detail.source, 'desktop-sidebar');
+  assert.equal(detail.detailAvailable, true);
+  assert.equal(detail.entries[0].text, '桌面单会话读取');
+
+  const missingInDb = await store.getSession(indexOnlyId);
+  assert.equal(missingInDb.title, '未命名会话');
+  assert.equal(missingInDb.detailAvailable, false);
+  assert.equal(missingInDb.entries[0].type, 'missing_session_file');
+});
+
 test('CodexSessionStore recent sync expands backward to include the latest user turn anchor', async () => {
   const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-home-sync-anchor-'));
   const sessionId = '019e-sync-anchor-session';
@@ -1710,79 +2069,33 @@ test('CodexSessionStore recent sync expands backward to include the latest user 
   assert.ok(Number(recent.sync.cursorStart) < Number(recent.sync.cursorEnd));
 });
 
-test('CodexSessionStore archives the thread from desktop lists while preserving its rollout file', async () => {
-  const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-home-delete-'));
-  const sessionId = '019e-delete-session';
-  const projectRoot = 'C:\\Users\\agent\\Desktop\\harmony-codex';
-  const sessionDir = path.join(codexHome, 'sessions', '2026', '06', '08');
-  await fs.mkdir(sessionDir, { recursive: true });
-  const rolloutPath = path.join(sessionDir, `rollout-2026-06-08T10-00-00-${sessionId}.jsonl`);
-  await fs.writeFile(rolloutPath, [
-    JSON.stringify({ timestamp: '2026-06-08T02:00:00Z', type: 'event_msg', payload: { type: 'user_message', message: '删除我' } }),
-    ''
-  ].join('\n'), 'utf8');
+test('CodexSessionStore renders reasoning summaries without [object Object] for array payloads', async () => {
+  const codexHome = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-home-reasoning-'));
+  const sessionId = '019e-reasoning-summary';
   await fs.writeFile(path.join(codexHome, 'session_index.jsonl'), [
-    JSON.stringify({ id: sessionId, thread_name: '待删除会话', updated_at: '2026-06-08T02:00:00Z' }),
-    JSON.stringify({ id: '019e-keep-session', thread_name: '保留会话', updated_at: '2026-06-08T01:00:00Z' }),
+    JSON.stringify({ id: sessionId, thread_name: '思考摘要', updated_at: '2026-09-24T01:40:00Z' }),
     ''
   ].join('\n'), 'utf8');
-  await fs.writeFile(path.join(codexHome, '.codex-global-state.json'), JSON.stringify({
-    'electron-saved-workspace-roots': [projectRoot],
-    'thread-workspace-root-hints': {
-      [sessionId]: projectRoot
-    },
-    'pinned-thread-ids': [sessionId],
-    'projectless-thread-ids': [sessionId]
-  }), 'utf8');
-
-  const db = new DatabaseSync(path.join(codexHome, 'state_5.sqlite'));
-  db.exec(`
-    CREATE TABLE threads (
-      id TEXT,
-      rollout_path TEXT,
-      title TEXT,
-      cwd TEXT,
-      updated_at_ms INTEGER,
-      updated_at INTEGER,
-      thread_source TEXT,
-      source TEXT,
-      archived INTEGER,
-      first_user_message TEXT,
-      preview TEXT,
-      has_user_event INTEGER
-    )
-  `);
-  db.prepare(`
-    INSERT INTO threads
-      (id, rollout_path, title, cwd, updated_at_ms, updated_at, thread_source, source, archived, first_user_message, preview, has_user_event)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(sessionId, `\\\\?\\${rolloutPath}`, '待删除会话', `\\\\?\\${projectRoot}`, 1780874400000, 1780874400, 'user', 'vscode', 0, '删除我', '删除我', 1);
-  db.close();
+  const sessionDir = path.join(codexHome, 'sessions', '2026', '09', '24');
+  await fs.mkdir(sessionDir, { recursive: true });
+  await fs.writeFile(path.join(sessionDir, `rollout-2026-09-24T10-00-00-${sessionId}.jsonl`), [
+    JSON.stringify({ timestamp: '2026-09-24T01:40:00.000Z', type: 'session_meta', payload: { cwd: 'C:\\work' } }),
+    JSON.stringify({ timestamp: '2026-09-24T01:40:01.000Z', type: 'response_item', payload: { type: 'reasoning', id: 'rs_objects', summary: [{ type: 'summary_text', text: '正在分析会话详情链路' }, { type: 'summary_text', text: '准备修复拼接问题' }] } }),
+    JSON.stringify({ timestamp: '2026-09-24T01:40:02.000Z', type: 'response_item', payload: { type: 'reasoning', id: 'rs_strings', summary: ['字符串片段一', '字符串片段二'] } }),
+    JSON.stringify({ timestamp: '2026-09-24T01:40:03.000Z', type: 'response_item', payload: { type: 'reasoning', id: 'rs_empty', summary: [] } }),
+    JSON.stringify({ timestamp: '2026-09-24T01:40:04.000Z', type: 'response_item', payload: { type: 'reasoning', id: 'rs_odd', summary: [{ type: 'summary_text' }, null, 42] } }),
+    ''
+  ].join('\n'), 'utf8');
 
   const store = new CodexSessionStore({ codexHome });
-  const deleted = await store.deleteSession(sessionId);
-
-  assert.equal(deleted.deletedFiles.length, 0);
-  assert.deepEqual(deleted.preservedFiles, [rolloutPath]);
-  assert.equal(deleted.archivedThreadCount, 1);
-  assert.equal(deleted.removedIndexRecords, 1);
-  assert.equal(await exists(rolloutPath), true);
-  assert.equal((await store.listSessions({ limit: 10 })).some((session) => session.id === sessionId), false);
-  assert.doesNotMatch(await fs.readFile(path.join(codexHome, 'session_index.jsonl'), 'utf8'), new RegExp(sessionId));
-
-  const reopened = new DatabaseSync(path.join(codexHome, 'state_5.sqlite'), { readOnly: true });
-  const row = reopened.prepare('SELECT archived FROM threads WHERE id = ?').get(sessionId);
-  reopened.close();
-  assert.equal(row.archived, 1);
+  const detail = await store.getSession(sessionId);
+  const reasoning = detail.entries.filter((entry) => entry.type === 'reasoning');
+  assert.equal(reasoning.length, 3);
+  assert.equal(reasoning[0].text.includes('正在分析会话详情链路'), true);
+  assert.equal(reasoning[0].text.includes('准备修复拼接问题'), true);
+  assert.equal(reasoning[0].text.includes('object'), false);
+  assert.equal(reasoning[1].text.includes('字符串片段一'), true);
+  assert.equal(reasoning[1].text.includes('字符串片段二'), true);
+  assert.equal(reasoning[2].text, '正在思考');
+  assert.equal(detail.entries.some((entry) => String(entry.text ?? '').includes('[object Object]')), false);
 });
-
-async function exists(filePath) {
-  try {
-    await fs.stat(filePath);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-

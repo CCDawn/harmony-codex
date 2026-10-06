@@ -43,7 +43,7 @@ export function sendJson(response, statusCode, payload) {
     'content-length': Buffer.byteLength(body),
     'access-control-allow-origin': '*',
     'access-control-allow-methods': 'GET,POST,DELETE,OPTIONS',
-    'access-control-allow-headers': 'Content-Type,Authorization,X-Codex-Bridge-Token'
+    'access-control-allow-headers': 'Content-Type,Authorization,X-Codex-Bridge-Token,X-Codex-Bridge-OTP'
   });
   response.end(body);
 }

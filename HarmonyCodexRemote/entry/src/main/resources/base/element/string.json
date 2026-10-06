@@ -6,6 +6,7 @@
     { "name": "permission_internet_reason", "value": "连接电脑上的本地 Codex 桥接服务" },
     { "name": "permission_background_reason", "value": "保持远程 HDC 中继在线，便于无线调试和更新" },
     { "name": "permission_sensor_reason", "value": "在查看桌面截图时根据手机方向自动旋转图片" },
+    { "name": "permission_mic_reason", "value": "用于语音通话采集麦克风声音" },
     { "name": "standby_monitor_name", "value": "Codex 小夜灯" },
     { "name": "standby_monitor_desc", "value": "显示正在运行、已完成未读会话和额度" },
     { "name": "standby_monitor_ability_label", "value": "Codex 监控卡片" },

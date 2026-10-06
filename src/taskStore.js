@@ -34,7 +34,7 @@ export class TaskStore {
     }));
   }
 
-  createTask({ projectId, prompt, codexSessionId = null, sessionFingerprint = null, verifiedSessionTarget = null, verifiedDesktopStatus = null, submissionSource = '', submissionId = '', reasoningEffort = '', model = '' }) {
+  createTask({ projectId, prompt, codexSessionId = null, sessionFingerprint = null, verifiedSessionTarget = null, verifiedDesktopStatus = null, submissionSource = '', submissionId = '', reasoningEffort = '', model = '', desktopRelaunch = '' }) {
     const project = this.projects.find((candidate) => candidate.id === projectId);
     if (!project) {
       const error = new Error('Unknown project');
@@ -79,6 +79,7 @@ export class TaskStore {
       error: null,
       desktopSync: null,
       verifiedDesktopStatus,
+      desktopRelaunch: normalizeOptionalString(desktopRelaunch),
       submissionSource: normalizeOptionalString(submissionSource),
       submissionId: normalizedSubmissionId,
       model: normalizeModelId(model),
@@ -201,12 +202,17 @@ export class TaskStore {
         submissionId: normalizedSubmissionId,
         turnId: result?.turnId ?? task.activeCodexTurnId ?? ''
       });
+      // The phone renders the live user bubble from task.prompt; steering reuses
+      // the same task, so the prompt must carry the latest steered text.
+      task.prompt = text;
+      task.updatedAt = new Date().toISOString();
       return task;
     } catch (error) {
       this.addEvent(task.id, 'task.guidance.failed', {
         submissionId: normalizedSubmissionId,
         message: error instanceof Error ? error.message : String(error)
       });
+      if (error.deliveryUncertain === true) error.deliveryTaskId = task.id;
       throw error;
     }
   }

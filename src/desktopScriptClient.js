@@ -1,22 +1,81 @@
+const DEFAULT_RETRY_BACKOFF_MS = 2000;
+const DEFAULT_RETRY_BACKOFF_MAX_MS = 30000;
+
+// 失败退避：2s 起、×2、封顶 30s；服务端给了 Retry-After（429）时取两者较大值，同样封顶。
+export function nextRetryDelayMs(failureCount, retryAfterMs = 0, {
+  baseMs = DEFAULT_RETRY_BACKOFF_MS,
+  maxMs = DEFAULT_RETRY_BACKOFF_MAX_MS
+} = {}) {
+  const failures = Math.max(1, Math.floor(Number(failureCount) || 1));
+  const backoff = Math.min(baseMs * 2 ** (failures - 1), maxMs);
+  const serverHint = Math.min(Math.max(0, Number(retryAfterMs) || 0), maxMs);
+  return Math.max(backoff, serverHint);
+}
+
 export function buildDesktopScriptClient({
   bridgeUrl,
-  token = '',
+  authRequired = false,
   pollTimeoutMs = 25000,
-  heartbeatMs = 5000
+  heartbeatMs = 5000,
+  retryBackoffMs = DEFAULT_RETRY_BACKOFF_MS,
+  retryBackoffMaxMs = DEFAULT_RETRY_BACKOFF_MAX_MS
 } = {}) {
   const baseUrl = String(bridgeUrl ?? '').replace(/\/+$/, '');
   if (!baseUrl) {
     throw new Error('bridgeUrl is required');
   }
-  const authHeader = token ? { 'X-Codex-Bridge-Token': token } : {};
 
+  // 安全约束：脚本响应体绝不内嵌桥接 token。页面在运行时自行取得令牌：
+  // 先读 localStorage（历史会话已保存），否则提示用户输入一次并持久化。
   return `(() => {
   const bridgeUrl = ${JSON.stringify(baseUrl)};
-  const authHeader = ${JSON.stringify(authHeader)};
+  const authRequired = ${JSON.stringify(authRequired === true)};
+  const tokenStorageKey = 'codex-hramony-bridge-token';
   const pollTimeoutMs = ${JSON.stringify(pollTimeoutMs)};
   const heartbeatMs = ${JSON.stringify(heartbeatMs)};
+  const retryBackoffMs = ${JSON.stringify(retryBackoffMs)};
+  const retryBackoffMaxMs = ${JSON.stringify(retryBackoffMaxMs)};
+
+  function retryDelayMs(failures, retryAfterMs = 0) {
+    const backoff = Math.min(retryBackoffMs * 2 ** Math.max(0, failures - 1), retryBackoffMaxMs);
+    return Math.max(backoff, Math.min(Number(retryAfterMs) || 0, retryBackoffMaxMs));
+  }
+
+  function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  function resolveBridgeToken() {
+    if (!authRequired) {
+      return '';
+    }
+    try {
+      const stored = window.localStorage.getItem(tokenStorageKey);
+      if (stored) {
+        return stored;
+      }
+    } catch (error) {
+      console.warn('[codex-hramony] 读取本地桥接令牌失败', error);
+    }
+    try {
+      const entered = window.prompt('请输入 Codex 桥接访问 token');
+      if (entered) {
+        window.localStorage.setItem(tokenStorageKey, entered);
+        return entered;
+      }
+    } catch (error) {
+      console.warn('[codex-hramony] 当前环境无法弹出令牌输入框', error);
+    }
+    return '';
+  }
+
   if (!window.electronBridge || typeof window.electronBridge.sendMessageFromView !== 'function') {
     throw new Error('当前页面不是 Codex 桌面窗口，找不到 electronBridge.sendMessageFromView');
+  }
+  const bridgeToken = resolveBridgeToken();
+  const authHeader = bridgeToken ? { 'X-Codex-Bridge-Token': bridgeToken } : {};
+  if (authRequired && !bridgeToken) {
+    console.warn('[codex-hramony] 桥接已开启令牌校验，但页面中没有令牌。请在控制台执行 localStorage.setItem("' + tokenStorageKey + '", "<token>") 后重新注入脚本。');
   }
   if (window.__codexHramonyDesktopScript?.stop) {
     window.__codexHramonyDesktopScript.stop();
@@ -184,7 +243,12 @@ export function buildDesktopScriptClient({
     const text = await response.text();
     const json = text ? JSON.parse(text) : {};
     if (!response.ok) {
-      throw new Error(json.error || text || ('HTTP ' + response.status));
+      const error = new Error(json.error || text || ('HTTP ' + response.status));
+      const retryAfterSeconds = Number(response.headers.get('retry-after'));
+      if (Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0) {
+        error.retryAfterMs = retryAfterSeconds * 1000;
+      }
+      throw error;
     }
     return json;
   }
@@ -194,6 +258,7 @@ export function buildDesktopScriptClient({
     return {
       scriptId: state.scriptId,
       currentSessionId: state.lastSessionId,
+      tokenPresent: Boolean(bridgeToken),
       ...extra
     };
   }
@@ -224,23 +289,29 @@ export function buildDesktopScriptClient({
     await window.electronBridge.sendMessageFromView(command);
   }
 
+  let heartbeatFailures = 0;
   async function heartbeatLoop() {
     while (!state.stopped) {
       try {
         await post('/desktop/script/status', envelope());
+        heartbeatFailures = 0;
         renderStatusBadge('ok', '远程在线', '桌面脚本桥在线');
+        await sleep(heartbeatMs);
       } catch (error) {
+        heartbeatFailures += 1;
         console.warn('[codex-hramony] 桌面脚本桥心跳失败', error);
         renderStatusBadge('warn', '心跳重试', '桌面脚本桥心跳失败，正在重试');
+        await sleep(retryDelayMs(heartbeatFailures, error.retryAfterMs));
       }
-      await new Promise((resolve) => setTimeout(resolve, heartbeatMs));
     }
   }
 
+  let pollFailures = 0;
   async function pollLoop() {
     while (!state.stopped) {
       try {
         const result = await post('/desktop/script/poll', envelope());
+        pollFailures = 0;
         const commands = Array.isArray(result.commands) ? result.commands : [];
         for (const command of commands) {
           if (state.stopped) {
@@ -261,9 +332,10 @@ export function buildDesktopScriptClient({
           });
         }
       } catch (error) {
+        pollFailures += 1;
         console.warn('[codex-hramony] 桌面脚本桥轮询失败', error);
         renderStatusBadge('warn', '命令重试', '桌面命令轮询失败，正在重试');
-        await new Promise((resolve) => setTimeout(resolve, Math.min(heartbeatMs, pollTimeoutMs)));
+        await sleep(retryDelayMs(pollFailures, error.retryAfterMs));
       }
     }
   }
@@ -283,23 +355,39 @@ export function buildDesktopScriptClient({
         scriptId: state.scriptId,
         currentSessionId: currentSessionId(),
         bridgeUrl,
+        authRequired,
+        tokenPresent: Boolean(bridgeToken),
         stopped: state.stopped
       };
     }
   };
 
-  post('/desktop/script/connect', envelope())
-    .then(() => {
-      renderStatusBadge('ok', '远程在线', '桌面脚本桥已连接');
-      console.log('[codex-hramony] 桌面脚本桥已连接', window.__codexHramonyDesktopScript.status());
-    })
-    .catch((error) => {
-      renderStatusBadge('offline', '远程断开', '桌面脚本桥连接失败');
-      console.warn('[codex-hramony] 桌面脚本桥连接失败', error);
-    });
-  renderStatusBadge('pending', '远程连接中', '正在连接桌面脚本桥');
+  let connectFailures = 0;
+  async function connectLoop() {
+    while (!state.stopped) {
+      try {
+        await post('/desktop/script/connect', envelope());
+        connectFailures = 0;
+        renderStatusBadge('ok', '远程在线', '桌面脚本桥已连接');
+        console.log('[codex-hramony] 桌面脚本桥已连接', window.__codexHramonyDesktopScript.status());
+        return;
+      } catch (error) {
+        connectFailures += 1;
+        renderStatusBadge('offline', '远程断开', '桌面脚本桥连接失败，退避重试中');
+        console.warn('[codex-hramony] 桌面脚本桥连接失败，退避后重试', error);
+        await sleep(retryDelayMs(connectFailures, error.retryAfterMs));
+      }
+    }
+  }
+
+  if (authRequired && !bridgeToken) {
+    renderStatusBadge('warn', '缺少令牌', '未取得桥接访问令牌，请在控制台设置 localStorage 后重新注入');
+  } else {
+    renderStatusBadge('pending', '远程连接中', '正在连接桌面脚本桥');
+  }
   heartbeatLoop();
   pollLoop();
+  connectLoop();
   return window.__codexHramonyDesktopScript;
 })()`;
 }

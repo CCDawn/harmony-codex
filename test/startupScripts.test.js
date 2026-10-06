@@ -74,6 +74,18 @@ test('relay connector reuses a compatible PowerShell host when restarting its lo
   assert.doesNotMatch(text, /-FilePath 'powershell(?:\.exe)?'/);
 });
 
+test('desktop relaunch stays behind the tray switch and refuses a plain Codex window', () => {
+  const restart = readScript('scripts/restart-codex-desktop-live.ps1');
+  const watchdog = readScript('tools/harmony/watch-desktop-live.ps1');
+  assert.match(restart, /Sort-Object -Property @\{ Expression = \{ try \{ \[version\]\$_.Version \}/);
+  assert.match(restart, /\[switch\]\$RefusePlainCodex/);
+  assert.match(restart, /exit 11/);
+  assert.match(restart, /exit 10/);
+  assert.match(watchdog, /function Test-DesktopSupervisorArmed/);
+  assert.match(watchdog, /桌面应用未开，不自动拉起/);
+  assert.match(watchdog, /-RefusePlainCodex/);
+});
+
 test('local bridge watchdog derives its token from config instead of a process argument', () => {
   const stackText = readScript('scripts/start-codex-mobile-stack.ps1');
   const watchdogText = readScript('tools/harmony/watch-local-bridge.ps1');
@@ -84,6 +96,32 @@ test('local bridge watchdog derives its token from config instead of a process a
   assert.match(watchdogText, /BridgeConfig\.ets/);
   assert.match(watchdogText, /DEFAULT_BRIDGE_TOKEN/);
   assert.doesNotMatch(watchdogStartBody, /-Name '-BridgeToken'/);
+});
+
+test('both local bridge launchers inject voice env guarded by the voice server file', () => {
+  for (const filePath of [
+    'scripts/start-codex-mobile-stack.ps1',
+    'tools/harmony/watch-local-bridge.ps1'
+  ]) {
+    const text = readScript(filePath);
+    assert.match(text, /voice\\voice_server\.py/);
+    assert.match(text, /Test-Path -LiteralPath \$voiceServerPath/);
+    assert.match(text, /CODEX_BRIDGE_VOICE_ENABLED/);
+    assert.match(text, /CODEX_BRIDGE_VOICE_COMMAND/);
+    assert.match(text, /CODEX_BRIDGE_VOICE_ENABLED='\$VoiceEnabledText'/);
+    assert.match(text, /CODEX_BRIDGE_VOICE_COMMAND='\$VoiceCommand'/);
+  }
+});
+
+test('local bridge watchdog re-derives TOTP secret and public URL from app config on restarts', () => {
+  const watchdogText = readScript('tools/harmony/watch-local-bridge.ps1');
+
+  assert.match(watchdogText, /\[string\]\$BridgeTotpSecret = \$env:CODEX_BRIDGE_TOTP_SECRET/);
+  assert.match(watchdogText, /\[string\]\$BridgePublicUrl = \$env:CODEX_BRIDGE_PUBLIC_URL/);
+  assert.match(watchdogText, /DEFAULT_BRIDGE_TOTP_SECRET/);
+  assert.match(watchdogText, /DEFAULT_BRIDGE_URL/);
+  assert.match(watchdogText, /\$env:CODEX_BRIDGE_TOTP_SECRET='\$BridgeTotpSecret'/);
+  assert.match(watchdogText, /\$env:CODEX_BRIDGE_PUBLIC_URL='\$BridgePublicUrl'/);
 });
 
 test('bridge proxy watchdog authenticates its local health probe from app config', () => {

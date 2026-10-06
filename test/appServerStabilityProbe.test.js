@@ -478,3 +478,4 @@ class FakeAppServerProcess extends EventEmitter {
     this.disconnect(0);
   }
 }
+

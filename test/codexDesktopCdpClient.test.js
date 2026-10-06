@@ -14,6 +14,35 @@ import {
   selectCodexDesktopCdpTarget
 } from '../src/codexDesktopCdpClient.js';
 
+test('current turn lookup uses bounded official pages in chronological order', async () => {
+  const client = new CodexDesktopCdpClient();
+  const calls = [];
+  client.request = async (method, params) => {
+    calls.push({ method, params });
+    if (method === 'thread/read') {
+      assert.equal(params.includeTurns, false);
+      return { thread: { id: 'target', status: { type: 'active' } } };
+    }
+    assert.equal(method, 'thread/turns/list');
+    assert.deepEqual(params, { threadId: 'target', limit: 10, itemsView: 'summary' });
+    return { data: [{ id: 'current', status: 'inProgress' }, { id: 'older', status: 'completed' }] };
+  };
+  const result = await client.readRecentThread('target');
+  assert.deepEqual(result.thread.turns.map(turn => turn.id), ['older', 'current']);
+  assert.equal(result.thread.status.type, 'active');
+  assert.equal(calls.length, 2);
+});
+
+test('failed turn page never falls back to unbounded history', async () => {
+  const client = new CodexDesktopCdpClient();
+  client.request = async (method, params) => {
+    assert.notEqual(params.includeTurns, true);
+    if (method === 'thread/read') return { thread: { id: 'target' } };
+    throw new Error('page unavailable');
+  };
+  await assert.rejects(client.readRecentThread('target'), /page unavailable/);
+});
+
 test('buildDesktopCdpWebSocketOptions sends the Electron CDP allow-listed Origin', () => {
   assert.deepEqual(buildDesktopCdpWebSocketOptions(9229, {}), {
     headers: {

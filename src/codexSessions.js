@@ -13,6 +13,8 @@ import { normalizeModelId, normalizeReasoningEffort } from './sessionSettingsSto
 const DEFAULT_CODEX_HOME = path.join(os.homedir(), '.codex');
 const MAX_VISIBLE_MESSAGE_LENGTH = 20000;
 const ACTIVITY_TAIL_BYTES = 1024 * 1024;
+const SESSION_ACTIVITY_CACHE_LIMIT = 400;
+const SESSION_ACTIVITY_RUNNING_TTL_MS = 15 * 1000;
 const SESSION_DETAIL_FULL_READ_LIMIT_BYTES = 32 * 1024 * 1024;
 const SESSION_DETAIL_TAIL_BYTES = 8 * 1024 * 1024;
 const RECENT_ASSISTANT_PROGRESS_WINDOW_MS = 10 * 60 * 1000;
@@ -38,6 +40,14 @@ export class CodexSessionStore {
       return desktopSessions;
     }
     return this.listSessionIndexSessions({ limit, query });
+  }
+
+  async listDesktopProjects() {
+    const state = await readDesktopSidebarState(this.globalStatePath);
+    return [...state.visibleWorkspaceRoots].map((root) => ({
+      root,
+      name: projectLabelForRoot(root, state.workspaceLabels)
+    }));
   }
 
   async decorateDesktopThreads(threads) {
@@ -84,46 +94,15 @@ export class CodexSessionStore {
       collectExistingRolloutPathInfo(rows)
     ]);
     const sessions = rows
-      .map((row) => {
-        const id = String(row.id ?? '');
-        const indexSummary = sessionIndex.get(id);
-        const rolloutPath = normalizeFilePath(row.rollout_path ?? '');
-        const fileInfo = getKnownSessionFileInfo(id, rolloutPath, filePathsById, existingRolloutPaths);
-        const title = cleanTitle(indexSummary?.title || row.title || row.first_user_message || row.preview || '未命名会话');
-        const projectRoot = normalizeWorkspaceRoot(sidebarState.threadWorkspaceHints[id] ?? row.cwd ?? '');
-        const desktopUpdatedAtMs = Number(row.updated_at_ms ?? 0);
-        const fileUpdatedAtMs = Number(fileInfo?.updatedAtMs ?? 0);
-        const updatedAtMs = fileUpdatedAtMs > 0 ? fileUpdatedAtMs : desktopUpdatedAtMs;
-        const activity = summarizeSessionActivity(fileInfo?.path ?? '');
-        const runtime = createSessionRuntimeSnapshot(activity, fileUpdatedAtMs > 0 ? 'session-file' : 'desktop-sidebar');
-        return {
-          id,
-          title,
-          updatedAt: updatedAtMs > 0 ? new Date(updatedAtMs).toISOString() : String(indexSummary?.updatedAt ?? ''),
-          updatedAtMs,
-          relativeTime: formatRelativeTime(updatedAtMs),
-          projectRoot,
-          projectLabel: projectRoot.length > 0 ? projectLabelForRoot(projectRoot, sidebarState.workspaceLabels) : '未归类',
-          sidebarSection: sidebarState.projectlessThreadIds.has(id) ? 'recent' : 'project',
-          source: 'desktop-sidebar',
-          activitySource: runtime.runtimeSource,
-          activityStatus: runtime.runtimeState,
-          activityUpdatedAt: runtime.runtimeUpdatedAt,
-          ...runtime,
-          lastVisibleRole: activity.lastVisibleRole,
-          pinned: sidebarState.pinnedThreadIds.has(id),
-          hasUserEvent: Number(row.has_user_event ?? 0) === 1,
-          detailAvailable: Boolean(fileInfo)
-        };
-      })
-      .filter((session) => session.id.length > 0)
-      .filter((session) => session.detailAvailable)
-      .filter((session) => isDesktopVisibleSession(session, sidebarState))
-      .filter((session) => {
+      .map((row) => buildDesktopSessionCandidate(row, sessionIndex, sidebarState, filePathsById, existingRolloutPaths))
+      .filter((candidate) => candidate.id.length > 0)
+      .filter((candidate) => Boolean(candidate.fileInfo))
+      .filter((candidate) => isDesktopVisibleSession(candidate, sidebarState))
+      .filter((candidate) => {
         if (normalizedQuery.length === 0) {
           return true;
         }
-        return `${session.id} ${session.title} ${session.projectLabel} ${session.projectRoot}`.toLowerCase().includes(normalizedQuery);
+        return `${candidate.id} ${candidate.title} ${candidate.projectLabel} ${candidate.projectRoot}`.toLowerCase().includes(normalizedQuery);
       })
       .sort((left, right) => {
         if (left.pinned !== right.pinned) {
@@ -132,7 +111,7 @@ export class CodexSessionStore {
         return right.updatedAtMs - left.updatedAtMs;
       })
       .slice(0, max)
-      .map(({ updatedAtMs, hasUserEvent, ...session }) => session);
+      .map((candidate) => finalizeDesktopSessionCandidate(candidate));
 
     return sessions;
   }
@@ -229,6 +208,83 @@ export class CodexSessionStore {
     }
   }
 
+  async getSessionSummaryById(sessionId) {
+    const bareSummary = {
+      id: sessionId,
+      title: '未命名会话',
+      updatedAt: '',
+      detailAvailable: false
+    };
+    const sidebarState = await readDesktopSidebarState(this.globalStatePath);
+    let row = null;
+    let desktopDbReadable = true;
+    try {
+      const db = new DatabaseSync(this.stateDbPath, { readOnly: true });
+      row = db.prepare(`
+        SELECT id, rollout_path, title, cwd, updated_at_ms, updated_at, first_user_message, preview
+        FROM threads
+        WHERE id = ?
+          AND COALESCE(archived, 0) = 0
+          AND COALESCE(thread_source, '') != 'subagent'
+          AND COALESCE(source, '') != 'exec'
+      `).get(String(sessionId)) ?? null;
+      db.close();
+    } catch {
+      desktopDbReadable = false;
+      row = null;
+    }
+
+    if (row) {
+      const id = String(row.id ?? '');
+      const rolloutPath = normalizeFilePath(row.rollout_path ?? '');
+      const [fileInfo, indexRecord] = await Promise.all([
+        this.getSessionFileInfoForId(id, rolloutPath),
+        readLatestSessionIndexRecord(this.sessionIndexPath, id)
+      ]);
+      const indexSummary = indexRecord
+        ? { title: String(indexRecord.thread_name ?? ''), updatedAt: String(indexRecord.updated_at ?? '') }
+        : null;
+      return buildDesktopSessionSummary(row, fileInfo, sidebarState, indexSummary) ?? bareSummary;
+    }
+    if (desktopDbReadable && (await this.hasDesktopSidebarRows())) {
+      // Desktop sidebar database is readable and non-empty: an id missing from it stays a bare
+      // summary, mirroring how listDesktopSidebarSessions filters it out of listSessions.
+      return bareSummary;
+    }
+    const indexRecord = await readLatestSessionIndexRecord(this.sessionIndexPath, sessionId);
+    if (indexRecord) {
+      return buildSessionIndexSummary(indexRecord, sidebarState);
+    }
+    return bareSummary;
+  }
+
+  async hasDesktopSidebarRows() {
+    try {
+      const db = new DatabaseSync(this.stateDbPath, { readOnly: true });
+      const row = db.prepare(`
+        SELECT 1 FROM threads
+        WHERE COALESCE(archived, 0) = 0
+          AND COALESCE(thread_source, '') != 'subagent'
+          AND COALESCE(source, '') != 'exec'
+        LIMIT 1
+      `).get();
+      db.close();
+      return Boolean(row);
+    } catch {
+      return false;
+    }
+  }
+
+  async getSessionFileInfoForId(sessionId, rolloutPath) {
+    if (rolloutPath.length > 0) {
+      return sessionFileInfo(rolloutPath);
+    }
+    const files = await collectFiles(this.sessionsRoot);
+    const matches = files.filter((file) => path.basename(file).includes(sessionId) && file.endsWith('.jsonl'));
+    matches.sort((left, right) => right.localeCompare(left));
+    return matches.length > 0 ? sessionFileInfo(matches[0]) : null;
+  }
+
   async getSession(sessionId, { tail = 80 } = {}) {
     if (!/^[A-Za-z0-9_-]+$/.test(sessionId)) {
       const error = new Error('Invalid Codex session id');
@@ -236,13 +292,7 @@ export class CodexSessionStore {
       throw error;
     }
 
-    const sessions = await this.listSessions({ limit: 1000 });
-    const summary = sessions.find((candidate) => candidate.id === sessionId) ?? {
-      id: sessionId,
-      title: '未命名会话',
-      updatedAt: '',
-      detailAvailable: false
-    };
+    const summary = await this.getSessionSummaryById(sessionId);
     const filePath = await this.findSessionFile(sessionId);
     if (!filePath) {
       return {
@@ -258,7 +308,6 @@ export class CodexSessionStore {
         entryCount: 1
       };
     }
-
     const lines = await readSessionDetailLines(filePath, {
       fullReadLimitBytes: this.sessionDetailFullReadLimitBytes,
       tailBytes: this.sessionDetailTailBytes
@@ -311,13 +360,7 @@ export class CodexSessionStore {
       throw error;
     }
 
-    const sessions = await this.listSessions({ limit: 1000 });
-    const summary = sessions.find((candidate) => candidate.id === sessionId) ?? {
-      id: sessionId,
-      title: '未命名会话',
-      updatedAt: '',
-      detailAvailable: false
-    };
+    const summary = await this.getSessionSummaryById(sessionId);
     const filePath = await this.findSessionFile(sessionId);
     if (!filePath) {
       return {
@@ -529,142 +572,6 @@ export class CodexSessionStore {
     } catch {
       return '';
     }
-  }
-
-  async deleteSession(sessionId) {
-    if (!/^[A-Za-z0-9_-]+$/.test(sessionId)) {
-      const error = new Error('Invalid Codex session id');
-      error.statusCode = 400;
-      throw error;
-    }
-
-    const files = await this.findDeletableSessionFiles(sessionId);
-    const archivedThreadCount = await this.archiveThreadRecord(sessionId);
-    const removedIndexRecords = await this.removeSessionIndexRecords(sessionId);
-    const removedGlobalStateEntries = await this.removeThreadFromGlobalState(sessionId);
-    const preservedFiles = [...files];
-    const deletedFiles = [];
-
-    if (preservedFiles.length === 0 && archivedThreadCount === 0 && removedIndexRecords === 0 && removedGlobalStateEntries === 0) {
-      const error = new Error('未找到可删除的 Codex 会话');
-      error.statusCode = 404;
-      throw error;
-    }
-
-    return {
-      id: sessionId,
-      deletedFiles,
-      preservedFiles,
-      archivedThreadCount,
-      removedIndexRecords,
-      removedGlobalStateEntries,
-      deletedAt: new Date().toISOString()
-    };
-  }
-
-  async findDeletableSessionFiles(sessionId) {
-    const candidates = new Set();
-    const rolloutPath = await this.getThreadRolloutPath(sessionId);
-    if (rolloutPath) {
-      candidates.add(rolloutPath);
-    }
-
-    const files = await collectFiles(this.sessionsRoot);
-    for (const filePath of files) {
-      if (filePath.endsWith('.jsonl') && path.basename(filePath).includes(sessionId)) {
-        candidates.add(filePath);
-      }
-    }
-
-    const safeFiles = [];
-    for (const filePath of candidates) {
-      const resolved = assertDeletableSessionFilePath(filePath, sessionId, this.sessionsRoot);
-      if (await fileExists(resolved)) {
-        safeFiles.push(resolved);
-      }
-    }
-    return [...new Set(safeFiles)];
-  }
-
-  async archiveThreadRecord(sessionId) {
-    if (!fsSync.existsSync(this.stateDbPath)) {
-      return 0;
-    }
-    let db = null;
-    try {
-      db = new DatabaseSync(this.stateDbPath);
-      const result = db.prepare('UPDATE threads SET archived = 1 WHERE id = ?').run(sessionId);
-      return Number(result?.changes ?? 0);
-    } catch {
-      return 0;
-    } finally {
-      try {
-        db?.close();
-      } catch {
-      }
-    }
-  }
-
-  async removeSessionIndexRecords(sessionId) {
-    let raw = '';
-    try {
-      raw = await fs.readFile(this.sessionIndexPath, 'utf8');
-    } catch {
-      return 0;
-    }
-
-    let removed = 0;
-    const kept = [];
-    for (const line of raw.split(/\r?\n/)) {
-      if (line.trim().length === 0) {
-        continue;
-      }
-      try {
-        const record = JSON.parse(line);
-        if (String(record?.id ?? '') === sessionId) {
-          removed += 1;
-          continue;
-        }
-      } catch {
-      }
-      kept.push(line);
-    }
-
-    if (removed > 0) {
-      await fs.writeFile(this.sessionIndexPath, kept.length > 0 ? `${kept.join('\n')}\n` : '', 'utf8');
-    }
-    return removed;
-  }
-
-  async removeThreadFromGlobalState(sessionId) {
-    let parsed = {};
-    try {
-      parsed = JSON.parse(await fs.readFile(this.globalStatePath, 'utf8'));
-    } catch {
-      return 0;
-    }
-
-    let removed = 0;
-    for (const key of ['pinned-thread-ids', 'projectless-thread-ids']) {
-      if (!Array.isArray(parsed[key])) {
-        continue;
-      }
-      const before = parsed[key].length;
-      parsed[key] = parsed[key].filter((id) => String(id) !== sessionId);
-      removed += before - parsed[key].length;
-    }
-
-    if (parsed['thread-workspace-root-hints'] && typeof parsed['thread-workspace-root-hints'] === 'object' && !Array.isArray(parsed['thread-workspace-root-hints'])) {
-      if (Object.prototype.hasOwnProperty.call(parsed['thread-workspace-root-hints'], sessionId)) {
-        delete parsed['thread-workspace-root-hints'][sessionId];
-        removed += 1;
-      }
-    }
-
-    if (removed > 0) {
-      await fs.writeFile(this.globalStatePath, `${JSON.stringify(parsed, null, 2)}\n`, 'utf8');
-    }
-    return removed;
   }
 
   async listSessionFilePathsById() {
@@ -901,29 +808,179 @@ async function sessionFileInfo(filePath) {
   }
 }
 
+function buildDesktopSessionCandidate(row, sessionIndex, sidebarState, filePathsById, existingRolloutPaths) {
+  const id = String(row.id ?? '');
+  const indexSummary = sessionIndex.get(id);
+  const rolloutPath = normalizeFilePath(row.rollout_path ?? '');
+  const fileInfo = getKnownSessionFileInfo(id, rolloutPath, filePathsById, existingRolloutPaths);
+  const title = cleanTitle(indexSummary?.title || row.title || row.first_user_message || row.preview || '未命名会话');
+  const projectRoot = normalizeWorkspaceRoot(sidebarState.threadWorkspaceHints[id] ?? row.cwd ?? '');
+  const desktopUpdatedAtMs = Number(row.updated_at_ms ?? 0);
+  const fileUpdatedAtMs = Number(fileInfo?.updatedAtMs ?? 0);
+  const updatedAtMs = fileUpdatedAtMs > 0 ? fileUpdatedAtMs : desktopUpdatedAtMs;
+  return {
+    id,
+    title,
+    updatedAt: updatedAtMs > 0 ? new Date(updatedAtMs).toISOString() : String(indexSummary?.updatedAt ?? ''),
+    updatedAtMs,
+    relativeTime: formatRelativeTime(updatedAtMs),
+    projectRoot,
+    projectLabel: projectRoot.length > 0 ? projectLabelForRoot(projectRoot, sidebarState.workspaceLabels) : '未归类',
+    sidebarSection: sidebarState.projectlessThreadIds.has(id) ? 'recent' : 'project',
+    source: 'desktop-sidebar',
+    pinned: sidebarState.pinnedThreadIds.has(id),
+    hasUserEvent: Number(row.has_user_event ?? 0) === 1,
+    fileInfo
+  };
+}
+
+function finalizeDesktopSessionCandidate(candidate) {
+  // Activity tail parsing (1MB sync read + JSON per line) happens only here, after
+  // filtering/sorting/truncation, so a list request pays it solely for returned sessions.
+  const activity = summarizeSessionActivity(candidate.fileInfo?.path ?? '');
+  const runtime = createSessionRuntimeSnapshot(
+    activity,
+    Number(candidate.fileInfo?.updatedAtMs ?? 0) > 0 ? 'session-file' : 'desktop-sidebar'
+  );
+  return {
+    id: candidate.id,
+    title: candidate.title,
+    updatedAt: candidate.updatedAt,
+    relativeTime: candidate.relativeTime,
+    projectRoot: candidate.projectRoot,
+    projectLabel: candidate.projectLabel,
+    sidebarSection: candidate.sidebarSection,
+    source: 'desktop-sidebar',
+    activitySource: runtime.runtimeSource,
+    activityStatus: runtime.runtimeState,
+    activityUpdatedAt: runtime.runtimeUpdatedAt,
+    ...runtime,
+    lastVisibleRole: activity.lastVisibleRole,
+    pinned: candidate.pinned,
+    detailAvailable: true
+  };
+}
+
+function buildDesktopSessionSummary(row, fileInfo, sidebarState, indexSummary) {
+  const id = String(row.id ?? '');
+  if (id.length === 0 || !fileInfo) {
+    return null;
+  }
+  const title = cleanTitle(indexSummary?.title || row.title || row.first_user_message || row.preview || '未命名会话');
+  const projectRoot = normalizeWorkspaceRoot(sidebarState.threadWorkspaceHints[id] ?? row.cwd ?? '');
+  const desktopUpdatedAtMs = Number(row.updated_at_ms ?? 0);
+  const fileUpdatedAtMs = Number(fileInfo.updatedAtMs ?? 0);
+  const updatedAtMs = fileUpdatedAtMs > 0 ? fileUpdatedAtMs : desktopUpdatedAtMs;
+  // No activity tail read here on purpose: getSession/getSessionSync recompute runtime state
+  // from the detail window; the summary only carries neutral runtime fields for shape parity
+  // with listSessions output.
+  const runtime = createSessionRuntimeSnapshot(
+    emptySessionActivity(),
+    fileUpdatedAtMs > 0 ? 'session-file' : 'desktop-sidebar'
+  );
+  return {
+    id,
+    title,
+    updatedAt: updatedAtMs > 0 ? new Date(updatedAtMs).toISOString() : String(indexSummary?.updatedAt ?? ''),
+    relativeTime: formatRelativeTime(updatedAtMs),
+    projectRoot,
+    projectLabel: projectRoot.length > 0 ? projectLabelForRoot(projectRoot, sidebarState.workspaceLabels) : '未归类',
+    sidebarSection: sidebarState.projectlessThreadIds.has(id) ? 'recent' : 'project',
+    source: 'desktop-sidebar',
+    activitySource: runtime.runtimeSource,
+    activityStatus: runtime.runtimeState,
+    activityUpdatedAt: runtime.runtimeUpdatedAt,
+    ...runtime,
+    lastVisibleRole: '',
+    pinned: sidebarState.pinnedThreadIds.has(id),
+    detailAvailable: true
+  };
+}
+
+function buildSessionIndexSummary(record, sidebarState) {
+  const id = String(record.id ?? '');
+  const projectRoot = normalizeWorkspaceRoot(sidebarState.threadWorkspaceHints[id] ?? '');
+  return {
+    id,
+    title: String(record.thread_name ?? '未命名会话'),
+    updatedAt: String(record.updated_at ?? ''),
+    relativeTime: '',
+    projectRoot,
+    projectLabel: projectRoot.length > 0 ? projectLabelForRoot(projectRoot, sidebarState.workspaceLabels) : '未归类',
+    sidebarSection: sidebarState.projectlessThreadIds.has(id) ? 'recent' : 'project',
+    source: 'session-index',
+    activitySource: 'unknown',
+    activityStatus: 'idle',
+    activityUpdatedAt: '',
+    runtimeState: 'idle',
+    runtimeSource: 'unknown',
+    runtimeUpdatedAt: '',
+    canInterrupt: false,
+    pinned: sidebarState.pinnedThreadIds.has(id),
+    detailAvailable: true
+  };
+}
+
+async function readLatestSessionIndexRecord(sessionIndexPath, sessionId) {
+  const wanted = String(sessionId ?? '');
+  if (wanted.length === 0) {
+    return null;
+  }
+  const records = await readJsonl(sessionIndexPath);
+  let latest = null;
+  for (const record of records) {
+    if (!record || String(record.id ?? '') !== wanted) {
+      continue;
+    }
+    if (!latest || String(record.updated_at ?? '').localeCompare(String(latest.updated_at ?? '')) >= 0) {
+      latest = record;
+    }
+  }
+  return latest;
+}
+
+const sessionActivityCache = new Map();
+
+function emptySessionActivity() {
+  return {
+    status: 'idle',
+    updatedAt: '',
+    terminalReason: '',
+    lastVisibleRole: ''
+  };
+}
+
 function summarizeSessionActivity(filePath) {
   if (!filePath) {
-    return {
-      status: 'idle',
-      updatedAt: '',
-      terminalReason: '',
-      lastVisibleRole: ''
-    };
+    return emptySessionActivity();
   }
   try {
     const stat = fsSync.statSync(filePath);
+    const cacheKey = `${filePath}\u0000${stat.size}\u0000${stat.mtimeMs}`;
+    const cached = sessionActivityCache.get(cacheKey);
+    const runningVerdictIsStale = cached?.summary.status === 'running'
+      && Date.now() - cached.computedAtMs > SESSION_ACTIVITY_RUNNING_TTL_MS;
+    if (cached && !runningVerdictIsStale) {
+      sessionActivityCache.delete(cacheKey);
+      sessionActivityCache.set(cacheKey, cached);
+      return { ...cached.summary };
+    }
     const raw = readFileTail(filePath, ACTIVITY_TAIL_BYTES);
     const lines = raw.split(/\r?\n/).filter((line) => line.trim().length > 0);
-    return summarizeActivityRecords(parseSessionRecordLines(lines), {
+    const summary = summarizeActivityRecords(parseSessionRecordLines(lines), {
       fileUpdatedAtMs: stat.mtimeMs
     });
+    sessionActivityCache.set(cacheKey, { summary, computedAtMs: Date.now() });
+    while (sessionActivityCache.size > SESSION_ACTIVITY_CACHE_LIMIT) {
+      const oldestKey = sessionActivityCache.keys().next().value;
+      if (oldestKey === undefined) {
+        break;
+      }
+      sessionActivityCache.delete(oldestKey);
+    }
+    return { ...summary };
   } catch {
-    return {
-      status: 'idle',
-      updatedAt: '',
-      terminalReason: '',
-      lastVisibleRole: ''
-    };
+    return emptySessionActivity();
   }
 }
 
@@ -1146,23 +1203,6 @@ function normalizeFilePath(value) {
   return String(value ?? '')
     .replace(/^\\\\\?\\/, '')
     .trim();
-}
-
-function assertDeletableSessionFilePath(filePath, sessionId, sessionsRoot) {
-  const resolvedRoot = path.resolve(sessionsRoot);
-  const resolvedPath = path.resolve(normalizeFilePath(filePath));
-  const relative = path.relative(resolvedRoot, resolvedPath);
-  if (relative.startsWith('..') || path.isAbsolute(relative)) {
-    const error = new Error('拒绝删除 Codex 会话目录之外的文件');
-    error.statusCode = 403;
-    throw error;
-  }
-  if (path.extname(resolvedPath).toLowerCase() !== '.jsonl' || !path.basename(resolvedPath).includes(sessionId)) {
-    const error = new Error('拒绝删除无法确认归属的会话文件');
-    error.statusCode = 403;
-    throw error;
-  }
-  return resolvedPath;
 }
 
 async function readAllLines(filePath) {
@@ -1780,13 +1820,11 @@ function summarizeToolRun(entries, options = {}) {
     return sum + Number.parseInt(match?.[1] ?? '0', 10);
   }, 0);
   if (completedCount > 0) {
-    const details = summarizeToolRunDetails(entries);
-    const summary = `已运行 ${completedCount} 条命令`;
     return {
       timestamp: last.timestamp,
       type: 'tool_result',
       role: 'tool',
-      text: details.length > 0 ? `${summary}\n\n${details}` : summary,
+      text: `已运行 ${completedCount} 条命令`,
       toolItems,
       syncStartOffset: entries[0].syncStartOffset,
       syncEndOffset: last.syncEndOffset
@@ -1858,34 +1896,6 @@ function isCompletedToolResultEntry(entry) {
     && /^已运行\s+\d+\s+条命令$/.test(firstLine(entry.text));
 }
 
-function summarizeToolRunDetails(entries) {
-  const details = [];
-  let pendingCommand = '';
-  for (const entry of entries) {
-    if (entry.type === 'tool_call') {
-      pendingCommand = commandFromToolCallText(entry.text);
-      continue;
-    }
-    if (!isCompletedToolResultEntry(entry)) {
-      continue;
-    }
-    const resultText = toolResultDetailText(entry.text);
-    const title = pendingCommand.length > 0 ? pendingCommand : '命令';
-    const output = resultText.length > 0 ? `\n输出：${resultText}` : '';
-    details.push(`${details.length + 1}. ${title}${output}`);
-    pendingCommand = '';
-  }
-  if (details.length === 0) {
-    return '';
-  }
-  const visibleDetails = details.slice(0, 20);
-  const hiddenCount = details.length - visibleDetails.length;
-  if (hiddenCount > 0) {
-    visibleDetails.push(`还有 ${hiddenCount} 条命令未展开显示`);
-  }
-  return visibleDetails.join('\n');
-}
-
 function summarizeToolRunItems(entries) {
   const items = [];
   const itemIndexesByCallId = new Map();
@@ -1913,11 +1923,15 @@ function summarizeToolRunItems(entries) {
       continue;
     }
     const item = items[itemIndex];
-    items[itemIndex] = {
+    const updatedItem = {
       ...item,
       detail: String(entry.toolOutputDetail ?? '').trim(),
       status: toolResultStatus(entry)
     };
+    if (Array.isArray(entry.toolAgents) && entry.toolAgents.length > 0) {
+      updatedItem.agents = entry.toolAgents;
+    }
+    items[itemIndex] = updatedItem;
   }
   return items.slice(0, 50);
 }
@@ -2098,14 +2112,22 @@ function summarizeRecord(record, options = {}) {
     }
     if (itemType === 'function_call_output') {
       const summary = summarizeFunctionCallOutput(payload, { ...options, includeImageMarkdown: true });
-      return summary ? {
+      if (!summary) {
+        return null;
+      }
+      const entry = {
         timestamp,
         type: 'tool_result',
         role: 'tool',
         text: summary,
         toolCallId: toolCallId(payload),
         toolOutputDetail: summarizeFunctionCallOutputDetail(payload, summary)
-      } : null;
+      };
+      const toolAgents = parseToolAgentsFromOutput(payload.output);
+      if (toolAgents) {
+        entry.toolAgents = toolAgents;
+      }
+      return entry;
     }
     if (itemType === 'reasoning') {
       const summary = extractReasoningSummary(payload);
@@ -2156,6 +2178,9 @@ function summarizeCodexClientNoticeRecord(record, options = {}) {
 function isTurnAbortedRecord(record) {
   const type = String(record.type ?? '');
   const payload = record.payload ?? {};
+  if (type === 'event_msg' && payload.type === 'turn_aborted') {
+    return true;
+  }
   if (type === 'event_msg' && payload.type === 'user_message') {
     return isTurnAbortedText(extractTextElements(payload));
   }
@@ -2494,7 +2519,7 @@ function toolCallId(payload) {
 function createToolCallItem(payload, timestamp) {
   const name = String(payload.name ?? '').trim() || 'tool';
   const presentation = functionCallPresentation(payload);
-  return {
+  const item = {
     id: toolCallId(payload) || `${name}-${timestamp}`,
     name,
     verb: presentation.verb,
@@ -2502,6 +2527,60 @@ function createToolCallItem(payload, timestamp) {
     detail: '',
     status: 'running'
   };
+  const normalizedToolName = name.toLowerCase();
+  if (isDelegatingToolName(normalizedToolName)) {
+    const args = delegatedToolCallArgs(payload.arguments);
+    if (args) {
+      item.args = args;
+    }
+    const taskName = delegatedToolCallTaskName(payload.arguments);
+    if (taskName) {
+      item.taskName = taskName;
+    }
+  }
+  return item;
+}
+
+function isDelegatingToolName(normalizedName) {
+  return normalizedName === 'followup_task'
+    || normalizedName === 'spawn_agent'
+    || normalizedName.endsWith('/followup_task')
+    || normalizedName.endsWith('/spawn_agent');
+}
+
+function isLikelyEncryptedToolText(value) {
+  const text = String(value ?? '').trim();
+  if (text.startsWith('gAAAA')) {
+    return true;
+  }
+  return text.length >= 80 && /^[A-Za-z0-9+/=_\-]+$/.test(text);
+}
+
+function delegatedToolCallArgs(argumentsValue) {
+  const parsed = parseFunctionArguments(argumentsValue);
+  for (const key of ['message', 'instructions', 'prompt', 'task', 'input', 'directive']) {
+    const value = parsed[key];
+    if (typeof value === 'string' && value.trim().length > 0 && !isLikelyEncryptedToolText(value)) {
+      return clampText(value.trim(), 800);
+    }
+  }
+  const raw = String(argumentsValue ?? '').trim();
+  if (raw.length > 0 && raw.length <= 200 && !isLikelyEncryptedToolText(raw)) {
+    return raw;
+  }
+  return '';
+}
+
+function delegatedToolCallTaskName(argumentsValue) {
+  const parsed = parseFunctionArguments(argumentsValue);
+  const value = parsed.task_name ?? parsed.taskName;
+  const name = typeof value === 'string' ? value.trim() : '';
+  return name.length > 0 ? clampText(name, 120) : '';
+}
+
+function clampText(value, maxLength) {
+  const text = String(value ?? '');
+  return text.length > maxLength ? text.slice(0, maxLength) : text;
 }
 
 function functionCallPresentation(payload) {
@@ -2629,6 +2708,79 @@ function summarizeFunctionCallOutputDetail(payload, summary) {
   return toolResultDetailText(summary) || firstLine(summary);
 }
 
+function parseToolAgentsFromOutput(output) {
+  if (typeof output !== 'string' || !output.includes('"agents"')) {
+    return null;
+  }
+  const parsed = parseEmbeddedJsonObject(output);
+  if (!parsed || !Array.isArray(parsed.agents)) {
+    return null;
+  }
+  const agents = [];
+  for (const raw of parsed.agents) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      continue;
+    }
+    const name = String(raw.agent_name ?? raw.name ?? '').trim();
+    if (name.length === 0) {
+      continue;
+    }
+    const normalized = normalizeAgentStatusValue(raw.agent_status ?? raw.status);
+    const agent = { name, status: normalized.status };
+    if (normalized.report.length > 0) {
+      agent.report = normalized.report;
+    }
+    agents.push(agent);
+    if (agents.length >= 20) {
+      break;
+    }
+  }
+  return agents.length > 0 ? agents : null;
+}
+
+function parseEmbeddedJsonObject(text) {
+  const value = String(text ?? '').trim();
+  if (value.length === 0) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    // fall through to embedded extraction
+  }
+  const start = value.indexOf('{');
+  const end = value.lastIndexOf('}');
+  if (start < 0 || end <= start) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(value.slice(start, end + 1));
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function normalizeAgentStatusValue(value) {
+  if (typeof value === 'string') {
+    const status = value.trim();
+    return { status: status.length > 0 ? clampText(status, 40) : 'unknown', report: '' };
+  }
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    if (typeof value.completed === 'string' && value.completed.trim().length > 0) {
+      return { status: 'completed', report: clampText(value.completed.trim(), 2000) };
+    }
+    if (typeof value.failed === 'string' && value.failed.trim().length > 0) {
+      return { status: 'failed', report: clampText(value.failed.trim(), 2000) };
+    }
+    if (typeof value.error === 'string' && value.error.trim().length > 0) {
+      return { status: 'failed', report: clampText(value.error.trim(), 2000) };
+    }
+  }
+  return { status: 'unknown', report: '' };
+}
+
 function commandFromFunctionArguments(value) {
   return truncateInline(rawCommandFromFunctionArguments(value), 110);
 }
@@ -2672,7 +2824,24 @@ function summarizeToolOutput(output) {
 }
 
 function extractReasoningSummary(payload) {
-  const text = String(payload.text ?? payload.summaryText ?? payload.summary ?? '').trim();
+  const raw = payload.text ?? payload.summaryText ?? payload.summary;
+  let text = '';
+  if (typeof raw === 'string') {
+    text = raw;
+  } else if (Array.isArray(raw)) {
+    text = raw.map((item) => {
+      if (typeof item === 'string') {
+        return item;
+      }
+      if (item && typeof item === 'object') {
+        return String(item.text ?? '');
+      }
+      return '';
+    }).join('\n');
+  } else if (raw && typeof raw === 'object') {
+    text = String(raw.text ?? '');
+  }
+  text = text.trim();
   return text.length > 0 ? truncateInline(text, 120) : '';
 }
 
@@ -2712,6 +2881,7 @@ function isInternalSessionText(value) {
     || text.startsWith('<collaboration_mode>')
     || text.startsWith('<skills_instructions>')
     || text.startsWith('<plugins_instructions>')
+    || text.startsWith('<image_resize_notice>')
     || text.startsWith('# AGENTS.md instructions');
 }
 
@@ -2743,7 +2913,8 @@ function stripInternalInstructionBlocks(value) {
     'skills_instructions',
     'plugins_instructions',
     'turn_aborted',
-    'personality_spec'
+    'personality_spec',
+    'image_resize_notice'
   ];
   for (const name of blockNames) {
     text = stripXmlLikeBlock(text, name);

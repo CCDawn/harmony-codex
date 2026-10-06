@@ -1,7 +1,4 @@
-# Harmony Codex
-
-[![CI](https://github.com/CCDawn/harmony-codex/actions/workflows/ci.yml/badge.svg)](https://github.com/CCDawn/harmony-codex/actions/workflows/ci.yml)
-[![License](https://img.shields.io/github/license/CCDawn/harmony-codex)](LICENSE)
+# Codex Harmony Remote
 
 **在鸿蒙手机、折叠屏和平板上，继续电脑里的 Codex 任务。**
 
@@ -32,12 +29,19 @@
 - **适配移动设备**：支持手机、宽屏双栏、主题与字号调整，以及桌面监控视图。
 - **连接自己的电脑**：提供局域网直连和可选的公网中转部署脚本。
 
-## 当前状态与边界
+## 本次更新
 
-- 任务列表与额度已复用桌面官方接口（`thread/list`、`account/rateLimits/read`）；历史详情仍读取本地会话记录。官方历史分页在实测中出现缺轮，因此尚未切换，当前版本不是全链路单一事实源。
-- CDP 接入仍依赖桌面版本，升级桌面后应重新验证连接。
-- 本仓同步包含本地 1.0.14 系列的手机／平板能力与相关修复；版本明细见提交历史。
-- 本次代码验证为 **440 项测试通过**。手机安装及历史自动刷新已做实机检查；这不代表所有设备、网络和桌面版本组合均已验证。
+本次源码同步包含本地 1.0.14 系列的手机／平板能力及以下修复：
+
+- 任务列表使用桌面同实例 `thread/list`，避免将自行扫描到的内部任务混入手机列表。
+- 额度读取改为官方 `account/rateLimits/read`，移除旧 HTTP 请求和页面文字抓取逻辑。
+- 修复历史刷新时旧消息追加到最新消息之后，导致底部看似丢失新消息的问题。
+- 同一消息更新时替换内容，保留不同消息 ID 的独立记录。
+- 修复桌面 CDP 页面识别，避免误连嵌入的网页。
+
+**当前边界**：任务列表与额度已复用桌面官方接口；历史详情仍读取本地会话记录。官方历史分页在实测中出现缺轮，因此尚未切换，不能将当前版本理解为全链路单一事实源。CDP 接入仍依赖桌面版本，升级桌面后应重新验证连接。
+
+本次代码验证为 **440 项测试通过**。手机安装及历史自动刷新已做实机检查；这不代表所有设备、网络和桌面版本组合均已验证。
 
 ## 快速开始
 
@@ -56,8 +60,8 @@
 ### 安装与部署
 
 ```powershell
-git clone https://github.com/CCDawn/harmony-codex.git
-cd harmony-codex
+git clone https://github.com/CCDawn/codex-harmony-remote.git
+cd codex-harmony-remote
 npm install
 powershell -ExecutionPolicy Bypass -File .\scripts\agent\setup.ps1
 ```
@@ -110,13 +114,6 @@ powershell -ExecutionPolicy Bypass -File .\scripts\agent\generate-readme-screens
 ```
 
 请勿提交令牌、服务器地址、设备 ID、签名材料、构建包、运行日志、真实会话截图或提取的桌面程序。公开图片只使用明确标注的演示数据。
-
-## 相关项目
-
-- [briefbound-skills](https://github.com/CCDawn/briefbound-skills) — Briefbound Agent Skills
-- [Vibelution](https://github.com/CCDawn/Vibelution) — 动态视觉/动效项目
-- [codex-skin](https://github.com/CCDawn/codex-skin) — Codex 动态皮肤
-- [pc-touchpad](https://github.com/CCDawn/pc-touchpad) — 鸿蒙手机变 Windows 触控板
 
 ## 许可证
 

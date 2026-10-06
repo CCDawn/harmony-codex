@@ -5,6 +5,8 @@ import { http } from '@kit.NetworkKit';
 import { systemShare } from '@kit.ShareKit';
 import pasteboard from '@ohos.pasteboard';
 import { RemoteSessionFile } from '../model/BridgeModels';
+import { CredentialRuntime } from '../config/CredentialRuntime';
+import { TotpGenerator } from '../utils/TotpGenerator';
 
 interface DownloadedImage {
   bytes: ArrayBuffer;
@@ -110,6 +112,10 @@ export class ContentActionService {
     if (bridgeToken.length > 0) {
       headers['X-Codex-Bridge-Token'] = bridgeToken;
     }
+    const bridgeOtp = await TotpGenerator.currentCode(CredentialRuntime.getRuntimeTotpSecret());
+    if (bridgeOtp.length > 0) {
+      headers['X-Codex-Bridge-OTP'] = bridgeOtp;
+    }
     try {
       const response = await request.request(downloadUrl, {
         method: http.RequestMethod.GET,
@@ -208,6 +214,10 @@ export class ContentActionService {
     const headers: Record<string, string> = {};
     if (bridgeToken.length > 0) {
       headers['X-Codex-Bridge-Token'] = bridgeToken;
+    }
+    const bridgeOtp = await TotpGenerator.currentCode(CredentialRuntime.getRuntimeTotpSecret());
+    if (bridgeOtp.length > 0) {
+      headers['X-Codex-Bridge-OTP'] = bridgeOtp;
     }
     try {
       const response = await request.request(imageUrl, {

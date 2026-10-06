@@ -1,6 +1,11 @@
 import { EventEmitter } from 'node:events';
+import { readRecentDesktopThread } from './desktopRecentThread.js';
 
 export class DesktopScriptBridge extends EventEmitter {
+  async readRecentThread(threadId, options = {}) {
+    return readRecentDesktopThread(this, threadId, options);
+  }
+
   constructor(options = {}) {
     super();
     this.hostId = options.hostId ?? process.env.CODEX_DESKTOP_HOST_ID ?? 'local';
@@ -144,6 +149,8 @@ export class DesktopScriptBridge extends EventEmitter {
       lastCommandFailureMessage: this.lastCommandFailureMessage || null,
       scriptAuth: {
         required: authRequired,
+        otpRequired: options.otpRequired === true,
+        clientTokenEmbedded: options.clientTokenEmbedded === true,
         scriptTokenPresent: this.scriptTokenPresent === true,
         healthy: scriptAuthHealthy,
         recentUnauthorized,

@@ -164,3 +164,4 @@ function isApprovalRequest(method) {
     || method.includes('requestuserinput')
     || method.includes('elicitation');
 }
+

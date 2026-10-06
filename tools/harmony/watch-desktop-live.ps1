@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
   [int]$BridgePort = 8787,
   [string]$BridgeToken = $env:CODEX_BRIDGE_TOKEN,
@@ -125,6 +125,25 @@ function Invoke-SoftRecovery {
   return $LASTEXITCODE -eq 0
 }
 
+function Test-DesktopSupervisorArmed {
+  $armPath = Join-Path ([string]$repoRoot) 'logs\state\desktop-supervisor.json'
+  if (-not (Test-Path -LiteralPath $armPath)) {
+    return $false
+  }
+  try {
+    $arm = Get-Content -Raw -LiteralPath $armPath | ConvertFrom-Json
+    $heartbeat = [datetimeoffset]::Parse([string]$arm.heartbeatAt).UtcDateTime
+    $ageSeconds = ([datetime]::UtcNow - $heartbeat).TotalSeconds
+    if ($ageSeconds -gt 20 -or $ageSeconds -lt -5) {
+      return $false
+    }
+    $armPid = [int]$arm.pid
+    return $null -ne (Get-Process -Id $armPid -ErrorAction SilentlyContinue)
+  } catch {
+    return $false
+  }
+}
+
 function Invoke-StartRemoteDesktop {
   Write-WatchLog '未检测到 Codex 桌面进程，启动带 CDP 的受控远程模式'
   $script = Join-Path ([string]$repoRoot) 'scripts\restart-codex-desktop-live.ps1'
@@ -132,18 +151,24 @@ function Invoke-StartRemoteDesktop {
     '-NoProfile',
     '-ExecutionPolicy', 'Bypass',
     '-File', $script,
-    '-BridgeUrl', $bridgeUrl
+    '-BridgeUrl', $bridgeUrl,
+    '-RefusePlainCodex'
   )
   if (-not [string]::IsNullOrWhiteSpace($SessionId)) {
     $arguments += @('-SessionId', $SessionId)
   }
   & $powerShellHostPath @arguments
-  return $LASTEXITCODE -eq 0
+  return $LASTEXITCODE -eq 0 -or $LASTEXITCODE -eq 10
 }
 
 Write-WatchLog "desktop live watchdog started: bridge=$bridgeUrl; interval=${IntervalSeconds}s"
 
+. (Join-Path ([string]$repoRoot) 'tools\windows\mobile-link-lifecycle.ps1')
+
 while ($true) {
+  $cycleGate = Enter-MobileLinkCycle ([string]$repoRoot)
+  if ($null -eq $cycleGate) { Start-Sleep -Seconds $IntervalSeconds; continue }
+  try {
   $status = Get-DesktopLiveStatus
   if ($status.Reachable -and $status.DesktopLive) {
     if ($missingCount -gt 0) {
@@ -160,7 +185,11 @@ while ($true) {
       $shells = @(Get-CodexDesktopShellProcesses)
       $recovered = $false
       if ($shells.Count -eq 0) {
-        $recovered = Invoke-StartRemoteDesktop
+        if (Test-DesktopSupervisorArmed) {
+          $recovered = Invoke-StartRemoteDesktop
+        } else {
+          Write-WatchLog '未检测到 Codex，桌面应用未开，不自动拉起'
+        }
       } elseif ($status.CdpPort -gt 0 -or $status.ProcessMode -eq 'remote_debug') {
         $recovered = Invoke-SoftRecovery
       } else {
@@ -173,5 +202,6 @@ while ($true) {
       }
     }
   }
+  } finally { Exit-MobileLinkCycle $cycleGate }
   Start-Sleep -Seconds ([Math]::Max(3, $IntervalSeconds))
 }

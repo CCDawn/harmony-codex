@@ -29,7 +29,7 @@ export class DesktopLiveRecovery {
       || /未连接|timeout|超时|heartbeat|socket|CDP|not connected/i.test(reason);
   }
 
-  async recover({ sessionId = '', logger = null, reason = '', mode = 'soft' } = {}) {
+  async recover({ sessionId = '', logger = null, reason = '', mode = 'soft', refusePlain = false } = {}) {
     if (!this.enabled) {
       return { attempted: false, skipped: true, reason: 'disabled' };
     }
@@ -45,13 +45,13 @@ export class DesktopLiveRecovery {
       };
     }
     this.lastAttemptAt = Date.now();
-    this.inflight = this.runRecovery({ sessionId, logger, reason, mode }).finally(() => {
+    this.inflight = this.runRecovery({ sessionId, logger, reason, mode, refusePlain }).finally(() => {
       this.inflight = null;
     });
     return this.inflight;
   }
 
-  async runRecovery({ sessionId, logger, reason, mode = 'soft' }) {
+  async runRecovery({ sessionId, logger, reason, mode = 'soft', refusePlain = false }) {
     const startedAt = Date.now();
     const hard = mode === 'hard';
     const scriptPath = hard ? this.hardScriptPath : this.scriptPath;
@@ -77,6 +77,9 @@ export class DesktopLiveRecovery {
     if (sessionId) {
       args.push('-SessionId', sessionId);
     }
+    if (hard && refusePlain === true) {
+      args.push('-RefusePlainCodex');
+    }
 
     const result = await spawnWithTimeout('powershell.exe', args, {
       cwd: this.repoRoot,
@@ -91,14 +94,21 @@ export class DesktopLiveRecovery {
       stdoutTail: tailText(result.stdout, 3000),
       stderrTail: tailText(result.stderr, 3000)
     };
-    const ok = result.exitCode === 0;
+    const shared = hard && result.exitCode === 10;
+    const plainRefused = hard && result.exitCode === 11;
+    const ok = result.exitCode === 0 || shared;
     await logger?.write?.('bridge', ok ? 'info' : 'error', ok ? 'desktop_live.recovery.completed' : 'desktop_live.recovery.failed', payload).catch(() => {});
+    if (plainRefused) {
+      const error = new Error('检测到普通 Codex 正在运行，已停止自动拉起。');
+      error.recovery = payload;
+      throw error;
+    }
     if (!ok) {
       const error = new Error(`桌面 live ${hard ? '硬' : '软'}恢复失败，退出码 ${result.exitCode}`);
       error.recovery = payload;
       throw error;
     }
-    return { attempted: true, ok: true, ...payload };
+    return { attempted: true, ok: true, shared, ...payload };
   }
 }
 

@@ -6,12 +6,16 @@ import path from 'node:path';
 import { once } from 'node:events';
 import { createApp } from '../src/app.js';
 import { MockCodexAdapter } from '../src/mockCodexAdapter.js';
+import { HybridCodexAdapter } from '../src/hybridCodexAdapter.js';
 import { DiagnosticLogger } from '../src/diagnosticLogger.js';
 import { CodexSessionStore } from '../src/codexSessions.js';
 import { desktopScriptBridge } from '../src/desktopScriptBridge.js';
+import { generateTotp } from '../src/totp.js';
 
 function createTestConfig() {
   const sessionSettingsById = new Map();
+  // 每个测试独立的设备注册表落盘位置，避免读到仓库 logs/state 下的真实设备数据。
+  const testRoot = path.join(os.tmpdir(), `codex-app-test-logs-${Date.now()}-${Math.random().toString(16).slice(2)}`);
   const config = {
     // Keep the desktop fixture explicit. Production also defaults to the
     // desktop-owned path; individual tests opt into compatibility modes
@@ -19,8 +23,9 @@ function createTestConfig() {
     appServerRuntimeMode: 'desktop',
     outboxEnabled: false,
     logger: new DiagnosticLogger({
-      root: path.join(os.tmpdir(), `codex-app-test-logs-${Date.now()}-${Math.random().toString(16).slice(2)}`)
+      root: testRoot
     }),
+    deviceRegistryPath: path.join(testRoot, 'state', 'device-registry.json'),
     desktopLiveRecovery: {
       shouldRecover() {
         return false;
@@ -30,6 +35,7 @@ function createTestConfig() {
       }
     },
     desktopLiveDiagnostics: false,
+    desktopSupervisor: { armed: false },
     async defaultReasoningEffortProvider() {
       return '';
     },
@@ -2206,6 +2212,37 @@ test('persists per-session reasoning effort settings', async () => {
   }
 });
 
+test('keeps the stored model when a settings update only changes the reasoning effort', async () => {
+  const config = createTestConfig();
+  config.defaultReasoningEffortProvider = async () => 'xhigh';
+  config.threadService = new FakeThreadService();
+  const { server } = createApp({ config, adapter: new MockCodexAdapter() });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+
+  try {
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    await config.sessionSettings.updateSessionSettings('019e-test-session', { model: 'gpt-alt' });
+
+    const updateResponse = await fetch(`${baseUrl}/api/codex/threads/019e-test-session/settings`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ reasoningEffort: 'high' })
+    });
+    assert.equal(updateResponse.status, 200);
+    const updated = await updateResponse.json();
+    assert.equal(updated.settings.model, 'gpt-alt');
+    assert.equal(updated.settings.modelSource, 'session');
+    assert.equal(updated.settings.reasoningEffort, 'high');
+
+    const stored = await config.sessionSettings.getSessionSettings('019e-test-session');
+    assert.equal(stored.model, 'gpt-alt');
+    assert.equal(stored.reasoningEffort, 'high');
+  } finally {
+    server.close();
+  }
+});
+
 test('exposes desktop default reasoning effort for automatic session settings', async () => {
   const config = createTestConfig();
   config.defaultReasoningEffortProvider = async () => 'xhigh';
@@ -2430,6 +2467,35 @@ test('deduplicates strict desktop phone retries by submission id', async () => {
   }
 });
 
+test('outbox admits a desktop-owned running turn after bridge task memory is lost', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-external-turn-'));
+  const config = createTestConfig();
+  config.outboxEnabled = true;
+  config.outboxPath = path.join(root, 'outbox.json');
+  config.threadService = new FakeThreadService();
+  config.threadService.getThread = async () => ({ id: '019e-test-session', activityStatus: 'running', entries: [] });
+  config.sessions = new FakeSessionVerifier();
+  const adapter = new DesktopVerifiedAdapter();
+  adapter.steer = async () => ({ accepted: true });
+  const { server, store } = createApp({ config, adapter });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  try {
+    assert.equal(store.listTasks().length, 0);
+    const response = await fetch(`http://127.0.0.1:${server.address().port}/api/codex/threads/019e-test-session/messages`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ projectId: 'probe', text: '追加消息', submissionId: 'external-turn-1', sessionFingerprint: testSessionFingerprint() })
+    });
+    const body = await response.json();
+    assert.equal(response.status, 202);
+    assert.equal(body.outbox.status, 'submitted');
+    await until(() => adapter.runs.length === 1);
+  } finally {
+    server.close();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
 test('steers a running desktop task immediately instead of leaving guidance stuck in the outbox', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-app-outbox-steer-'));
   const config = createTestConfig();
@@ -2439,7 +2505,10 @@ test('steers a running desktop task immediately instead of leaving guidance stuc
   config.sessions = new FakeSessionVerifier();
   const steered = [];
   let finishRun = () => {};
-  const adapter = {
+  const desktopAdapter = {
+    async probe() { return {}; },
+    async verifyTargetSession() { return { verified: true }; },
+    async getCurrentConversationId() { return '019e-test-session'; },
     async run({ task, emit }) {
       emit('codex.app_server.turn.started', {
         threadId: task.codexSessionId,
@@ -2469,6 +2538,7 @@ test('steers a running desktop task immediately instead of leaving guidance stuc
       };
     }
   };
+  const adapter = new HybridCodexAdapter({ desktopAdapter });
   const { server, store } = createApp({ config, adapter });
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
@@ -2496,14 +2566,16 @@ test('steers a running desktop task immediately instead of leaving guidance stuc
     const body = await response.json();
 
     assert.equal(response.status, 202);
-    assert.equal(body.run.id, running.id);
-    assert.equal(body.run.status, 'running');
+    assert.equal(body.run.id, body.outbox.id);
+    assert.equal(body.run.status, 'queued');
     assert.deepEqual(steered, [{
       taskId: running.id,
       prompt: '这是运行中的引导消息'
     }]);
+    assert.equal(store.getTask(running.id).id, running.id);
+    assert.equal(store.getTask(running.id).prompt, '这是运行中的引导消息');
     assert.equal(store.listTasks().length, 1);
-    assert.equal(body.outbox.status, 'submitted');
+    assert.equal(body.outbox.status, 'dispatching');
     assert.equal(body.outbox.resultId, running.id);
     finishRun();
     await waitForTaskStatus(store, running.id, 'completed');
@@ -2664,7 +2736,7 @@ test('desktop-primary falls back to App Server only when desktop preflight is un
     assert.deepEqual(config.threadService.sentMessages[0], {
       threadId: '019e-test-session',
       text: '桌面不在线时的受控兜底',
-      model: 'gpt-test',
+      model: '',
       reasoningEffort: '',
       submissionId: 'desktop-primary-fallback-1'
     });
@@ -2818,7 +2890,7 @@ test('uses stored reasoning effort when a phone thread message omits it', async 
   }
 });
 
-test('uses desktop default reasoning effort when phone thread message is automatic', async () => {
+test('keeps automatic phone thread messages unpinned instead of applying desktop defaults', async () => {
   const config = createTestConfig();
   config.defaultReasoningEffortProvider = async () => 'high';
   config.threadService = new FakeThreadService();
@@ -2836,6 +2908,7 @@ test('uses desktop default reasoning effort when phone thread message is automat
       body: JSON.stringify({
         projectId: 'probe',
         text: '继续',
+        model: '',
         reasoningEffort: '',
         sessionFingerprint: testSessionFingerprint()
       })
@@ -2843,11 +2916,13 @@ test('uses desktop default reasoning effort when phone thread message is automat
     const body = await response.json();
 
     assert.equal(response.status, 202);
-    assert.equal(body.run.model, 'gpt-test');
-    assert.equal(body.run.reasoningEffort, 'high');
+    assert.equal(body.run.model, '');
+    assert.equal(body.run.reasoningEffort, '');
+    assert.equal(store.getTask(body.run.id).model, '');
+    assert.equal(store.getTask(body.run.id).reasoningEffort, '');
     await waitForTaskStatus(store, body.run.id, 'completed');
-    assert.equal(adapter.runs[0]?.model, 'gpt-test');
-    assert.equal(adapter.runs[0]?.reasoningEffort, 'high');
+    assert.equal(adapter.runs[0]?.model, '');
+    assert.equal(adapter.runs[0]?.reasoningEffort, '');
   } finally {
     server.close();
   }
@@ -2882,7 +2957,7 @@ test('reports desktop per-thread reasoning effort for automatic session settings
   }
 });
 
-test('uses desktop per-thread reasoning effort when automatic phone thread message is sent', async () => {
+test('does not pin desktop per-thread defaults when an automatic phone thread message is sent', async () => {
   const config = createTestConfig();
   config.defaultReasoningEffortProvider = async () => 'high';
   config.threadService = new FakeThreadService();
@@ -2910,11 +2985,13 @@ test('uses desktop per-thread reasoning effort when automatic phone thread messa
     const body = await response.json();
 
     assert.equal(response.status, 202);
-    assert.equal(body.run.model, 'gpt-alt');
-    assert.equal(body.run.reasoningEffort, 'xhigh');
+    assert.equal(body.run.model, '');
+    assert.equal(body.run.reasoningEffort, '');
+    assert.equal(store.getTask(body.run.id).model, '');
+    assert.equal(store.getTask(body.run.id).reasoningEffort, '');
     await waitForTaskStatus(store, body.run.id, 'completed');
-    assert.equal(adapter.runs[0]?.model, 'gpt-alt');
-    assert.equal(adapter.runs[0]?.reasoningEffort, 'xhigh');
+    assert.equal(adapter.runs[0]?.model, '');
+    assert.equal(adapter.runs[0]?.reasoningEffort, '');
   } finally {
     server.close();
   }
@@ -3863,6 +3940,266 @@ test('system repair run does not choose hard recovery automatically for missing 
   }
 });
 
+function missingCodexDiagnostics(live) {
+  return {
+    async inspect() {
+      if (live()) {
+        return {
+          failureClass: 'none',
+          desktopProcessMode: 'cdp',
+          requiresDesktopCdp: false,
+          mobileRecoverable: true,
+          cdpPort: 9229
+        };
+      }
+      return {
+        failureClass: 'codex_not_running',
+        desktopProcessMode: 'missing',
+        codexProcessCount: 0,
+        requiresDesktopCdp: true,
+        mobileRecoverable: false
+      };
+    }
+  };
+}
+
+test('armed desktop app queues a phone send and relaunches when Codex is missing', async () => {
+  const config = createTestConfig();
+  config.desktopSupervisor = { armed: true };
+  config.sessions = new FakeSessionVerifier();
+  let live = false;
+  let recoverMode = '';
+  let refusePlain = false;
+  let ran = false;
+  config.desktopLiveDiagnostics = missingCodexDiagnostics(() => live);
+  config.desktopLiveRecovery = {
+    shouldRecover() { return false; },
+    async recover(input) {
+      recoverMode = input.mode;
+      refusePlain = input.refusePlain === true;
+      live = true;
+      return { attempted: true, ok: true, mode: 'hard' };
+    }
+  };
+  const adapter = {
+    async getDesktopLiveStatus(timeoutMs, sessionId) {
+      return live ? {
+        ok: true,
+        desktopLive: true,
+        status: 'verified',
+        message: '桌面 Codex 已拉起',
+        currentSessionId: sessionId,
+        targetSessionId: sessionId,
+        sessionVerified: true,
+        targetVerified: true
+      } : {
+        ok: true,
+        desktopLive: false,
+        status: 'unavailable',
+        message: '没有 Codex 进程',
+        targetSessionId: sessionId,
+        sessionVerified: false
+      };
+    },
+    async run() {
+      ran = true;
+      return { ok: true };
+    }
+  };
+  const { server, store } = createApp({ config, adapter });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  try {
+    const response = await fetch(`http://127.0.0.1:${server.address().port}/api/codex/threads/019e-test-session/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        projectId: 'probe',
+        text: '崩溃后继续',
+        sessionFingerprint: testSessionFingerprint()
+      })
+    });
+    const body = await response.json();
+    assert.equal(response.status, 202);
+    const task = await waitForTaskStatus(store, body.run.id, 'completed');
+    assert.equal(task.desktopRelaunch, 'missing');
+    assert.equal(recoverMode, 'hard');
+    assert.equal(refusePlain, true);
+    assert.equal(ran, true);
+  } finally {
+    server.close();
+  }
+});
+
+test('armed desktop app does not relaunch a plain Codex window from a phone send', async () => {
+  const config = createTestConfig();
+  config.desktopSupervisor = { armed: true };
+  config.sessions = new FakeSessionVerifier();
+  let recoverCalled = false;
+  config.desktopLiveDiagnostics = {
+    async inspect() {
+      return {
+        failureClass: 'codex_plain_no_cdp',
+        desktopProcessMode: 'plain',
+        codexProcessCount: 1,
+        requiresDesktopCdp: true,
+        mobileRecoverable: false
+      };
+    }
+  };
+  config.desktopLiveRecovery = {
+    async recover() { recoverCalled = true; }
+  };
+  const adapter = {
+    async getDesktopLiveStatus(timeoutMs, sessionId) {
+      return {
+        ok: true,
+        desktopLive: false,
+        status: 'unavailable',
+        message: 'connect ECONNREFUSED 127.0.0.1:9229',
+        reason: 'connect ECONNREFUSED 127.0.0.1:9229',
+        targetSessionId: sessionId,
+        sessionVerified: false
+      };
+    },
+    async run() { throw new Error('plain window must stay up'); }
+  };
+  const { server, store } = createApp({ config, adapter });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  try {
+    const response = await fetch(`http://127.0.0.1:${server.address().port}/api/codex/threads/019e-test-session/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        projectId: 'probe',
+        text: '不要重启普通窗口',
+        sessionFingerprint: testSessionFingerprint()
+      })
+    });
+    assert.equal(response.status, 503);
+    assert.equal(recoverCalled, false);
+    assert.equal(store.listTasks().length, 0);
+  } finally {
+    server.close();
+  }
+});
+
+test('closed desktop app does not relaunch missing Codex from phone send or link recover', async () => {
+  const config = createTestConfig();
+  config.sessions = {
+    async listSessions() {
+      return [{ id: '019e-test-session', title: '测试会话' }];
+    },
+    async verifySessionTarget(sessionId, fingerprint = {}) {
+      return {
+        id: sessionId,
+        title: fingerprint?.title ?? '测试会话',
+        projectRoot: 'C:\\work',
+        projectLabel: 'work',
+        filePath: 'C:\\sessions\\rollout.jsonl',
+        entryCount: 2
+      };
+    }
+  };
+  let recoverCalled = false;
+  config.desktopLiveDiagnostics = missingCodexDiagnostics(() => false);
+  config.desktopLiveRecovery = {
+    async recover() { recoverCalled = true; }
+  };
+  const adapter = {
+    async getDesktopLiveStatus(timeoutMs, sessionId) {
+      return {
+        ok: true,
+        desktopLive: false,
+        status: 'unavailable',
+        message: '没有 Codex 进程',
+        targetSessionId: sessionId,
+        sessionVerified: false
+      };
+    },
+    async run() { throw new Error('must not run'); }
+  };
+  const { server, store } = createApp({ config, adapter });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  try {
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    const send = await fetch(`${baseUrl}/api/codex/threads/019e-test-session/messages`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        projectId: 'probe',
+        text: '应用关着',
+        sessionFingerprint: testSessionFingerprint()
+      })
+    });
+    assert.equal(send.status, 503);
+    const recover = await fetch(`${baseUrl}/system/link/recover`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ sessionId: '019e-test-session', mode: 'auto' })
+    });
+    const body = await recover.json();
+    assert.equal(recover.status, 200);
+    assert.equal(body.link.repairMode, 'blocked');
+    assert.equal(recoverCalled, false);
+    assert.equal(store.listTasks().length, 0);
+  } finally {
+    server.close();
+  }
+});
+
+test('armed link recover starts a missing Codex without waiting for the restart', async () => {
+  const config = createTestConfig();
+  config.desktopSupervisor = { armed: true };
+  config.sessions = {
+    async listSessions() {
+      return [{ id: '019e-test-session', title: '测试会话' }];
+    }
+  };
+  let recoverMode = '';
+  config.desktopLiveDiagnostics = missingCodexDiagnostics(() => false);
+  config.desktopLiveRecovery = {
+    async recover(input) {
+      recoverMode = input.mode;
+      return { attempted: true, ok: true, mode: 'hard' };
+    }
+  };
+  const adapter = {
+    async getDesktopLiveStatus(timeoutMs, sessionId) {
+      return {
+        ok: true,
+        desktopLive: false,
+        status: 'unavailable',
+        message: '没有 Codex 进程',
+        targetSessionId: sessionId,
+        sessionVerified: false
+      };
+    }
+  };
+  const { server } = createApp({ config, adapter });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  try {
+    const response = await fetch(`http://127.0.0.1:${server.address().port}/system/link/recover`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ sessionId: '019e-test-session', mode: 'auto' })
+    });
+    const body = await response.json();
+    assert.equal(response.status, 200);
+    assert.equal(body.link.repairMode, 'hard_starting');
+    assert.equal(body.link.recoveryMessage, '正在拉起桌面 Codex');
+    for (let i = 0; i < 20 && recoverMode !== 'hard'; i += 1) {
+      await delay(10);
+    }
+    assert.equal(recoverMode, 'hard');
+  } finally {
+    server.close();
+  }
+});
+
 test('system link status reports HDC degradation without blocking desktop sessions', async () => {
   const config = createTestConfig();
   config.sessions = {
@@ -4463,3 +4800,676 @@ function delay(ms) {
     setTimeout(resolve, ms);
   });
 }
+
+const TOTP_TEST_SECRET = 'JBSWY3DPEHPK3PXP';
+
+// 挑一个确定不在容差窗口内的 6 位码，避免 1e-6 级别的偶发碰撞。
+function wrongTotpCode(secret, nowMs = Date.now()) {
+  const valid = new Set();
+  const currentStep = Math.floor(nowMs / 1000 / 30);
+  for (let step = currentStep - 1; step <= currentStep + 1; step += 1) {
+    valid.add(generateTotp(secret, { counter: step }));
+  }
+  for (let candidate = 0; candidate < 1000000; candidate += 1) {
+    const code = String(candidate).padStart(6, '0');
+    if (!valid.has(code)) {
+      return code;
+    }
+  }
+  return '000000';
+}
+
+test('requires OTP when CODEX_BRIDGE_TOTP_SECRET is set', async () => {
+  const previousToken = process.env.CODEX_BRIDGE_TOKEN;
+  const previousSecret = process.env.CODEX_BRIDGE_TOTP_SECRET;
+  process.env.CODEX_BRIDGE_TOKEN = 'secret-token';
+  process.env.CODEX_BRIDGE_TOTP_SECRET = TOTP_TEST_SECRET;
+  const config = createTestConfig();
+  config.threadService = {
+    async listProjects() {
+      return config.projects;
+    }
+  };
+  const { server } = createApp({ config, adapter: new MockCodexAdapter() });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+
+  try {
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    const otp = generateTotp(TOTP_TEST_SECRET);
+    const wrong = wrongTotpCode(TOTP_TEST_SECRET);
+
+    const missing = await fetch(`${baseUrl}/projects`, {
+      headers: { 'x-codex-bridge-token': 'secret-token', 'x-forwarded-for': 'otp-missing' }
+    });
+    assert.equal(missing.status, 401);
+    assert.equal(missing.headers.get('x-codex-bridge-2fa'), 'required');
+
+    const invalid = await fetch(`${baseUrl}/projects`, {
+      headers: {
+        'x-codex-bridge-token': 'secret-token',
+        'x-codex-bridge-otp': wrong,
+        'x-forwarded-for': 'otp-wrong'
+      }
+    });
+    assert.equal(invalid.status, 401);
+    assert.equal(invalid.headers.get('x-codex-bridge-2fa'), 'required');
+
+    const bearer = await fetch(`${baseUrl}/projects`, {
+      headers: { authorization: 'Bearer secret-token', 'x-codex-bridge-otp': otp }
+    });
+    assert.equal(bearer.status, 200);
+
+    const header = await fetch(`${baseUrl}/projects`, {
+      headers: { 'x-codex-bridge-token': 'secret-token', 'x-codex-bridge-otp': otp }
+    });
+    assert.equal(header.status, 200);
+
+    const query = await fetch(`${baseUrl}/projects?token=secret-token&otp=${otp}`);
+    assert.equal(query.status, 200);
+  } finally {
+    server.close();
+    restoreEnv('CODEX_BRIDGE_TOKEN', previousToken);
+    restoreEnv('CODEX_BRIDGE_TOTP_SECRET', previousSecret);
+  }
+});
+
+test('accepts previous window OTP and rejects codes older than the tolerance', async () => {
+  const previousToken = process.env.CODEX_BRIDGE_TOKEN;
+  const previousSecret = process.env.CODEX_BRIDGE_TOTP_SECRET;
+  process.env.CODEX_BRIDGE_TOKEN = 'secret-token';
+  process.env.CODEX_BRIDGE_TOTP_SECRET = TOTP_TEST_SECRET;
+  const config = createTestConfig();
+  config.threadService = {
+    async listProjects() {
+      return config.projects;
+    }
+  };
+  const { server } = createApp({ config, adapter: new MockCodexAdapter() });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+
+  try {
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+
+    const previous = await fetch(`${baseUrl}/projects`, {
+      headers: {
+        'x-codex-bridge-token': 'secret-token',
+        'x-codex-bridge-otp': generateTotp(TOTP_TEST_SECRET, { offsetSteps: -1 }),
+        'x-forwarded-for': 'otp-previous-window'
+      }
+    });
+    assert.equal(previous.status, 200);
+
+    const stale = await fetch(`${baseUrl}/projects`, {
+      headers: {
+        'x-codex-bridge-token': 'secret-token',
+        'x-codex-bridge-otp': generateTotp(TOTP_TEST_SECRET, { offsetSteps: -2 }),
+        'x-forwarded-for': 'otp-stale-window'
+      }
+    });
+    assert.equal(stale.status, 401);
+    assert.equal(stale.headers.get('x-codex-bridge-2fa'), 'required');
+  } finally {
+    server.close();
+    restoreEnv('CODEX_BRIDGE_TOKEN', previousToken);
+    restoreEnv('CODEX_BRIDGE_TOTP_SECRET', previousSecret);
+  }
+});
+
+test('empty CODEX_BRIDGE_TOTP_SECRET keeps token-only baseline behavior', async () => {
+  const previousToken = process.env.CODEX_BRIDGE_TOKEN;
+  const previousSecret = process.env.CODEX_BRIDGE_TOTP_SECRET;
+  process.env.CODEX_BRIDGE_TOKEN = 'secret-token';
+  process.env.CODEX_BRIDGE_TOTP_SECRET = '';
+  const config = createTestConfig();
+  config.threadService = {
+    async listProjects() {
+      return config.projects;
+    }
+  };
+  const { server } = createApp({ config, adapter: new MockCodexAdapter() });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+
+  try {
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    const response = await fetch(`${baseUrl}/projects`, {
+      headers: { 'x-codex-bridge-token': 'secret-token' }
+    });
+    assert.equal(response.status, 200);
+
+    const status = await fetch(`${baseUrl}/desktop/script/status`, {
+      headers: { 'x-codex-bridge-token': 'secret-token' }
+    });
+    const body = await status.json();
+    assert.equal(body.bridge.scriptAuth.required, true);
+    assert.equal(body.bridge.scriptAuth.otpRequired, false);
+    assert.equal(body.bridge.scriptAuth.clientTokenEmbedded, false);
+  } finally {
+    server.close();
+    restoreEnv('CODEX_BRIDGE_TOKEN', previousToken);
+    restoreEnv('CODEX_BRIDGE_TOTP_SECRET', previousSecret);
+  }
+});
+
+test('desktop script client.js no longer embeds the bridge token', async () => {
+  const previousToken = process.env.CODEX_BRIDGE_TOKEN;
+  const previousSecret = process.env.CODEX_BRIDGE_TOTP_SECRET;
+  process.env.CODEX_BRIDGE_TOKEN = 'secret-token';
+  process.env.CODEX_BRIDGE_TOTP_SECRET = TOTP_TEST_SECRET;
+  const config = createTestConfig();
+  const { server } = createApp({ config, adapter: new MockCodexAdapter() });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+
+  try {
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    const script = await fetch(`${baseUrl}/desktop/script/client.js`, {
+      headers: {
+        'x-codex-bridge-token': 'secret-token',
+        'x-codex-bridge-otp': generateTotp(TOTP_TEST_SECRET)
+      }
+    });
+    assert.equal(script.status, 200);
+    const body = await script.text();
+    assert.doesNotMatch(body, /secret-token/);
+    assert.match(body, /const authRequired = true;/);
+    assert.match(body, /codex-hramony-bridge-token/);
+
+    const status = await fetch(`${baseUrl}/desktop/script/status`, {
+      headers: {
+        'x-codex-bridge-token': 'secret-token',
+        'x-codex-bridge-otp': generateTotp(TOTP_TEST_SECRET)
+      }
+    });
+    assert.equal(status.status, 200);
+    const snapshot = (await status.json()).bridge;
+    assert.equal(snapshot.scriptAuth.required, true);
+    assert.equal(snapshot.scriptAuth.otpRequired, true);
+    assert.equal(snapshot.scriptAuth.clientTokenEmbedded, false);
+  } finally {
+    server.close();
+    restoreEnv('CODEX_BRIDGE_TOKEN', previousToken);
+    restoreEnv('CODEX_BRIDGE_TOTP_SECRET', previousSecret);
+  }
+});
+
+test('auth failures are audited to security jsonl without secrets', async () => {
+  const previousToken = process.env.CODEX_BRIDGE_TOKEN;
+  const previousSecret = process.env.CODEX_BRIDGE_TOTP_SECRET;
+  const previousLogDir = process.env.CODEX_BRIDGE_LOG_DIR;
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-auth-audit-'));
+  process.env.CODEX_BRIDGE_TOKEN = 'secret-token';
+  process.env.CODEX_BRIDGE_TOTP_SECRET = TOTP_TEST_SECRET;
+  process.env.CODEX_BRIDGE_LOG_DIR = root;
+  const config = createTestConfig();
+  config.threadService = {
+    async listProjects() {
+      return config.projects;
+    }
+  };
+  config.logger = new DiagnosticLogger({ root });
+  const { server, logger } = createApp({ config, adapter: new MockCodexAdapter() });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const wrong = wrongTotpCode(TOTP_TEST_SECRET);
+
+  try {
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    await fetch(`${baseUrl}/projects`, {
+      headers: { authorization: 'Bearer bad-token', 'x-forwarded-for': 'audit-test' }
+    });
+    await fetch(`${baseUrl}/projects`, {
+      headers: { 'x-codex-bridge-token': 'secret-token', 'x-forwarded-for': 'audit-test' }
+    });
+    await fetch(`${baseUrl}/projects`, {
+      headers: {
+        'x-codex-bridge-token': 'secret-token',
+        'x-codex-bridge-otp': wrong,
+        'x-forwarded-for': 'audit-test'
+      }
+    });
+    await logger.flushAnalysis();
+
+    const auditLog = await fs.readFile(path.join(root, 'current-run', 'security.jsonl'), 'utf8');
+    assert.match(auditLog, /"event":"bridge\.auth\.failed"/);
+    assert.match(auditLog, /"category":"token"/);
+    assert.match(auditLog, /"category":"otp_missing"/);
+    assert.match(auditLog, /"category":"otp_invalid"/);
+    assert.match(auditLog, /"xForwardedFor":"audit-test"/);
+    assert.match(auditLog, /"pathname":"\/projects"/);
+    assert.doesNotMatch(auditLog, /secret-token/);
+    assert.doesNotMatch(auditLog, /bad-token/);
+    assert.doesNotMatch(auditLog, new RegExp(wrong));
+    assert.doesNotMatch(auditLog, new RegExp(generateTotp(TOTP_TEST_SECRET)));
+  } finally {
+    server.close();
+    restoreEnv('CODEX_BRIDGE_TOKEN', previousToken);
+    restoreEnv('CODEX_BRIDGE_TOTP_SECRET', previousSecret);
+    restoreEnv('CODEX_BRIDGE_LOG_DIR', previousLogDir);
+  }
+});
+
+test('rate limits repeated auth failures per source and recovers after the window slides', async () => {
+  const previousToken = process.env.CODEX_BRIDGE_TOKEN;
+  const previousSecret = process.env.CODEX_BRIDGE_TOTP_SECRET;
+  process.env.CODEX_BRIDGE_TOKEN = 'secret-token';
+  process.env.CODEX_BRIDGE_TOTP_SECRET = TOTP_TEST_SECRET;
+  let clockMs = 1_700_000_000_000;
+  const config = createTestConfig();
+  config.authClock = () => clockMs;
+  config.threadService = {
+    async listProjects() {
+      return config.projects;
+    }
+  };
+  const { server } = createApp({ config, adapter: new MockCodexAdapter() });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+
+  try {
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    const badHeaders = {
+      'x-codex-bridge-token': 'secret-token',
+      'x-codex-bridge-otp': 'not-a-code',
+      'x-forwarded-for': 'rate-limit-test'
+    };
+
+    for (let attempt = 0; attempt < 11; attempt += 1) {
+      const response = await fetch(`${baseUrl}/projects?attempt=${attempt}`, { headers: badHeaders });
+      assert.equal(response.status, 401);
+    }
+
+    const limited = await fetch(`${baseUrl}/projects`, { headers: badHeaders });
+    assert.equal(limited.status, 429);
+    assert.ok(Number(limited.headers.get('retry-after')) >= 1);
+
+    const blockedWithValidCredentials = await fetch(`${baseUrl}/projects`, {
+      headers: {
+        'x-codex-bridge-token': 'secret-token',
+        'x-codex-bridge-otp': generateTotp(TOTP_TEST_SECRET, { nowMs: clockMs }),
+        'x-forwarded-for': 'rate-limit-test'
+      }
+    });
+    assert.equal(blockedWithValidCredentials.status, 429);
+
+    clockMs += 61_000;
+    const recovered = await fetch(`${baseUrl}/projects`, {
+      headers: {
+        'x-codex-bridge-token': 'secret-token',
+        'x-codex-bridge-otp': generateTotp(TOTP_TEST_SECRET, { nowMs: clockMs }),
+        'x-forwarded-for': 'rate-limit-test'
+      }
+    });
+    assert.equal(recovered.status, 200);
+  } finally {
+    server.close();
+    restoreEnv('CODEX_BRIDGE_TOKEN', previousToken);
+    restoreEnv('CODEX_BRIDGE_TOTP_SECRET', previousSecret);
+  }
+});
+
+test('desktop script loopback without forwarded-for is exempt from OTP while token still required', async () => {
+  const previousToken = process.env.CODEX_BRIDGE_TOKEN;
+  const previousSecret = process.env.CODEX_BRIDGE_TOTP_SECRET;
+  const previousLogDir = process.env.CODEX_BRIDGE_LOG_DIR;
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-otp-exempt-'));
+  process.env.CODEX_BRIDGE_TOKEN = 'secret-token';
+  process.env.CODEX_BRIDGE_TOTP_SECRET = TOTP_TEST_SECRET;
+  process.env.CODEX_BRIDGE_LOG_DIR = root;
+  const config = createTestConfig();
+  config.logger = new DiagnosticLogger({ root });
+  const { server, logger } = createApp({ config, adapter: new MockCodexAdapter() });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+
+  try {
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+
+    const tokenless = await fetch(`${baseUrl}/desktop/script/status`);
+    assert.equal(tokenless.status, 401);
+    assert.equal(tokenless.headers.get('x-codex-bridge-2fa'), null);
+
+    const status = await fetch(`${baseUrl}/desktop/script/status`, {
+      headers: { 'x-codex-bridge-token': 'secret-token' }
+    });
+    assert.equal(status.status, 200);
+
+    const connected = await fetch(`${baseUrl}/desktop/script/connect`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-codex-bridge-token': 'secret-token'
+      },
+      body: JSON.stringify({ scriptId: 'exempt-script', currentSessionId: '019e-test-session' })
+    });
+    assert.equal(connected.status, 200);
+
+    await logger.flushAnalysis();
+    const auditLog = await fs.readFile(path.join(root, 'current-run', 'security.jsonl'), 'utf8');
+    assert.match(auditLog, /"category":"token"/);
+    assert.doesNotMatch(auditLog, /"category":"otp_missing"/);
+  } finally {
+    desktopScriptBridge.reset();
+    server.close();
+    restoreEnv('CODEX_BRIDGE_TOKEN', previousToken);
+    restoreEnv('CODEX_BRIDGE_TOTP_SECRET', previousSecret);
+    restoreEnv('CODEX_BRIDGE_LOG_DIR', previousLogDir);
+  }
+});
+
+test('mapped loopback remote address keeps the desktop script OTP exemption', async () => {
+  const previousToken = process.env.CODEX_BRIDGE_TOKEN;
+  const previousSecret = process.env.CODEX_BRIDGE_TOTP_SECRET;
+  process.env.CODEX_BRIDGE_TOKEN = 'secret-token';
+  process.env.CODEX_BRIDGE_TOTP_SECRET = TOTP_TEST_SECRET;
+  const config = createTestConfig();
+  config.authRemoteAddress = () => '::ffff:127.0.0.1';
+  const { server } = createApp({ config, adapter: new MockCodexAdapter() });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+
+  try {
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    const response = await fetch(`${baseUrl}/desktop/script/status`, {
+      headers: { 'x-codex-bridge-token': 'secret-token' }
+    });
+    assert.equal(response.status, 200);
+  } finally {
+    server.close();
+    restoreEnv('CODEX_BRIDGE_TOKEN', previousToken);
+    restoreEnv('CODEX_BRIDGE_TOTP_SECRET', previousSecret);
+  }
+});
+
+test('loopback requests carrying x-forwarded-for still require OTP', async () => {
+  const previousToken = process.env.CODEX_BRIDGE_TOKEN;
+  const previousSecret = process.env.CODEX_BRIDGE_TOTP_SECRET;
+  process.env.CODEX_BRIDGE_TOKEN = 'secret-token';
+  process.env.CODEX_BRIDGE_TOTP_SECRET = TOTP_TEST_SECRET;
+  const config = createTestConfig();
+  const { server } = createApp({ config, adapter: new MockCodexAdapter() });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+
+  try {
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    const response = await fetch(`${baseUrl}/desktop/script/status`, {
+      headers: {
+        'x-codex-bridge-token': 'secret-token',
+        'x-forwarded-for': '100.64.0.7'
+      }
+    });
+    assert.equal(response.status, 401);
+    assert.equal(response.headers.get('x-codex-bridge-2fa'), 'required');
+  } finally {
+    server.close();
+    restoreEnv('CODEX_BRIDGE_TOKEN', previousToken);
+    restoreEnv('CODEX_BRIDGE_TOTP_SECRET', previousSecret);
+  }
+});
+
+test('OTP exemption only covers desktop script routes', async () => {
+  const previousToken = process.env.CODEX_BRIDGE_TOKEN;
+  const previousSecret = process.env.CODEX_BRIDGE_TOTP_SECRET;
+  process.env.CODEX_BRIDGE_TOKEN = 'secret-token';
+  process.env.CODEX_BRIDGE_TOTP_SECRET = TOTP_TEST_SECRET;
+  const config = createTestConfig();
+  const { server } = createApp({ config, adapter: new MockCodexAdapter() });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+
+  try {
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    const response = await fetch(`${baseUrl}/projects`, {
+      headers: { 'x-codex-bridge-token': 'secret-token' }
+    });
+    assert.equal(response.status, 401);
+    assert.equal(response.headers.get('x-codex-bridge-2fa'), 'required');
+  } finally {
+    server.close();
+    restoreEnv('CODEX_BRIDGE_TOKEN', previousToken);
+    restoreEnv('CODEX_BRIDGE_TOTP_SECRET', previousSecret);
+  }
+});
+
+test('non-loopback desktop script requests still require OTP', async () => {
+  const previousToken = process.env.CODEX_BRIDGE_TOKEN;
+  const previousSecret = process.env.CODEX_BRIDGE_TOTP_SECRET;
+  process.env.CODEX_BRIDGE_TOKEN = 'secret-token';
+  process.env.CODEX_BRIDGE_TOTP_SECRET = TOTP_TEST_SECRET;
+  const config = createTestConfig();
+  config.authRemoteAddress = () => '10.0.0.8';
+  const { server } = createApp({ config, adapter: new MockCodexAdapter() });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+
+  try {
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    const response = await fetch(`${baseUrl}/desktop/script/status`, {
+      headers: { 'x-codex-bridge-token': 'secret-token' }
+    });
+    assert.equal(response.status, 401);
+    assert.equal(response.headers.get('x-codex-bridge-2fa'), 'required');
+  } finally {
+    server.close();
+    restoreEnv('CODEX_BRIDGE_TOKEN', previousToken);
+    restoreEnv('CODEX_BRIDGE_TOTP_SECRET', previousSecret);
+  }
+});
+
+test('health endpoint allows token-only loopback probes without forwarded-for and audits no otp_missing', async () => {
+  const previousToken = process.env.CODEX_BRIDGE_TOKEN;
+  const previousSecret = process.env.CODEX_BRIDGE_TOTP_SECRET;
+  const previousLogDir = process.env.CODEX_BRIDGE_LOG_DIR;
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-health-exempt-'));
+  process.env.CODEX_BRIDGE_TOKEN = 'secret-token';
+  process.env.CODEX_BRIDGE_TOTP_SECRET = TOTP_TEST_SECRET;
+  process.env.CODEX_BRIDGE_LOG_DIR = root;
+  const config = createTestConfig();
+  config.logger = new DiagnosticLogger({ root });
+  const { server, logger } = createApp({ config, adapter: new MockCodexAdapter() });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+
+  try {
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+
+    const tokenless = await fetch(`${baseUrl}/health`);
+    assert.equal(tokenless.status, 401);
+    assert.equal(tokenless.headers.get('x-codex-bridge-2fa'), null);
+
+    const health = await fetch(`${baseUrl}/health`, {
+      headers: { 'x-codex-bridge-token': 'secret-token' }
+    });
+    assert.equal(health.status, 200);
+    const body = await health.json();
+    assert.equal(body.ok, true);
+
+    await logger.flushAnalysis();
+    const auditLog = await fs.readFile(path.join(root, 'current-run', 'security.jsonl'), 'utf8');
+    assert.match(auditLog, /"category":"token"/);
+    assert.doesNotMatch(auditLog, /"category":"otp_missing"/);
+  } finally {
+    server.close();
+    restoreEnv('CODEX_BRIDGE_TOKEN', previousToken);
+    restoreEnv('CODEX_BRIDGE_TOTP_SECRET', previousSecret);
+    restoreEnv('CODEX_BRIDGE_LOG_DIR', previousLogDir);
+  }
+});
+
+test('health endpoint on loopback with forwarded-for still requires OTP', async () => {
+  const previousToken = process.env.CODEX_BRIDGE_TOKEN;
+  const previousSecret = process.env.CODEX_BRIDGE_TOTP_SECRET;
+  process.env.CODEX_BRIDGE_TOKEN = 'secret-token';
+  process.env.CODEX_BRIDGE_TOTP_SECRET = TOTP_TEST_SECRET;
+  const config = createTestConfig();
+  const { server } = createApp({ config, adapter: new MockCodexAdapter() });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+
+  try {
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    const response = await fetch(`${baseUrl}/health`, {
+      headers: {
+        'x-codex-bridge-token': 'secret-token',
+        'x-forwarded-for': '100.64.0.7'
+      }
+    });
+    assert.equal(response.status, 401);
+    assert.equal(response.headers.get('x-codex-bridge-2fa'), 'required');
+  } finally {
+    server.close();
+    restoreEnv('CODEX_BRIDGE_TOKEN', previousToken);
+    restoreEnv('CODEX_BRIDGE_TOTP_SECRET', previousSecret);
+  }
+});
+
+test('health endpoint from non-loopback still requires OTP', async () => {
+  const previousToken = process.env.CODEX_BRIDGE_TOKEN;
+  const previousSecret = process.env.CODEX_BRIDGE_TOTP_SECRET;
+  process.env.CODEX_BRIDGE_TOKEN = 'secret-token';
+  process.env.CODEX_BRIDGE_TOTP_SECRET = TOTP_TEST_SECRET;
+  const config = createTestConfig();
+  config.authRemoteAddress = () => '10.0.0.9';
+  const { server } = createApp({ config, adapter: new MockCodexAdapter() });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+
+  try {
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    const response = await fetch(`${baseUrl}/health`, {
+      headers: { 'x-codex-bridge-token': 'secret-token' }
+    });
+    assert.equal(response.status, 401);
+    assert.equal(response.headers.get('x-codex-bridge-2fa'), 'required');
+  } finally {
+    server.close();
+    restoreEnv('CODEX_BRIDGE_TOKEN', previousToken);
+    restoreEnv('CODEX_BRIDGE_TOTP_SECRET', previousSecret);
+  }
+});
+
+test('health endpoint still requires token on exempt loopback shape', async () => {
+  const previousToken = process.env.CODEX_BRIDGE_TOKEN;
+  const previousSecret = process.env.CODEX_BRIDGE_TOTP_SECRET;
+  process.env.CODEX_BRIDGE_TOKEN = 'secret-token';
+  process.env.CODEX_BRIDGE_TOTP_SECRET = TOTP_TEST_SECRET;
+  const config = createTestConfig();
+  const { server } = createApp({ config, adapter: new MockCodexAdapter() });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+
+  try {
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    const response = await fetch(`${baseUrl}/health`);
+    assert.equal(response.status, 401);
+    assert.equal(response.headers.get('x-codex-bridge-2fa'), null);
+  } finally {
+    server.close();
+    restoreEnv('CODEX_BRIDGE_TOKEN', previousToken);
+    restoreEnv('CODEX_BRIDGE_TOTP_SECRET', previousSecret);
+  }
+});
+
+test('desktop live status allows token-only loopback probes without forwarded-for', async () => {
+  const previousToken = process.env.CODEX_BRIDGE_TOKEN;
+  const previousSecret = process.env.CODEX_BRIDGE_TOTP_SECRET;
+  process.env.CODEX_BRIDGE_TOKEN = 'secret-token';
+  process.env.CODEX_BRIDGE_TOTP_SECRET = TOTP_TEST_SECRET;
+  const config = createTestConfig();
+  const { server } = createApp({ config, adapter: new MockCodexAdapter() });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+
+  try {
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    const response = await fetch(`${baseUrl}/desktop/live/status`, {
+      headers: { 'x-codex-bridge-token': 'secret-token' }
+    });
+    assert.equal(response.status, 200);
+  } finally {
+    server.close();
+    restoreEnv('CODEX_BRIDGE_TOKEN', previousToken);
+    restoreEnv('CODEX_BRIDGE_TOTP_SECRET', previousSecret);
+  }
+});
+
+test('desktop live status on loopback with forwarded-for still requires OTP', async () => {
+  const previousToken = process.env.CODEX_BRIDGE_TOKEN;
+  const previousSecret = process.env.CODEX_BRIDGE_TOTP_SECRET;
+  process.env.CODEX_BRIDGE_TOKEN = 'secret-token';
+  process.env.CODEX_BRIDGE_TOTP_SECRET = TOTP_TEST_SECRET;
+  const config = createTestConfig();
+  const { server } = createApp({ config, adapter: new MockCodexAdapter() });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+
+  try {
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    const response = await fetch(`${baseUrl}/desktop/live/status`, {
+      headers: {
+        'x-codex-bridge-token': 'secret-token',
+        'x-forwarded-for': '100.64.0.7'
+      }
+    });
+    assert.equal(response.status, 401);
+    assert.equal(response.headers.get('x-codex-bridge-2fa'), 'required');
+  } finally {
+    server.close();
+    restoreEnv('CODEX_BRIDGE_TOKEN', previousToken);
+    restoreEnv('CODEX_BRIDGE_TOTP_SECRET', previousSecret);
+  }
+});
+
+test('desktop live status from non-loopback still requires OTP', async () => {
+  const previousToken = process.env.CODEX_BRIDGE_TOKEN;
+  const previousSecret = process.env.CODEX_BRIDGE_TOTP_SECRET;
+  process.env.CODEX_BRIDGE_TOKEN = 'secret-token';
+  process.env.CODEX_BRIDGE_TOTP_SECRET = TOTP_TEST_SECRET;
+  const config = createTestConfig();
+  config.authRemoteAddress = () => '10.0.0.9';
+  const { server } = createApp({ config, adapter: new MockCodexAdapter() });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+
+  try {
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    const response = await fetch(`${baseUrl}/desktop/live/status`, {
+      headers: { 'x-codex-bridge-token': 'secret-token' }
+    });
+    assert.equal(response.status, 401);
+    assert.equal(response.headers.get('x-codex-bridge-2fa'), 'required');
+  } finally {
+    server.close();
+    restoreEnv('CODEX_BRIDGE_TOKEN', previousToken);
+    restoreEnv('CODEX_BRIDGE_TOTP_SECRET', previousSecret);
+  }
+});
+
+test('paths outside desktop and health keep full 2FA on loopback without forwarded-for', async () => {
+  const previousToken = process.env.CODEX_BRIDGE_TOKEN;
+  const previousSecret = process.env.CODEX_BRIDGE_TOTP_SECRET;
+  process.env.CODEX_BRIDGE_TOKEN = 'secret-token';
+  process.env.CODEX_BRIDGE_TOTP_SECRET = TOTP_TEST_SECRET;
+  const config = createTestConfig();
+  const { server } = createApp({ config, adapter: new MockCodexAdapter() });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+
+  try {
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    for (const pathname of ['/tasks', '/mobile/logs']) {
+      const response = await fetch(`${baseUrl}${pathname}`, {
+        headers: { 'x-codex-bridge-token': 'secret-token' }
+      });
+      assert.equal(response.status, 401, pathname);
+      assert.equal(response.headers.get('x-codex-bridge-2fa'), 'required', pathname);
+    }
+  } finally {
+    server.close();
+    restoreEnv('CODEX_BRIDGE_TOKEN', previousToken);
+    restoreEnv('CODEX_BRIDGE_TOTP_SECRET', previousSecret);
+  }
+});

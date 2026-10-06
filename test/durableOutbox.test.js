@@ -10,6 +10,37 @@ async function createTempOutboxPath() {
   return path.join(root, 'outbox.json');
 }
 
+test('asynchronous delivery stays dispatching until receipt and never dispatches twice', async () => {
+  let calls = 0;
+  let receipt = { status: 'unknown' };
+  const outbox = new DurableOutbox({ filePath: await createTempOutboxPath(), schedule: false,
+    dispatch: async () => { calls++; return { run: { id: 'task-1' }, deliveryPending: true }; },
+    reconcile: async () => receipt });
+  const item = await outbox.enqueue(sampleItem());
+  await outbox.dispatchReady();
+  assert.equal(outbox.get(item.id).status, 'dispatching');
+  assert.equal(outbox.get(item.id).submittedAt, '');
+  await outbox.dispatchReady();
+  assert.equal(calls, 1);
+  receipt = { status: 'submitted', result: { run: { id: 'task-1' } } };
+  await outbox.dispatchReady();
+  assert.equal(outbox.get(item.id).status, 'submitted');
+  assert.equal(outbox.get(item.id).resultId, 'task-1');
+  assert.equal(calls, 1);
+});
+
+test('a steering transport timeout is uncertain and is not retried automatically', async () => {
+  let calls = 0;
+  const outbox = new DurableOutbox({ filePath: await createTempOutboxPath(), schedule: false,
+    dispatch: async () => { calls++; throw Object.assign(new Error('CDP timeout'), { deliveryUncertain: true }); } });
+  const item = await outbox.enqueue(sampleItem());
+  await outbox.dispatchReady();
+  assert.equal(outbox.get(item.id).status, 'uncertain');
+  assert.equal(outbox.get(item.id).retryable, false);
+  await outbox.dispatchReady();
+  assert.equal(calls, 1);
+});
+
 function sampleItem(overrides = {}) {
   return {
     kind: 'existing_thread',
@@ -30,6 +61,22 @@ function sampleItem(overrides = {}) {
   };
 }
 
+test('late receipt reconciliation cannot resurrect a canceled uncertain message', async () => {
+  const outbox = new DurableOutbox({ filePath: await createTempOutboxPath(), schedule: false,
+    dispatch: async () => { throw Object.assign(new Error('timeout'), { deliveryUncertain: true }); } });
+  const item = await outbox.enqueue(sampleItem());
+  await outbox.dispatchReady();
+  const started = Promise.withResolvers();
+  const reply = Promise.withResolvers();
+  outbox.reconcile = async () => { started.resolve(); return reply.promise; };
+  const pending = outbox.reconcileUncertainItems();
+  await started.promise;
+  await outbox.cancel(item.id);
+  reply.resolve({ status: 'uncertain', error: 'no receipt' });
+  await pending;
+  assert.equal(outbox.get(item.id).status, 'canceled');
+});
+
 test('durable outbox survives restart and deduplicates a submission id', async () => {
   const filePath = await createTempOutboxPath();
   const first = new DurableOutbox({ filePath, dispatch: async () => ({ id: 'run-1' }), schedule: false });
@@ -46,6 +93,25 @@ test('durable outbox survives restart and deduplicates a submission id', async (
   assert.equal(listed.length, 1);
   assert.equal(listed[0].submissionId, 'phone-1');
   assert.equal(listed[0].text, '第一条消息');
+});
+
+test('a persisted non-retryable failure does not block later messages or resend itself', async () => {
+  const filePath = await createTempOutboxPath();
+  const first = new DurableOutbox({ filePath, schedule: false,
+    dispatch: async () => { throw Object.assign(new Error('no active turn to steer'), { statusCode: 409 }); }
+  });
+  const failed = await first.enqueue(sampleItem({ submissionId: 'failed' }));
+  await first.dispatchReady();
+  assert.equal(first.get(failed.id).retryable, false);
+  const calls = [];
+  const restored = new DurableOutbox({ filePath, schedule: false,
+    dispatch: async (item) => { calls.push(item.submissionId); return { id: 'run-next' }; }
+  });
+  const next = await restored.enqueue(sampleItem({ submissionId: 'next' }));
+  await restored.dispatchReady();
+  assert.deepEqual(calls, ['next']);
+  assert.equal(restored.get(next.id).status, 'submitted');
+  assert.equal(restored.get(failed.id).status, 'failed');
 });
 
 test('durable outbox dispatches only the first item in a session lane', async () => {

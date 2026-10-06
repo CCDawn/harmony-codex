@@ -92,7 +92,7 @@ test('assistant messages stay borderless but gain a readable inset and visual an
 
   assert.match(assistantBody, /\.width\(6\)[\s\S]*\.backgroundColor\(this\.theme\(\)\.accent\)/);
   assert.match(assistantBody, /\.width\('88%'\)/);
-  assert.match(assistantBody, /\.padding\(\{ left: 12, right: 0, top: 3, bottom: 8 \}\)/);
+  assert.match(assistantBody, /\.padding\(\{ left: 12, right: 0, top: 2, bottom: 4 \}\)/);
   assert.doesNotMatch(assistantBody, /\.backgroundColor\([^)]*\)[\s\S]{0,100}\.border\(/);
 });
 

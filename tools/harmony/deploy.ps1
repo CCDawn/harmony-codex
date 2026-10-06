@@ -8,6 +8,7 @@ param(
   [switch]$RelayHostedByHelper,
   [string]$BridgeUrl = '',
   [string]$BridgeToken = $env:CODEX_BRIDGE_TOKEN,
+  [string]$BridgeTotpSecret = $env:CODEX_BRIDGE_TOTP_SECRET,
   [string[]]$DeviceId = @(),
   [string]$ConfigPath = '',
   [string]$ProjectPath = ''
@@ -863,6 +864,7 @@ function Set-BridgeUrl {
     [string]$ProjectRoot,
     [string]$BridgeUrl,
     [string]$BridgeToken,
+    [string]$BridgeTotpSecret,
     [switch]$RelayHostedByHelper,
     [string]$BundleName = ''
   )
@@ -874,7 +876,23 @@ function Set-BridgeUrl {
   $configPath = Join-Path $ProjectRoot 'entry\src\main\ets\config\BridgeConfig.ets'
   $escaped = $BridgeUrl.Trim().Replace('\', '\\').Replace("'", "\'")
   $bridgeTokenValue = if ([string]::IsNullOrWhiteSpace($BridgeToken)) { [string]$env:CODEX_BRIDGE_TOKEN } else { $BridgeToken }
+  if ([string]::IsNullOrWhiteSpace($bridgeTokenValue) -and (Test-Path -LiteralPath $configPath)) {
+    $tokenConfigText = Get-Content -Raw -LiteralPath $configPath
+    $tokenMatch = [regex]::Match($tokenConfigText, "DEFAULT_BRIDGE_TOKEN:\s*string\s*=\s*'([^']*)'")
+    if ($tokenMatch.Success) {
+      $bridgeTokenValue = $tokenMatch.Groups[1].Value
+    }
+  }
   $escapedBridgeToken = $bridgeTokenValue.Trim().Replace('\', '\\').Replace("'", "\'")
+  $bridgeTotpSecretValue = if ([string]::IsNullOrWhiteSpace($BridgeTotpSecret)) { [string]$env:CODEX_BRIDGE_TOTP_SECRET } else { $BridgeTotpSecret }
+  if ([string]::IsNullOrWhiteSpace($bridgeTotpSecretValue) -and (Test-Path -LiteralPath $configPath)) {
+    $configText = Get-Content -Raw -LiteralPath $configPath
+    $totpMatch = [regex]::Match($configText, "DEFAULT_BRIDGE_TOTP_SECRET:\s*string\s*=\s*'([^']*)'")
+    if ($totpMatch.Success) {
+      $bridgeTotpSecretValue = $totpMatch.Groups[1].Value
+    }
+  }
+  $escapedBridgeTotpSecret = $bridgeTotpSecretValue.Trim().Replace('\', '\\').Replace("'", "\'")
   $repoRootForProject = Split-Path -Parent $ProjectRoot
   $relayConfigPath = Join-Path $repoRootForProject 'tools\harmony\hdc-relay.local.psd1'
   $relayConfig = @{}
@@ -900,6 +918,7 @@ function Set-BridgeUrl {
   $content = @"
 export const DEFAULT_BRIDGE_URL: string = '$escaped';
 export const DEFAULT_BRIDGE_TOKEN: string = '$escapedBridgeToken';
+export const DEFAULT_BRIDGE_TOTP_SECRET: string = '$escapedBridgeTotpSecret';
 export const DEFAULT_RELAY_HOST: string = '$relayHost';
 export const DEFAULT_RELAY_PORT: string = '$relayPort';
 export const DEFAULT_DEVICE_ID: string = '$deviceIdValue';
@@ -913,6 +932,9 @@ export const DEFAULT_EMBEDDED_RELAY_ENABLED: boolean = $embeddedRelayEnabled;
   Write-Info "已写入默认 Bridge URL: $BridgeUrl"
   if ($bridgeTokenValue.Trim().Length -gt 0) {
     Write-Info "已写入默认 Bridge Token: [REDACTED]"
+  }
+  if ($bridgeTotpSecretValue.Trim().Length -gt 0) {
+    Write-Info "已写入默认 Bridge TOTP Secret: [REDACTED]"
   }
   if (Test-Path -LiteralPath $relayConfigPath) {
     Write-Info "已写入 HDC Relay 配置: $relayConfigPath; embeddedRelay=$embeddedRelayEnabled"
@@ -1096,7 +1118,7 @@ if ($StartBridge -and -not $UseLanBridge) {
   Write-Info "默认启用 USB Bridge URL: $BridgeUrl"
 }
 
-Set-BridgeUrl -ProjectRoot $projectRoot -BridgeUrl $BridgeUrl -BridgeToken $BridgeToken -RelayHostedByHelper:$RelayHostedByHelper -BundleName ([string]$config.BundleName)
+Set-BridgeUrl -ProjectRoot $projectRoot -BridgeUrl $BridgeUrl -BridgeToken $BridgeToken -BridgeTotpSecret $BridgeTotpSecret -RelayHostedByHelper:$RelayHostedByHelper -BundleName ([string]$config.BundleName)
 
 if ($StartBridge) {
   if ([string]::IsNullOrWhiteSpace($BridgeUrl)) {

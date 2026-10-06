@@ -2,6 +2,8 @@
 param(
   [int]$BridgePort = 8787,
   [string]$BridgeToken = $env:CODEX_BRIDGE_TOKEN,
+  [string]$BridgeTotpSecret = $env:CODEX_BRIDGE_TOTP_SECRET,
+  [string]$BridgePublicUrl = $env:CODEX_BRIDGE_PUBLIC_URL,
   [string]$BridgeUrl = $env:CODEX_BRIDGE_URL,
   [string]$RuntimeMode = $env:CODEX_BRIDGE_RUNTIME_MODE,
   [string]$CanaryThreadIds = $env:CODEX_BRIDGE_APP_SERVER_CANARY_THREADS,
@@ -35,6 +37,14 @@ if ([string]::IsNullOrWhiteSpace($BridgeToken) -and (Test-Path -LiteralPath $bri
 $args = @{
   BridgePort = $BridgePort
   BridgeToken = $BridgeToken
+}
+
+if (-not [string]::IsNullOrWhiteSpace($BridgeTotpSecret)) {
+  $args.BridgeTotpSecret = $BridgeTotpSecret
+}
+
+if (-not [string]::IsNullOrWhiteSpace($BridgePublicUrl)) {
+  $args.BridgePublicUrl = $BridgePublicUrl
 }
 
 if ([string]::IsNullOrWhiteSpace($RuntimeMode)) {

@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
   [string]$ConfigPath = '',
   [int]$IntervalSeconds = 8,
@@ -62,20 +62,8 @@ function Test-LocalBridge {
 }
 
 function Stop-BridgeProxy {
-  $escapedRepo = [Regex]::Escape([string]$repoRoot)
-  $processes = @(Get-CimInstance Win32_Process | Where-Object {
-    $commandLine = [string]$_.CommandLine
-    if ($_.ProcessId -eq $PID -or [string]::IsNullOrWhiteSpace($commandLine)) {
-      return $false
-    }
-    return $commandLine -match $escapedRepo -and $commandLine -match 'bridge:relay-proxy|start-bridge-proxy\.mjs'
-  })
-  foreach ($proc in $processes) {
-    Write-Host "$(Get-Date -Format o) stop stale bridge-proxy PID=$($proc.ProcessId)" -ForegroundColor Yellow
-    Stop-Process -Id ([int]$proc.ProcessId) -Force -ErrorAction SilentlyContinue
-  }
+  Stop-MobileLinkOwnedProcesses -Repo ([string]$repoRoot) -Roles @('public-proxy') | Out-Null
 }
-
 function Start-BridgeProxy {
   $logRoot = Join-Path ([string]$repoRoot) 'logs\startup'
   New-Item -ItemType Directory -Force -Path $logRoot | Out-Null
@@ -91,7 +79,12 @@ function Start-BridgeProxy {
 
 Write-Host "Bridge proxy watchdog started: relay=${relayHost}:$relayPort" -ForegroundColor Green
 
+. (Join-Path ([string]$repoRoot) 'tools\windows\mobile-link-lifecycle.ps1')
+
 while ($true) {
+  $cycleGate = Enter-MobileLinkCycle ([string]$repoRoot)
+  if ($null -eq $cycleGate) { Start-Sleep -Seconds $IntervalSeconds; continue }
+  try {
   try {
     $state = Get-RelayState
     $bridgePc = [int]$state.bridgePc
@@ -115,5 +108,6 @@ while ($true) {
     Write-Host "$(Get-Date -Format o) bridge watchdog check failed: $($_.Exception.Message)" -ForegroundColor Yellow
   }
 
+  } finally { Exit-MobileLinkCycle $cycleGate }
   Start-Sleep -Seconds $IntervalSeconds
 }

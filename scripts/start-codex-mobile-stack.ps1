@@ -2,6 +2,8 @@
 param(
   [int]$BridgePort = 8787,
   [string]$BridgeToken = $env:CODEX_BRIDGE_TOKEN,
+  [string]$BridgeTotpSecret = $env:CODEX_BRIDGE_TOTP_SECRET,
+  [string]$BridgePublicUrl = $env:CODEX_BRIDGE_PUBLIC_URL,
   [string]$BridgeUrl = '',
   [string]$RuntimeMode = $env:CODEX_BRIDGE_RUNTIME_MODE,
   [string]$CanaryThreadIds = $env:CODEX_BRIDGE_APP_SERVER_CANARY_THREADS,
@@ -25,6 +27,8 @@ if ($RuntimeMode -notin @('desktop', 'desktop-primary', 'app-server-shadow', 'ap
 }
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
+. (Join-Path $repoRoot 'tools\windows\mobile-link-lifecycle.ps1')
+if (Test-MobileLinkPaused $repoRoot) { throw '链路已在管理应用中停止，请使用启动链路恢复。' }
 if ([string]::IsNullOrWhiteSpace($BridgeUrl)) {
   $BridgeUrl = "http://127.0.0.1:$BridgePort"
 }
@@ -35,6 +39,20 @@ if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
 
 $logRoot = Join-Path $repoRoot 'logs\startup'
 New-Item -ItemType Directory -Force -Path $logRoot | Out-Null
+
+# Voice link (M2): only enable the managed voice server when voice\voice_server.py exists,
+# so open-source users without the voice feature keep the bridge voice-free by default.
+$voiceServerPath = Join-Path $repoRoot 'voice\voice_server.py'
+$voiceEnabledText = '0'
+$voiceCommand = ''
+if (Test-Path -LiteralPath $voiceServerPath) {
+  $voiceEnabledText = '1'
+  $voicePython = Join-Path $repoRoot '.venv\Scripts\python.exe'
+  if (-not (Test-Path -LiteralPath $voicePython)) {
+    $voicePython = 'python'
+  }
+  $voiceCommand = '"{0}" "{1}" --port 8790' -f $voicePython, $voiceServerPath
+}
 
 function Resolve-CompatiblePowerShellHost {
   $pwsh = Get-Command pwsh.exe -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -183,10 +201,43 @@ function Write-Warn {
   Write-Host "    $Message" -ForegroundColor Yellow
 }
 
+function Get-BridgeOtpCode {
+  param([string]$Secret)
+  # RFC 6238 TOTP（HMAC-SHA1、30 秒、6 位），与服务端 CODEX_BRIDGE_TOTP_SECRET 对应。
+  if ([string]::IsNullOrWhiteSpace($Secret)) { return '' }
+  $alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567'
+  $bits = New-Object System.Text.StringBuilder
+  foreach ($ch in $Secret.Trim().ToUpper().ToCharArray()) {
+    $idx = $alphabet.IndexOf($ch)
+    if ($idx -ge 0) { [void]$bits.Append([Convert]::ToString($idx, 2).PadLeft(5, '0')) }
+  }
+  $keyBytes = New-Object System.Collections.Generic.List[byte]
+  $bitText = $bits.ToString()
+  for ($i = 0; ($i + 8) -le $bitText.Length; $i += 8) {
+    $keyBytes.Add([Convert]::ToByte($bitText.Substring($i, 8), 2))
+  }
+  if ($keyBytes.Count -eq 0) { return '' }
+  $counter = [UInt64][Math]::Floor([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() / 30)
+  $counterBytes = New-Object byte[] 8
+  for ($i = 7; $i -ge 0; $i -= 1) {
+    $counterBytes[$i] = [byte]($counter % 256)
+    $counter = [UInt64][Math]::Floor($counter / 256)
+  }
+  $hmac = New-Object System.Security.Cryptography.HMACSHA1 (, $keyBytes.ToArray())
+  $digest = $hmac.ComputeHash($counterBytes)
+  $offset = $digest[19] -band 15
+  $value = ([UInt32]($digest[$offset] -band 127) * 16777216) + ([UInt32]($digest[$offset + 1]) * 65536) + ([UInt32]($digest[$offset + 2]) * 256) + [UInt32]($digest[$offset + 3])
+  return ('{0:D6}' -f ($value % 1000000))
+}
+
 function Get-BridgeHeaders {
   $headers = @{}
   if (-not [string]::IsNullOrWhiteSpace($BridgeToken)) {
     $headers['X-Codex-Bridge-Token'] = $BridgeToken
+  }
+  $otpCode = Get-BridgeOtpCode -Secret $BridgeTotpSecret
+  if (-not [string]::IsNullOrWhiteSpace($otpCode)) {
+    $headers['X-Codex-Bridge-OTP'] = $otpCode
   }
   return $headers
 }
@@ -489,9 +540,13 @@ function Start-LocalBridgeProcess {
 `$env:CODEX_BRIDGE_PORT='$BridgePort'
 `$env:CODEX_BRIDGE_WORKSPACE='$repoRoot'
 `$env:CODEX_BRIDGE_TOKEN='$BridgeToken'
+`$env:CODEX_BRIDGE_TOTP_SECRET='$BridgeTotpSecret'
+`$env:CODEX_BRIDGE_PUBLIC_URL='$BridgePublicUrl'
 `$env:CODEX_BRIDGE_ADAPTER='codex'
 `$env:CODEX_BRIDGE_RUNTIME_MODE='$RuntimeMode'
 `$env:CODEX_BRIDGE_APP_SERVER_CANARY_THREADS='$CanaryThreadIds'
+`$env:CODEX_BRIDGE_VOICE_ENABLED='$VoiceEnabledText'
+`$env:CODEX_BRIDGE_VOICE_COMMAND='$VoiceCommand'
 node src/server.js
 "@
   Start-Process -WindowStyle Hidden -FilePath $script:PowerShellHostPath -ArgumentList @(
@@ -575,10 +630,10 @@ function Ensure-BackgroundScript {
 
 function Ensure-LocalBridgeWatchdog {
   Write-Step "检查本地 bridge 自动恢复"
-  $expectedArgument = "-RuntimeMode $RuntimeMode"
+  $expectedArgument = '-RuntimeMode\s+[''" ]?' + [regex]::Escape($RuntimeMode) + '(?:[''"]|\s|$)'
   $allProcesses = @(Get-CimInstance Win32_Process)
   $staleWatchdogs = @(Get-MatchingProcesses -Pattern 'watch-local-bridge\.ps1' -RequireRepoPath | Where-Object {
-    [string]$_.CommandLine -notlike "*$expectedArgument*"
+    [string]$_.CommandLine -notmatch $expectedArgument
   })
   foreach ($stale in $staleWatchdogs) {
     Write-Warn "检测到旧本地 bridge watchdog 模式，切换为 ${RuntimeMode}: PID=$($stale.ProcessId)"

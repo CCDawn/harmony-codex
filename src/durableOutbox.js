@@ -105,7 +105,9 @@ export class DurableOutbox {
       return [];
     }
     const reconciled = [];
-    for (const item of this.items.filter((candidate) => candidate.status === 'uncertain')) {
+    for (const item of this.items.filter((candidate) => candidate.status === 'uncertain'
+      || (candidate.status === 'dispatching' && candidate.resultId))) {
+      const revision = { status: item.status, updatedAt: item.updatedAt, lastAttemptAt: item.lastAttemptAt };
       let receipt = null;
       try {
         receipt = await this.reconcile(clone(item));
@@ -116,13 +118,28 @@ export class DurableOutbox {
         });
         continue;
       }
+      // A user can cancel or retry while the official history read is in flight.
+      // Its stale result must not resurrect a canceled queue entry.
+      if (item.status !== revision.status || item.updatedAt !== revision.updatedAt
+        || item.lastAttemptAt !== revision.lastAttemptAt) {
+        continue;
+      }
+      if (receipt?.status === 'failed' || receipt?.status === 'uncertain') {
+        item.status = receipt.status;
+        item.error = receipt.error || '未确认消息进入官方会话，请核对后重试';
+        item.retryable = false;
+        item.nextAttemptAt = '';
+        item.updatedAt = isoAt(this.now());
+        reconciled.push(clone(item));
+        continue;
+      }
       if (receipt?.status !== 'submitted') {
         await this.log('info', 'outbox.item.reconcile_unknown', summarize(item));
         continue;
       }
       item.status = 'submitted';
-      item.result = normalizeResult(receipt.result);
-      item.resultId = String(receipt.result?.id ?? receipt.result?.run?.id ?? '');
+      item.result = normalizeResult(receipt.result ?? item.result);
+      item.resultId = String(item.result?.id ?? item.result?.run?.id ?? item.resultId ?? '');
       item.error = '';
       item.retryable = false;
       item.nextAttemptAt = '';
@@ -299,6 +316,7 @@ export class DurableOutbox {
   }
 
   async dispatchReadyOnce() {
+    await this.reconcileUncertainItems();
     const now = this.now();
     const firstByLane = new Map();
     for (const item of this.items.slice().sort(compareOutboxItems)) {
@@ -309,6 +327,7 @@ export class DurableOutbox {
         candidate.laneKey === item.laneKey
         && candidate.order < item.order
         && ACTIVE_STATUSES.has(candidate.status)
+        && !(candidate.status === 'failed' && candidate.retryable === false)
         && candidate.status !== 'canceled'
         && candidate.status !== 'submitted'
       ));
@@ -360,22 +379,26 @@ export class DurableOutbox {
     await this.log('info', 'outbox.item.dispatching', summarize(item));
     try {
       const result = await this.dispatch(clone(item));
-      item.status = 'submitted';
+      item.status = result?.deliveryPending === true ? 'dispatching' : 'submitted';
       item.result = normalizeResult(result);
       item.resultId = String(result?.id ?? result?.run?.id ?? '');
       item.error = '';
       item.retryable = false;
       item.nextAttemptAt = '';
-      item.submittedAt = isoAt(this.now());
-      item.updatedAt = item.submittedAt;
+      item.submittedAt = item.status === 'submitted' ? isoAt(this.now()) : '';
+      item.updatedAt = isoAt(this.now());
       await this.persist();
-      await this.log('info', 'outbox.item.submitted', summarize(item));
+      await this.log('info', item.status === 'submitted' ? 'outbox.item.submitted' : 'outbox.item.awaiting_receipt', summarize(item));
       return clone(item);
     } catch (error) {
       item.attemptCount += 1;
-      item.status = 'failed';
+      item.status = error?.deliveryUncertain === true ? 'uncertain' : 'failed';
+      if (error?.deliveryUncertain === true) {
+        item.resultId = String(error.deliveryTaskId ?? '');
+        item.result = { deliveryPending: true, run: { id: item.resultId } };
+      }
       item.error = error?.message ?? String(error);
-      item.retryable = isRetryableOutboxError(error);
+      item.retryable = error?.deliveryUncertain !== true && isRetryableOutboxError(error);
       item.nextAttemptAt = item.retryable
         ? isoAt(this.now() + retryDelayMs(item.attemptCount, this))
         : '';
@@ -415,11 +438,24 @@ export class DurableOutbox {
       updatedAt: isoAt(this.now()),
       items: this.items
     }, null, 2);
-    this.persistPromise = this.persistPromise.then(async () => {
+    // A failed save must reach its caller without preventing future saves.
+    this.persistPromise = this.persistPromise.catch(() => {}).then(async () => {
       await fs.mkdir(path.dirname(this.filePath), { recursive: true });
       const temporaryPath = `${this.filePath}.${process.pid}.tmp`;
       await fs.writeFile(temporaryPath, snapshot, { encoding: 'utf8', mode: 0o600 });
-      await fs.rename(temporaryPath, this.filePath);
+      for (let attempt = 0; ; attempt += 1) {
+        try {
+          await fs.rename(temporaryPath, this.filePath);
+          break;
+        } catch (error) {
+          if (!['EPERM', 'EACCES', 'EBUSY'].includes(error?.code) || attempt >= 4) {
+            throw error;
+          }
+          // Windows readers can briefly hold the destination. Keep the old
+          // file intact and retry the atomic replacement with bounded backoff.
+          await new Promise(resolve => setTimeout(resolve, 25 * (2 ** attempt)));
+        }
+      }
     });
     return await this.persistPromise;
   }
@@ -433,11 +469,18 @@ export class DurableOutbox {
       this.timer = null;
     }
     const now = this.now();
-    const nextAt = this.items
+    let nextAt = this.items
       .filter((item) => item.status === 'queued' || (item.status === 'failed' && item.retryable))
       .map((item) => item.nextAttemptAt ? Date.parse(item.nextAttemptAt) : now)
       .filter(Number.isFinite)
       .sort((left, right) => left - right)[0];
+    if (this.items.some(item => item.status === 'dispatching' && item.resultId)) {
+      nextAt = Math.min(Number.isFinite(nextAt) ? nextAt : Infinity, now + 1500);
+    }
+    if (this.items.some(item => item.status === 'uncertain'
+      && now - Date.parse(item.lastAttemptAt) < 300_000)) {
+      nextAt = Math.min(Number.isFinite(nextAt) ? nextAt : Infinity, now + 5000);
+    }
     if (!Number.isFinite(nextAt) && delayOverride === null) {
       return;
     }
@@ -446,7 +489,10 @@ export class DurableOutbox {
       : Math.max(0, Number(delayOverride) || 0);
     this.timer = setTimeout(() => {
       this.timer = null;
-      void this.dispatchReady();
+      void this.dispatchReady().catch(error => this.log('error', 'outbox.dispatch.failed', {
+        code: error?.code,
+        message: String(error?.message ?? error)
+      })).catch(() => {});
     }, Math.min(delay, 2_147_483_647));
     this.timer.unref?.();
   }

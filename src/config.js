@@ -71,5 +71,15 @@ export const config = {
     .split(',')
     .map((value) => value.trim())
     .filter(Boolean),
+  // 语音链路（M2）：/voice 升级隧道目标端口 + 受管 voice_server.py 子进程。
+  // voiceEnabled 默认关闭，仅在显式 CODEX_BRIDGE_VOICE_ENABLED=1 时启用。
+  voiceEnabled: process.env.CODEX_BRIDGE_VOICE_ENABLED === '1',
+  voicePort: Math.max(1, Number.parseInt(process.env.CODEX_BRIDGE_VOICE_PORT ?? '8790', 10) || 8790),
+  voiceCommand: process.env.CODEX_BRIDGE_VOICE_COMMAND ?? '',
+  voiceAutoReconnect: process.env.CODEX_BRIDGE_VOICE_AUTO_RECONNECT !== '0',
+  voiceReconnectDelayMs: Math.max(
+    0,
+    Number.parseInt(process.env.CODEX_BRIDGE_VOICE_RECONNECT_DELAY_MS ?? '2000', 10) || 0
+  ),
   projects: resolveProjects()
 };

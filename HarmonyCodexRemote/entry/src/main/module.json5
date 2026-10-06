@@ -18,7 +18,7 @@
         "startWindowIcon": "$media:start_icon",
         "startWindowBackground": "$color:start_window_background",
         "orientation": "auto_rotation",
-        "backgroundModes": ["dataTransfer"],
+        "backgroundModes": ["dataTransfer", "avPlaybackAndRecord"],
         "exported": true,
         "skills": [
           {
@@ -72,6 +72,14 @@
       {
         "name": "ohos.permission.ACCELEROMETER",
         "reason": "$string:permission_sensor_reason",
+        "usedScene": {
+          "abilities": ["EntryAbility"],
+          "when": "inuse"
+        }
+      },
+      {
+        "name": "ohos.permission.MICROPHONE",
+        "reason": "$string:permission_mic_reason",
         "usedScene": {
           "abilities": ["EntryAbility"],
           "when": "inuse"

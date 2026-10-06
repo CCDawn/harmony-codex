@@ -2,6 +2,8 @@ import { CodexDesktopCdpAdapter } from './codexDesktopCdpAdapter.js';
 import { CodexDesktopScriptAdapter } from './codexDesktopScriptAdapter.js';
 
 export class HybridCodexAdapter {
+  get requiresDeliveryReceipt() { return true; }
+
   constructor(options = {}) {
     this.scriptDesktopAdapter = options.scriptDesktopAdapter
       ?? (options.desktopAdapter ? null : new CodexDesktopScriptAdapter(options));
@@ -110,6 +112,19 @@ export class HybridCodexAdapter {
           ? '已复用本次发送前的桌面会话校验结果。'
           : '桌面 App Server 已确认目标会话；桌面当前页面无需切换。')
     };
+  }
+
+  async steer(context) {
+    const targetSessionId = normalizeSessionId(
+      context?.task?.codexSessionId ?? context?.task?.createdCodexSessionId ?? ''
+    );
+    const desktopStatus = await this.getDesktopLiveStatus(this.desktopProbeTimeoutMs, targetSessionId);
+    this.selectDesktopAdapterForStatus(desktopStatus);
+    this.emitDesktopProbeResult(context, desktopStatus);
+    if (!isDesktopTargetReady(desktopStatus, targetSessionId)) {
+      throw createDesktopVerificationError(desktopStatus);
+    }
+    return this.desktopAdapter.steer(context);
   }
 
   async interrupt(context) {

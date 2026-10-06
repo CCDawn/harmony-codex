@@ -64,6 +64,11 @@ Ensure-FromExample `
   -LocalPath (Join-Path $repoRoot 'HarmonyCodexRemote\entry\src\main\ets\config\BridgeConfig.ets')
 
 Ensure-FromExample `
+  -Id 'voice-route-config' `
+  -ExamplePath (Join-Path $repoRoot 'HarmonyCodexRemote\entry\src\main\ets\config\VoiceRouteConfig.example.ets') `
+  -LocalPath (Join-Path $repoRoot 'HarmonyCodexRemote\entry\src\main\ets\config\VoiceRouteConfig.ets')
+
+Ensure-FromExample `
   -Id 'helper-bridge-config' `
   -ExamplePath (Join-Path $repoRoot 'HarmonyHdcRelayHelper\entry\src\main\ets\config\BridgeConfig.example.ets') `
   -LocalPath (Join-Path $repoRoot 'HarmonyHdcRelayHelper\entry\src\main\ets\config\BridgeConfig.ets')

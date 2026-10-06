@@ -6,7 +6,8 @@ param(
   [string]$SessionId = '',
   [string]$CodexAppPath = '',
   [switch]$KeepExistingCodex,
-  [switch]$UsePackagedActivation
+  [switch]$UsePackagedActivation,
+  [switch]$RefusePlainCodex
 )
 
 Set-StrictMode -Version Latest
@@ -32,6 +33,18 @@ function Write-Step {
   param([string]$Message)
   Write-Host ""
   Write-Host "==> $Message" -ForegroundColor Cyan
+}
+
+function Test-PlainCodexShellRunning {
+  $shells = @(Get-CodexDesktopProcesses | Where-Object {
+    [string]$_.CommandLine -notmatch '\s--type='
+  })
+  foreach ($proc in $shells) {
+    if ([string]$proc.CommandLine -notmatch 'remote-debugging-port') {
+      return $true
+    }
+  }
+  return $false
 }
 
 function Get-CodexDesktopProcesses {
@@ -68,7 +81,10 @@ function Resolve-CodexAppDir {
     return $resolved
   }
 
-  $appxPackage = Get-AppxPackage -Name OpenAI.Codex -ErrorAction SilentlyContinue | Select-Object -First 1
+  $appxPackages = @(Get-AppxPackage -Name OpenAI.Codex -ErrorAction SilentlyContinue)
+  $appxPackage = $appxPackages |
+    Sort-Object -Property @{ Expression = { try { [version]$_.Version } catch { [version]'0.0.0.0' } } } -Descending |
+    Select-Object -First 1
   if ($appxPackage -and -not [string]::IsNullOrWhiteSpace($appxPackage.InstallLocation)) {
     $appxAppDir = Join-Path ([string]$appxPackage.InstallLocation) 'app'
     if ((Test-Path -LiteralPath (Join-Path $appxAppDir 'ChatGPT.exe')) -or
@@ -364,6 +380,23 @@ function Start-PackagedCodex {
   return [uint32][CodexHramony.ActivationBridge]::ActivateApplication($AppUserModelId, $Arguments)
 }
 
+$relaunchMutex = New-Object System.Threading.Mutex($false, 'Local\CodexHarmonyDesktopRelaunch')
+$relaunchMutexOwned = $false
+try {
+  try {
+    $relaunchMutexOwned = $relaunchMutex.WaitOne(0)
+  } catch [System.Threading.AbandonedMutexException] {
+    $relaunchMutexOwned = $true
+  }
+} catch {
+  $relaunchMutexOwned = $false
+}
+if (-not $relaunchMutexOwned) {
+  Write-Host '已有 Codex 拉起正在进行，本次不重复启动。'
+  exit 10
+}
+
+try {
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $BridgeUrl = $BridgeUrl.TrimEnd('/')
 $codexAppDir = Resolve-CodexAppDir -ExplicitPath $CodexAppPath
@@ -375,6 +408,10 @@ $appUserModelId = Get-AppUserModelIdFromAppDir -AppDir $codexAppDir
 Write-Step "准备重启 Codex 桌面壳"
 Write-Host "Codex App: $codexAppDir" -ForegroundColor DarkGray
 Write-Host "AUMID: $appUserModelId" -ForegroundColor DarkGray
+if ($RefusePlainCodex -and (Test-PlainCodexShellRunning)) {
+  Write-Host '检测到普通 Codex 正在运行，已停止自动拉起。'
+  exit 11
+}
 if (-not $KeepExistingCodex) {
   Stop-DesktopLiveHost
   Stop-CodexDesktopShell
@@ -453,4 +490,10 @@ if (-not [string]::IsNullOrWhiteSpace($SessionId)) {
   $encodedSessionId = [System.Uri]::EscapeDataString($SessionId)
   $liveStatus = Invoke-BridgeJson -Url "$BridgeUrl/desktop/live/status?sessionId=$encodedSessionId" -Token $BridgeToken
   $liveStatus | ConvertTo-Json -Depth 8
+}
+} finally {
+  if ($relaunchMutexOwned) {
+    $relaunchMutex.ReleaseMutex() | Out-Null
+    $relaunchMutex.Dispose()
+  }
 }

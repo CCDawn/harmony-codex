@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
   [string]$ConfigPath = '',
   [int]$IntervalSeconds = 5
@@ -126,22 +126,8 @@ function Wait-LocalProxyListening {
 }
 
 function Stop-LocalProxyProcesses {
-  $processes = @(Get-CimInstance Win32_Process | Where-Object {
-      $commandLine = [string]$_.CommandLine
-      $_.ProcessId -ne $PID -and
-      -not [string]::IsNullOrWhiteSpace($commandLine) -and
-      (
-        $commandLine -match 'scripts[\\/]hdc-relay[\\/]start-local-proxy\.mjs' -or
-        $commandLine -match 'start-local-proxy\.mjs' -or
-        ($commandLine -match 'start-hdc-relay\.ps1' -and $commandLine -match '\bProxy\b')
-      )
-    })
-  foreach ($process in $processes) {
-    Write-Host "$(Get-Date -Format o) restart local proxy, stop PID=$($process.ProcessId)" -ForegroundColor Yellow
-    Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue
-  }
+  Stop-MobileLinkOwnedProcesses -Repo ([string]$repoRoot) -Roles @('hdc-proxy') | Out-Null
 }
-
 function Restart-LocalProxy {
   New-Item -ItemType Directory -Force -Path $startupLogRoot | Out-Null
   Stop-LocalProxyProcesses
@@ -222,7 +208,12 @@ function Connect-HdcTarget {
 
 Write-Host "HDC watchdog started: target=$target relay=${relayHost}:$relayPort device=$deviceId" -ForegroundColor Green
 
+. (Join-Path ([string]$repoRoot) 'tools\windows\mobile-link-lifecycle.ps1')
+
 while ($true) {
+  $cycleGate = Enter-MobileLinkCycle ([string]$repoRoot)
+  if ($null -eq $cycleGate) { Start-Sleep -Seconds $IntervalSeconds; continue }
+  try {
   try {
     $state = Get-RelayState
     $hasPhone = (Get-StateArray -State $state -Name 'phones') -contains $deviceId
@@ -271,5 +262,6 @@ while ($true) {
     Write-Host "$(Get-Date -Format o) watchdog check failed: $($_.Exception.Message)" -ForegroundColor Yellow
   }
 
+  } finally { Exit-MobileLinkCycle $cycleGate }
   Start-Sleep -Seconds $IntervalSeconds
 }

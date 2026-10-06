@@ -14,6 +14,8 @@ import {
 import { resolveSafeProjectRoot } from './workspaceGuard.js';
 
 export class CodexDesktopCdpAdapter {
+  get requiresDeliveryReceipt() { return true; }
+
   constructor(options = {}) {
     this.client = options.client ?? new CodexDesktopCdpClient(options);
     this.model = options.model ?? process.env.CODEX_BRIDGE_MODEL ?? '';
@@ -81,6 +83,7 @@ export class CodexDesktopCdpAdapter {
       10
     );
     this.notificationSubscriptions = new Map();
+    this.pendingTurnStarts = new Map();
     this.nextNotificationSubscriptionId = 1;
     this.notificationPoller = null;
     this.notificationDrainQueue = Promise.resolve();
@@ -194,6 +197,8 @@ export class CodexDesktopCdpAdapter {
   }
 
   async run({ task, project, emit }) {
+    const turnStart = Promise.withResolvers();
+    this.pendingTurnStarts.set(task.id, turnStart.promise);
     const notifications = [];
     let notificationPolling = null;
     let turnSubmitted = false;
@@ -247,7 +252,23 @@ export class CodexDesktopCdpAdapter {
 
         try {
           turnSubmitted = true;
-          const turnResponse = await this.startTurn(thread, task);
+          let turnResponse;
+          if (attempt === 1 && prepared.activeTurnId) {
+            try {
+              const steered = await this.steer({
+                task: { ...task, activeCodexTurnId: prepared.activeTurnId },
+                prompt: task.prompt,
+                emit
+              });
+              turnResponse = { turn: { id: steered.turnId, status: 'inProgress' } };
+            } catch (error) {
+              if (error?.code !== 'CODEX_STEER_NO_ACTIVE_TURN') throw error;
+              turnResponse = await this.startTurn(thread, task);
+            }
+          } else {
+            turnResponse = await this.startTurn(thread, task);
+          }
+          turnStart.resolve(turnResponse.turn?.id ?? '');
 
           emit('codex.app_server.turn.started', sanitize({
             ...turnResponse,
@@ -272,6 +293,7 @@ export class CodexDesktopCdpAdapter {
             emit
           });
         } catch (error) {
+          turnStart.resolve('');
           if (sessionFileCursor && isRecoverablePostSubmitAckError(error)) {
             const accepted = await this.waitForPromptPersistenceAfterAckLoss({
               cursor: sessionFileCursor,
@@ -315,6 +337,8 @@ export class CodexDesktopCdpAdapter {
     } catch (error) {
       throw this.markSafeToFallback(error, turnSubmitted);
     } finally {
+      turnStart.resolve('');
+      this.pendingTurnStarts.delete(task.id);
       notificationPolling?.stop?.();
     }
   }
@@ -335,11 +359,22 @@ export class CodexDesktopCdpAdapter {
       text,
       text_elements: []
     }, ...extractLocalImageInputs(text)];
-    const response = await this.client.request('turn/steer', {
-      threadId,
-      input,
-      expectedTurnId: turnId
-    });
+    let response;
+    try {
+      response = await this.client.request('turn/steer', {
+        threadId,
+        input,
+        expectedTurnId: turnId
+      });
+    } catch (error) {
+      if (/^no active turn to steer[.!]?$/i.test(String(error?.message ?? '').trim())) {
+        error.code = 'CODEX_STEER_NO_ACTIVE_TURN';
+        error.safeToFallback = true;
+      } else if (isRetryableCdpTransportError(error)) {
+        error.deliveryUncertain = true;
+      }
+      throw error;
+    }
     emit('codex.app_server.turn.steered', sanitize({
       threadId,
       turnId: response?.turnId ?? turnId,
@@ -393,9 +428,13 @@ export class CodexDesktopCdpAdapter {
   }
 
   async interrupt({ task, emit }) {
+    // A locally submitted turn already has an acknowledgement in flight. Reading
+    // history here races resume/start and can block even after that ack arrives.
+    const pendingTurnId = await this.pendingTurnStarts.get(task.id);
     const threadId = task.codexSessionId || task.createdCodexSessionId;
-    const resolved = task.activeCodexTurnId
-      ? { turnId: task.activeCodexTurnId, terminal: null }
+    const acknowledgedTurnId = task.activeCodexTurnId || pendingTurnId;
+    const resolved = acknowledgedTurnId
+      ? { turnId: acknowledgedTurnId, terminal: null }
       : await this.resolveInterruptTarget(threadId, emit);
     const turnId = resolved.turnId;
     if (!threadId || !turnId) {
@@ -485,10 +524,7 @@ export class CodexDesktopCdpAdapter {
       return { turnId: '', terminal: null };
     }
     try {
-      const detail = await this.client.request('thread/read', {
-        threadId,
-        includeTurns: true
-      });
+      const detail = await this.readRecentThread(threadId);
       const turns = Array.isArray(detail?.thread?.turns) ? detail.thread.turns : [];
       for (let index = turns.length - 1; index >= 0; index -= 1) {
         const turn = turns[index];
@@ -556,10 +592,7 @@ export class CodexDesktopCdpAdapter {
       return '';
     }
     try {
-      const detail = await this.client.request('thread/read', {
-        threadId,
-        includeTurns: true
-      });
+      const detail = await this.readRecentThread(threadId);
       const turns = Array.isArray(detail?.thread?.turns) ? detail.thread.turns : [];
       for (let index = turns.length - 1; index >= 0; index -= 1) {
         const turn = turns[index];
@@ -589,10 +622,7 @@ export class CodexDesktopCdpAdapter {
     do {
       attempt += 1;
       try {
-        const detail = await this.client.request('thread/read', {
-          threadId,
-          includeTurns: true
-        });
+        const detail = await this.readRecentThread(threadId);
         const turn = findTurn(detail.thread, turnId);
         if (turn && isTurnTerminalForInterrupt(turn.status)) {
           emit('codex.app_server.turn.interrupt_confirmed', {
@@ -875,10 +905,7 @@ export class CodexDesktopCdpAdapter {
       if (Date.now() - lastReadAt >= 2000) {
         lastReadAt = Date.now();
         try {
-          const detail = await this.client.request('thread/read', {
-            threadId,
-            includeTurns: true
-          });
+          const detail = await this.readRecentThread(threadId, { itemsView: 'full' });
           consecutiveThreadPollFailures = 0;
           lastPollFailureMessage = '';
           const polledTurn = findTurn(detail.thread, turnId);
@@ -1216,10 +1243,7 @@ export class CodexDesktopCdpAdapter {
 
   async readFinalThreadState({ thread, task, completed, sessionFileCursor, emit }) {
     try {
-      const detail = await this.client.request('thread/read', {
-        threadId: thread.id,
-        includeTurns: true
-      });
+      const detail = await this.readRecentThread(thread.id, { itemsView: 'full' });
       emit('codex.app_server.thread.read', summarizeThreadForEvent(detail));
       const finalTurn = findTurn(detail.thread, completed.turn?.id) ?? completed.turn;
       if (turnHasPromptUserMessage(finalTurn, task.prompt)) {
@@ -1377,12 +1401,10 @@ export class CodexDesktopCdpAdapter {
   }
 
   taskModel(task = {}) {
+    // Empty means "auto": pass null so thread/start, turn/start and thread/resume
+    // let the desktop keep its own model choice instead of pinning a bridge value.
     const requested = String(task?.model ?? '').trim();
-    if (requested.length > 0) {
-      return requested;
-    }
-    const fallback = this.model.trim();
-    return fallback.length > 0 ? fallback : null;
+    return requested.length > 0 ? requested : null;
   }
 
   async startThread(task, project, emit) {
@@ -1406,10 +1428,26 @@ export class CodexDesktopCdpAdapter {
     return response.thread;
   }
 
+  async readRecentThread(threadId, options = {}) {
+    if (typeof this.client.readRecentThread === 'function') {
+      return this.client.readRecentThread(threadId, options);
+    }
+    return this.client.request('thread/read', { threadId, includeTurns: true });
+  }
+
   async prepareExistingThread(task, project, emit) {
     const verified = await this.verifyTargetSession(task.codexSessionId);
     if (!verified.verified) {
       throw new Error(`Codex 桌面端未确认目标会话，已阻止发送：${verified.reason}`);
+    }
+    // Desktop-owned turns survive a bridge restart. Resolve their official turn
+    // before deciding between steering and starting; never resume a busy thread.
+    if (desktopThreadRuntimeState(verified.thread).state !== 'idle'
+      || isDesktopRuntimeInProgress(verified.thread?.status)) {
+      const detail = await this.readRecentThread(task.codexSessionId);
+      const active = [...(detail?.thread?.turns ?? [])].reverse()
+        .find((turn) => isDesktopRuntimeInProgress(turn.status));
+      return { thread: detail.thread, resumed: false, activeTurnId: active?.id ?? '' };
     }
     const currentDesktopSession = isVerifiedCurrentDesktopSession(task, verified);
     emit('codex.desktop_host.session.verified', {

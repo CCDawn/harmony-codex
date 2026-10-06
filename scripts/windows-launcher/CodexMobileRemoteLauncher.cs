@@ -1,45 +1,52 @@
 using System;
 using System.Diagnostics;
+using System.Drawing;
 using System.IO;
+using System.Net.Sockets;
+using System.Text;
 using System.Windows.Forms;
 
 internal static class CodexMobileRemoteLauncher
 {
     [STAThread]
-    private static void Main()
+    private static void Main(string[] args)
     {
-        var projectDir = AppContext.BaseDirectory;
-        var marker = Path.Combine(projectDir, "scripts", "start-codex-mobile-stack.ps1");
-        if (!File.Exists(marker))
-        {
-            projectDir = Directory.GetCurrentDirectory();
-        }
-        var scriptPath = Path.Combine(projectDir, "scripts", "start-codex-mobile-stack.ps1");
-        var powershell = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.Windows),
-            "System32",
-            "WindowsPowerShell",
-            "v1.0",
-            "powershell.exe");
-
-        if (!File.Exists(scriptPath))
-        {
-            MessageBox.Show(
-                "没有找到启动脚本：" + Environment.NewLine + scriptPath,
-                "Codex 手机远程",
-                MessageBoxButtons.OK,
-                MessageBoxIcon.Error);
+        if (args.Length == 1 && args[0] == "--exit") {
+            try {
+                using (var signal = System.Threading.EventWaitHandle.OpenExisting("Local\\CodexMobileRemoteTrayExit")) signal.Set();
+            } catch (System.Threading.WaitHandleCannotBeOpenedException) { }
             return;
         }
-
-        var startInfo = new ProcessStartInfo
+        var gate = new System.Threading.Mutex(false, "Local\\CodexMobileRemoteTray");
+        var ownsGate = false;
+        try
         {
-            FileName = powershell,
-            Arguments = "-NoProfile -ExecutionPolicy Bypass -NoExit -File \"" + scriptPath + "\"",
-            WorkingDirectory = projectDir,
-            UseShellExecute = false
-        };
-
-        Process.Start(startInfo);
+            try
+            {
+                ownsGate = gate.WaitOne(0);
+            }
+            catch (System.Threading.AbandonedMutexException)
+            {
+                ownsGate = true;
+            }
+            if (!ownsGate)
+            {
+                try {
+                    using (var signal = System.Threading.EventWaitHandle.OpenExisting("Local\\CodexMobileRemoteTrayShow")) signal.Set();
+                } catch (System.Threading.WaitHandleCannotBeOpenedException) { }
+                return;
+            }
+            Application.EnableVisualStyles();
+            Application.SetCompatibleTextRenderingDefault(false);
+            Application.Run(new UnifiedTrayContext());
+        }
+        finally
+        {
+            if (ownsGate)
+            {
+                gate.ReleaseMutex();
+            }
+            gate.Dispose();
+        }
     }
 }

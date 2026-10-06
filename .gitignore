@@ -3,6 +3,9 @@ node_modules/
 HarmonyCodexRemote/node_modules/
 HarmonyHdcRelayHelper/node_modules/
 tools/harmony/local-hvigor/
+oh_modules/
+__pycache__/
+*.py[cod]
 
 # Harmony build outputs
 .hvigor/
@@ -63,3 +66,10 @@ main-*.js
 bootstrap.js
 preload.js
 comment-preload.js
+
+# Voice link (M2) runtime artifacts
+.venv/
+voice/voice-server.log
+voice/voice-scratch/
+voice/*.wav
+/HarmonyCodexRemote/entry/src/main/ets/config/VoiceRouteConfig.ets

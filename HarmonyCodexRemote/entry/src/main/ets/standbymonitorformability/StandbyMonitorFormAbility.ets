@@ -1,12 +1,14 @@
 import { Want } from '@kit.AbilityKit';
 import { formBindingData, FormExtensionAbility, formInfo } from '@kit.FormKit';
-import { DEFAULT_BRIDGE_TOKEN, DEFAULT_BRIDGE_URL } from '../config/BridgeConfig';
+import { CredentialRuntime } from '../config/CredentialRuntime';
 import { CodexAccountUsage } from '../model/BridgeModels';
 import { BridgeClient } from '../services/BridgeClient';
+import { BridgeCredentialStore } from '../services/BridgeCredentialStore';
 import { SessionRuntimeStore } from '../services/SessionRuntimeStore';
 import { StandbyMonitorSnapshotService } from '../services/StandbyMonitorSnapshotService';
 
 export default class StandbyMonitorFormAbility extends FormExtensionAbility {
+  private credentialLoadAttempted: boolean = false;
   onAddForm(want: Want): formBindingData.FormBindingData {
     const formId = String(want.parameters?.[formInfo.FormParam.IDENTITY_KEY] ?? '');
     const initial = StandbyMonitorSnapshotService.defaultSnapshot();
@@ -50,9 +52,13 @@ export default class StandbyMonitorFormAbility extends FormExtensionAbility {
   }
 
   private async refreshFromBridge(formId: string): Promise<void> {
+    await this.ensureRuntimeCredential();
     const cached = await StandbyMonitorSnapshotService.loadSnapshot(this.context);
     try {
-      const runtime = await BridgeClient.getRuntimeSnapshot(DEFAULT_BRIDGE_URL, DEFAULT_BRIDGE_TOKEN);
+      const runtime = await BridgeClient.getRuntimeSnapshot(
+        CredentialRuntime.getRuntimeBridgeUrl(),
+        CredentialRuntime.getRuntimeToken()
+      );
       const runtimeStore = new SessionRuntimeStore();
       runtimeStore.apply(runtime);
       const sessions = runtimeStore.mergeSessions([]);
@@ -82,9 +88,31 @@ export default class StandbyMonitorFormAbility extends FormExtensionAbility {
 
   private async loadUsageOrCached(): Promise<CodexAccountUsage | null> {
     try {
-      return await BridgeClient.getCodexAccountUsage(DEFAULT_BRIDGE_URL, DEFAULT_BRIDGE_TOKEN);
+      return await BridgeClient.getCodexAccountUsage(
+        CredentialRuntime.getRuntimeBridgeUrl(),
+        CredentialRuntime.getRuntimeToken()
+      );
     } catch (_) {
       return null;
+    }
+  }
+
+  /**
+   * 卡片侧启动时加载设备配对凭证：加载完成前的刷新周期回落烘焙常量（可接受）。
+   * 未配对（查无此条）只尝试一次，避免每个刷新周期重复查询。
+   */
+  private async ensureRuntimeCredential(): Promise<void> {
+    if (CredentialRuntime.getRuntimeCredential() !== null || this.credentialLoadAttempted) {
+      return;
+    }
+    this.credentialLoadAttempted = true;
+    try {
+      const credential = await BridgeCredentialStore.loadCredential(this.context);
+      if (credential !== null) {
+        CredentialRuntime.setRuntimeCredential(credential);
+      }
+    } catch (error) {
+      console.warn(`standby form credential load failed: ${String(error)}`);
     }
   }
 

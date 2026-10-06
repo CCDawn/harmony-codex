@@ -1,4 +1,5 @@
 import { createServer } from 'node:http';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { URL } from 'node:url';
@@ -31,11 +32,66 @@ import {
   publicRemoteFileMetadata,
   remoteFileContentDisposition
 } from './remoteFileAccess.js';
+import { createTotpVerifier } from './totp.js';
+import { DeviceRegistry } from './deviceRegistry.js';
+import {
+  buildPairingPayload,
+  createFailureRateLimiter,
+  createPairingSessionStore,
+  formatPairingCode,
+  PAIRING_ENROLL_MAX_BODY_BYTES,
+  PAIRING_FAILURE_WINDOW_MS,
+  PAIRING_MAX_FAILURES_PER_WINDOW,
+  renderPairingConsolePage,
+  renderPairingQrSvg,
+  validatePairEnrollBody
+} from './devicePairing.js';
+import {
+  canAutoRelaunchMissingCodex,
+  DESKTOP_RELAUNCH_MESSAGE,
+  isProcessAlive,
+  readSupervisorArmFile
+} from './desktopSupervisor.js';
+import { attachVoiceUpgrade } from './voiceProxy.js';
+import { createVoiceProcessSupervisor } from './voiceProcess.js';
+import { CompanionConversationService, handleCompanionRoute } from './companionConversationService.js';
+import { CompanionComputerService, handleCompanionComputerRoute } from './companionComputerService.js';
 
 export function createApp({ config, adapter }) {
   const eventBus = new EventBus();
   const logger = config.logger ?? new DiagnosticLogger();
+  const authClock = typeof config.authClock === 'function' ? config.authClock : () => Date.now();
+  // 扫码配对设备注册表：与 outbox 同款 config 注入；默认落盘 logs/state/device-registry.json。
+  const deviceRegistry = config.deviceRegistry ?? new DeviceRegistry({
+    filePath: config.deviceRegistryPath
+      ?? path.join(config.repoRoot ?? process.cwd(), 'logs', 'state', 'device-registry.json'),
+    now: authClock,
+    logger
+  });
+  if (typeof deviceRegistry.initialize === 'function') {
+    void Promise.resolve(deviceRegistry.initialize()).catch((error) => {
+      logger.write('security', 'error', 'device_registry.initialize.failed', {
+        message: error?.message ?? String(error)
+      }).catch(() => {});
+    });
+  }
+  const authGate = createAuthGate({
+    logger,
+    now: authClock,
+    remoteAddressResolver: typeof config.authRemoteAddress === 'function' ? config.authRemoteAddress : null,
+    deviceRegistry
+  });
+  // 配对会话（内存，不持久化）与 /pair/enroll 的独立失败限速桶（60 秒窗口 5 次失败即 429）。
+  const pairingSessions = config.pairingSessions ?? createPairingSessionStore({ now: authClock });
+  const pairingEnrollLimiter = createFailureRateLimiter({
+    now: authClock,
+    windowMs: PAIRING_FAILURE_WINDOW_MS,
+    maxFailures: PAIRING_MAX_FAILURES_PER_WINDOW,
+    resolveSourceKey: (request) => authGate.sourceKey(request)
+  });
   const sessions = config.sessions ?? new CodexSessionStore();
+  const companionService = config.companionService ?? new CompanionConversationService();
+  const companionComputerService = config.companionComputerService ?? new CompanionComputerService();
   const sessionSettings = config.sessionSettings ?? new SessionSettingsStore({
     repoRoot: config.repoRoot ?? process.cwd()
   });
@@ -93,7 +149,8 @@ export function createApp({ config, adapter }) {
       logger,
       desktopLiveRecovery,
       desktopLiveDiagnostics,
-      desktopOpener
+      desktopOpener,
+      config
     })
   });
   const outbox = config.outboxEnabled !== true && !config.outbox
@@ -104,7 +161,7 @@ export function createApp({ config, adapter }) {
         blockedDelayMs: config.outboxBlockedDelayMs,
         logger,
         reconcile: config.outboxReconciler
-          ?? createOutboxReceiptReconciler({ threadService, sessions }),
+          ?? createOutboxReceiptReconciler({ threadService, sessions, store }),
         canDispatch: (item) => canDispatchOutboxItem({ item, store, threadService }),
         canRequeueSubmitted: (item) => canRequeueSubmittedOutboxItem({
           item,
@@ -137,7 +194,7 @@ export function createApp({ config, adapter }) {
           url: sanitizeRequestUrl(request.url)
         });
       }
-      await route({ request, response, config, store, outbox, eventBus, logger, sessions, sessionSettings, defaultReasoningEffortProvider, codexSettingsProvider, accountUsageProvider, threadService, desktopLiveRecovery, desktopLiveDiagnostics, desktopOpener });
+      await route({ request, response, config, store, outbox, eventBus, logger, sessions, companionService, companionComputerService, sessionSettings, defaultReasoningEffortProvider, codexSettingsProvider, accountUsageProvider, threadService, desktopLiveRecovery, desktopLiveDiagnostics, desktopOpener, authGate, deviceRegistry, pairingSessions, pairingEnrollLimiter, voiceSupervisor: voiceProcess });
       if (shouldLogCompletedRequest(request)) {
         const responseBytes = responseByteCounter.bytes || responseContentLength(response);
         await logger.write('bridge', 'info', 'http.request.completed', {
@@ -171,10 +228,19 @@ export function createApp({ config, adapter }) {
       if (error.preflight) {
         payload.preflight = error.preflight;
       }
+      if (error.responseHeaders) {
+        for (const [header, value] of Object.entries(error.responseHeaders)) {
+          response.setHeader(header, value);
+        }
+      }
       sendJson(response, error.statusCode ?? 500, payload);
     }
   });
   server.on('close', () => outbox?.close());
+  // 语音链路：受管 voice_server 子进程 + /voice 升级隧道（/voice/status 走普通路由鉴权）。
+  const voiceProcess = createVoiceProcessSupervisor({ config, logger });
+  attachVoiceUpgrade({ server, config, logger, authGate, supervisor: voiceProcess });
+  server.on('close', () => voiceProcess.close());
   if (outbox) {
     void outbox.initialize()
       .then(() => outbox.dispatchReady())
@@ -183,7 +249,7 @@ export function createApp({ config, adapter }) {
       }).catch(() => {}));
   }
 
-  return { server, store, outbox, eventBus, logger, threadService };
+  return { server, store, outbox, deviceRegistry, eventBus, logger, threadService, voiceProcess };
 }
 
 function createThreadInterruptReconciler({ threadService }) {
@@ -346,9 +412,134 @@ function classifyTraffic(bytes) {
   return 'small';
 }
 
-function createBeforeRunDesktopVerification({ adapter, logger, desktopLiveRecovery, desktopLiveDiagnostics, desktopOpener }) {
+async function currentDesktopSupervisor(config) {
+  if (config?.desktopSupervisor && typeof config.desktopSupervisor.armed === 'boolean') {
+    return config.desktopSupervisor;
+  }
+  return readSupervisorArmFile(config?.repoRoot ?? process.cwd(), { isPidAlive: isProcessAlive });
+}
+
+function isPlainDesktop(status) {
+  return status?.desktopProcessMode === 'plain' || status?.failureClass === 'codex_plain_no_cdp';
+}
+
+async function shouldQueueMissingCodexRelaunch(config, desktop) {
+  return canAutoRelaunchMissingCodex(desktop, await currentDesktopSupervisor(config));
+}
+
+function relaunchingDesktopStatus(desktop) {
+  return {
+    ...desktop,
+    message: DESKTOP_RELAUNCH_MESSAGE,
+    recoveryHint: DESKTOP_RELAUNCH_MESSAGE
+  };
+}
+
+function kickMissingCodexRelaunch({ recovery, logger, sessionId = '', reason = 'desktop_supervisor' }) {
+  if (!recovery || typeof recovery.recover !== 'function') {
+    return;
+  }
+  void recovery.recover({
+    sessionId,
+    logger,
+    reason,
+    mode: 'hard',
+    refusePlain: true
+  }).catch((error) => {
+    logger?.write?.('bridge', 'error', 'desktop_live.relaunch.failed', {
+      sessionId,
+      reason,
+      message: error?.message ?? String(error)
+    }).catch(() => {});
+  });
+}
+
+async function ensureMissingCodexRelaunched({ config, adapter, sessionId = '', logger, recovery, diagnostics, reason }) {
+  const readStatus = async () => decorateDesktopLiveStatusWithDiagnostics(
+    await getDesktopLiveStatus(adapter, sessionId),
+    diagnostics
+  );
+  let status = await readStatus();
+  if (status.desktopLive === true || isPlainDesktop(status)) {
+    return status;
+  }
+  const supervisor = await currentDesktopSupervisor(config);
+  if (!canAutoRelaunchMissingCodex(status, supervisor)) {
+    return status;
+  }
+  status = await readStatus();
+  if (status.desktopLive === true || isPlainDesktop(status) || !canAutoRelaunchMissingCodex(status, { armed: true })) {
+    return status;
+  }
+  if (!recovery || typeof recovery.recover !== 'function') {
+    return status;
+  }
+  let result;
+  try {
+    result = await recovery.recover({
+      sessionId,
+      logger,
+      reason,
+      mode: 'hard',
+      refusePlain: true
+    });
+  } catch (error) {
+    const after = await readStatus();
+    return {
+      ...after,
+      recoveryAttempted: true,
+      recoveryOk: false,
+      recoveryError: error?.message ?? String(error),
+      message: isPlainDesktop(after)
+        ? (after.recoveryHint || after.message || error.message)
+        : (error?.message ?? String(error))
+    };
+  }
+  if (result?.shared === true) {
+    const deadline = Date.now() + 150_000;
+    while (Date.now() < deadline) {
+      status = await readStatus();
+      if (status.desktopLive === true || isPlainDesktop(status)) {
+        return status;
+      }
+      await delay(500);
+    }
+    return status;
+  }
+  return readStatus();
+}
+
+function createBeforeRunDesktopVerification({ adapter, logger, desktopLiveRecovery, desktopLiveDiagnostics, desktopOpener, config }) {
   return async ({ task, emit }) => {
+    if (task.desktopRelaunch === 'missing') {
+      emit('codex.desktop_live.relaunch.started', {
+        message: DESKTOP_RELAUNCH_MESSAGE
+      });
+      const status = await ensureMissingCodexRelaunched({
+        config,
+        adapter,
+        sessionId: task.codexSessionId ?? '',
+        logger,
+        recovery: desktopLiveRecovery,
+        diagnostics: desktopLiveDiagnostics,
+        reason: 'phone_send_missing_codex'
+      });
+      task.verifiedDesktopStatus = {
+        ...status,
+        message: status.desktopLive === true
+          ? (status.message || '桌面 Codex 已拉起')
+          : (status.recoveryHint || status.recoveryError || status.message || '未能拉起桌面 Codex')
+      };
+      if (status.desktopLive !== true) {
+        const error = new Error(task.verifiedDesktopStatus.message);
+        error.statusCode = 503;
+        throw error;
+      }
+    }
     if (task.submissionSource !== 'phone_thread_message' || !task.codexSessionId) {
+      if (task.desktopRelaunch === 'missing') {
+        assertDesktopReadyForNewThread(task.verifiedDesktopStatus);
+      }
       return;
     }
 
@@ -399,20 +590,41 @@ function createBeforeRunDesktopVerification({ adapter, logger, desktopLiveRecove
   };
 }
 
-async function route({ request, response, config, store, outbox, eventBus, logger, sessions, sessionSettings, defaultReasoningEffortProvider, codexSettingsProvider, accountUsageProvider, threadService, desktopLiveRecovery, desktopLiveDiagnostics, desktopOpener }) {
+async function route({ request, response, config, store, outbox, eventBus, logger, sessions, companionService, companionComputerService, sessionSettings, defaultReasoningEffortProvider, codexSettingsProvider, accountUsageProvider, threadService, desktopLiveRecovery, desktopLiveDiagnostics, desktopOpener, authGate, deviceRegistry, pairingSessions, pairingEnrollLimiter, voiceSupervisor }) {
   const url = new URL(request.url, 'http://127.0.0.1');
   const method = request.method ?? 'GET';
   if (method === 'OPTIONS') {
     response.writeHead(204, {
       'access-control-allow-origin': '*',
       'access-control-allow-methods': 'GET,POST,PATCH,DELETE,OPTIONS',
-      'access-control-allow-headers': 'Content-Type,Authorization,X-Codex-Bridge-Token',
+      'access-control-allow-headers': 'Content-Type,Authorization,X-Codex-Bridge-Token,X-Codex-Bridge-OTP',
       'access-control-max-age': '86400'
     });
     response.end();
     return;
   }
-  requireAuth({ request, url });
+  // /pair/enroll 是扫码配对的公开入口（一次性配对码 + 独立限速自护），
+  // 与 OPTIONS 一样在 requireAuth 之前短路。
+  if (method === 'POST' && url.pathname === '/pair/enroll') {
+    await handlePairEnroll({
+      request,
+      response,
+      url,
+      logger,
+      authGate,
+      deviceRegistry,
+      pairingSessions,
+      enrollLimiter: pairingEnrollLimiter
+    });
+    return;
+  }
+  await authGate.requireAuth({ request, url });
+  if (await handleCompanionRoute({ request, response, url, service: companionService })) {
+    return;
+  }
+  if (await handleCompanionComputerRoute({ request, response, url, service: companionComputerService })) {
+    return;
+  }
 
   if (method === 'GET' && url.pathname === '/health') {
     sendJson(response, 200, {
@@ -422,6 +634,13 @@ async function route({ request, response, config, store, outbox, eventBus, logge
         clientProtocol: url.searchParams.get('clientProtocol'),
         clientVersion: url.searchParams.get('clientVersion') ?? ''
       })
+    });
+    return;
+  }
+
+  if (method === 'GET' && url.pathname === '/voice/status') {
+    sendJson(response, 200, {
+      voice: voiceSupervisor.status()
     });
     return;
   }
@@ -501,6 +720,26 @@ async function route({ request, response, config, store, outbox, eventBus, logge
       : 'soft';
     if ((requestedMode === 'auto' && chooseDesktopRepairMode(initial.desktop) === 'hard')
       || (mode === 'hard' && !isHardDesktopRecoveryConfirmed(body))) {
+      const supervisor = await currentDesktopSupervisor(config);
+      if (requestedMode === 'auto' && canAutoRelaunchMissingCodex(initial.desktop, supervisor)) {
+        kickMissingCodexRelaunch({
+          recovery: desktopLiveRecovery,
+          logger,
+          sessionId,
+          reason: 'system_repair_missing_codex'
+        });
+        sendJson(response, 200, {
+          system: {
+            ...initial,
+            repaired: false,
+            repairMode: 'hard_starting',
+            hardRecoveryRequired: false,
+            recoverableFromPhone: true,
+            message: DESKTOP_RELAUNCH_MESSAGE
+          }
+        });
+        return;
+      }
       sendJson(response, 200, {
         system: {
           ...initial,
@@ -592,6 +831,94 @@ async function route({ request, response, config, store, outbox, eventBus, logge
     return;
   }
 
+  // —— 扫码配对管理路由（master-only；路径落在 /desktop/ 前缀下，天然继承现有
+  // loopback-token-only 豁免的判断面，但不改变豁免函数本身）——
+  if (method === 'GET' && url.pathname === '/desktop/pair') {
+    if (!requireMasterAuth(request, response)) {
+      return;
+    }
+    const html = renderPairingConsolePage({
+      initialPublicUrl: String(process.env.CODEX_BRIDGE_PUBLIC_URL ?? '').trim()
+    });
+    response.writeHead(200, {
+      'content-type': 'text/html; charset=utf-8',
+      'cache-control': 'no-store',
+      'access-control-allow-origin': '*'
+    });
+    response.end(html);
+    return;
+  }
+
+  if (method === 'POST' && url.pathname === '/desktop/pair/create') {
+    if (!requireMasterAuth(request, response)) {
+      return;
+    }
+    let body = {};
+    try {
+      body = await readJsonObjectBody(request, PAIRING_ENROLL_MAX_BODY_BYTES);
+    } catch {
+      body = {};
+    }
+    const requestedPublicUrl = typeof body.publicUrl === 'string' ? body.publicUrl.trim() : '';
+    if (requestedPublicUrl.length > 512) {
+      sendJson(response, 400, { error: 'invalid_request' });
+      return;
+    }
+    const publicUrl = resolvePairingPublicUrl({ requestedPublicUrl });
+    const session = pairingSessions.create();
+    const payload = buildPairingPayload({ publicUrl, pairingCode: session.code });
+    auditPairingEvent(logger, 'info', 'bridge.pairing.created', {
+      pathname: url.pathname,
+      expiresAt: session.expiresAt,
+      ...authGate.describeSource(request)
+    });
+    sendJson(response, 200, {
+      pairingCode: formatPairingCode(session.code),
+      expiresAt: session.expiresAt,
+      payload,
+      qrSvg: renderPairingQrSvg(payload),
+      publicUrl
+    });
+    return;
+  }
+
+  if (method === 'GET' && url.pathname === '/desktop/pair/devices') {
+    if (!requireMasterAuth(request, response)) {
+      return;
+    }
+    sendJson(response, 200, { devices: await deviceRegistry.list() });
+    return;
+  }
+
+  if (method === 'POST' && url.pathname === '/desktop/pair/revoke') {
+    if (!requireMasterAuth(request, response)) {
+      return;
+    }
+    let body;
+    try {
+      body = await readJsonObjectBody(request);
+    } catch (error) {
+      sendJson(response, error.statusCode ?? 400, { error: 'invalid_request' });
+      return;
+    }
+    const deviceId = typeof body.deviceId === 'string' ? body.deviceId.trim() : '';
+    if (!deviceId) {
+      sendJson(response, 400, { error: 'invalid_request' });
+      return;
+    }
+    const { changed } = await deviceRegistry.revoke(deviceId);
+    authGate.forgetDevice(deviceId);
+    if (changed) {
+      auditPairingEvent(logger, 'warn', 'bridge.device.revoked', {
+        pathname: url.pathname,
+        deviceId,
+        ...authGate.describeSource(request)
+      });
+    }
+    sendJson(response, 200, { revoked: true });
+    return;
+  }
+
   if (method === 'POST' && url.pathname === '/desktop/screenshot/primary') {
     const image = await captureDesktopScreenshot({ config, logger });
     sendJson(response, 200, { image });
@@ -599,14 +926,22 @@ async function route({ request, response, config, store, outbox, eventBus, logge
   }
 
   if (method === 'GET' && url.pathname === '/desktop/script/status') {
-    sendJson(response, 200, { bridge: desktopScriptBridge.snapshot({ authRequired: isBridgeAuthRequired() }) });
+    sendJson(response, 200, {
+      bridge: desktopScriptBridge.snapshot({
+        authRequired: isBridgeAuthRequired(),
+        otpRequired: authGate.isTotpRequired(),
+        clientTokenEmbedded: false
+      })
+    });
     return;
   }
 
   if (method === 'GET' && url.pathname === '/desktop/script/client.js') {
     const bridgeUrl = getDesktopScriptBridgeUrl(request, url);
-    const token = process.env.CODEX_BRIDGE_TOKEN ?? '';
-    const script = buildDesktopScriptClient({ bridgeUrl, token });
+    const script = buildDesktopScriptClient({
+      bridgeUrl,
+      authRequired: isBridgeAuthRequired()
+    });
     response.writeHead(200, {
       'content-type': 'application/javascript; charset=utf-8',
       'cache-control': 'no-store',
@@ -862,10 +1197,16 @@ async function route({ request, response, config, store, outbox, eventBus, logge
     const threadId = apiThreadSettingsMatch[1];
     assertValidCodexSessionId(threadId);
     const body = await readJsonObjectBody(request);
-    const settings = await sessionSettings.updateSessionSettings(threadId, {
-      model: body.model,
-      reasoningEffort: body.reasoningEffort
-    });
+    // Only fields present in the body are updated; an absent model must not
+    // clear a stored pin when the phone only changes the reasoning effort.
+    const patch = {};
+    if (body.model !== undefined) {
+      patch.model = body.model;
+    }
+    if (body.reasoningEffort !== undefined) {
+      patch.reasoningEffort = body.reasoningEffort;
+    }
+    const settings = await sessionSettings.updateSessionSettings(threadId, patch);
     await logger.write('bridge', 'info', 'codex.thread.settings.updated', {
       threadId,
       model: settings.model || 'auto',
@@ -1938,6 +2279,24 @@ async function recoverSystemLink({ config, store, sessions, logger, diagnostics,
   const requestedMode = String(mode ?? 'auto').toLowerCase();
   const action = initial.recommendedAction;
   if (action === 'desktop_cdp_restart_required') {
+    const supervisor = await currentDesktopSupervisor(config);
+    if (canAutoRelaunchMissingCodex(initial.desktop, supervisor)) {
+      kickMissingCodexRelaunch({
+        recovery,
+        logger,
+        sessionId,
+        reason: 'mobile_link_recover_missing_codex'
+      });
+      return {
+        ...initial,
+        severity: 'degraded',
+        recoverableFromPhone: true,
+        recommendedAction: 'desktop_relaunch_starting',
+        repaired: false,
+        repairMode: 'hard_starting',
+        recoveryMessage: DESKTOP_RELAUNCH_MESSAGE
+      };
+    }
     return {
       ...initial,
       repaired: false,
@@ -2217,7 +2576,9 @@ async function dispatchOutboxItem({
         desktopLiveDiagnostics,
         desktopOpener
       });
-  return dispatched.payload;
+  return store.adapter?.requiresDeliveryReceipt === true && store.getTask(dispatched.payload?.run?.id)
+    ? { ...dispatched.payload, deliveryPending: true }
+    : dispatched.payload;
 }
 
 async function canDispatchOutboxItem({ item, store, threadService }) {
@@ -2266,7 +2627,7 @@ async function canDispatchOutboxItem({ item, store, threadService }) {
         const thread = await threadService.getThread(item.threadId, { tail: 1 });
         const status = String(thread?.activityStatus ?? thread?.runtimeState ?? '').toLowerCase();
         if (activeStatuses.has(status)) {
-          return false;
+          return typeof store.adapter?.steer === 'function';
         }
       } catch {
         // Dispatch performs the authoritative target verification and records
@@ -2289,6 +2650,8 @@ async function canDispatchOutboxItem({ item, store, threadService }) {
 }
 
 function canRequeueSubmittedOutboxItem({ item, store, threadService }) {
+  // Execution can fail after delivery; that must not resend a confirmed input.
+  if (item.result?.deliveryPending === false) return false;
   const resultId = String(item?.resultId ?? '').trim();
   if (!resultId) {
     return false;
@@ -2324,12 +2687,12 @@ async function dispatchNewThreadMessage({
   desktopLiveRecovery,
   desktopLiveDiagnostics
 }) {
-  const defaults = await getDefaultCodexSettings({ codexSettingsProvider, defaultReasoningEffortProvider });
-  const requestedModel = normalizeModelId(body.model ?? '');
-  const requestedReasoningEffort = normalizeReasoningEffort(body.reasoningEffort ?? '');
-  const effectiveModel = requestedModel || defaults.model;
-  const effectiveReasoningEffort = requestedReasoningEffort || defaults.reasoningEffort;
   const prompt = String(body.prompt ?? body.text ?? '');
+  // "自动" arrives as an empty string: keep it empty end-to-end so the desktop
+  // (or App Server) keeps its own model/effort choice instead of being pinned
+  // to the bridge's drifting defaults. Explicit values still pass through.
+  const effectiveModel = normalizeModelId(body.model ?? '');
+  const effectiveReasoningEffort = normalizeReasoningEffort(body.reasoningEffort ?? '');
   const projectId = resolveProjectId(config, String(body.projectId ?? ''));
   const submissionId = String(body.submissionId ?? '');
   if (systemLinkExecutionMode(config) === 'app_server') {
@@ -2361,6 +2724,25 @@ async function dispatchNewThreadMessage({
     diagnostics: desktopLiveDiagnostics,
     source: 'api.codex.thread.start.preflight'
   });
+  if (await shouldQueueMissingCodexRelaunch(config, desktop)) {
+    const task = store.createTask({
+      projectId,
+      prompt,
+      verifiedDesktopStatus: relaunchingDesktopStatus(desktop),
+      submissionSource: 'phone_new_thread',
+      submissionId,
+      model: effectiveModel,
+      reasoningEffort: effectiveReasoningEffort,
+      desktopRelaunch: 'missing'
+    });
+    await logger.write('bridge', 'info', 'codex.thread.start.desktop_relaunch.queued', {
+      taskId: task.id,
+      projectId,
+      promptLength: prompt.length,
+      submissionId: submissionId || ''
+    });
+    return { statusCode: 202, payload: { run: task } };
+  }
   assertDesktopReadyForNewThread(desktop);
   const task = store.createTask({
     projectId,
@@ -2403,16 +2785,11 @@ async function dispatchExistingThreadMessage({
   const projectId = resolveProjectId(config, String(body.projectId ?? ''));
   const prompt = String(body.text ?? body.prompt ?? '');
   const storedSettings = await sessionSettings.getSessionSettings(threadId);
-  const defaults = await getThreadCodexDefaults({
-    codexSettingsProvider,
-    defaultReasoningEffortProvider,
-    sessions,
-    threadId
-  });
-  const requestedModel = normalizeModelId(body.model ?? storedSettings.model ?? '');
-  const requestedReasoningEffort = normalizeReasoningEffort(body.reasoningEffort ?? storedSettings.reasoningEffort ?? '');
-  const model = requestedModel || defaults.model;
-  const reasoningEffort = requestedReasoningEffort || defaults.reasoningEffort;
+  // "自动" arrives as an empty string: keep it empty end-to-end (no bridge
+  // defaults) so the desktop keeps its own model/effort choice. A phone-picked
+  // value or a pin stored via the settings endpoint still passes through.
+  const model = normalizeModelId(body.model ?? storedSettings.model ?? '');
+  const reasoningEffort = normalizeReasoningEffort(body.reasoningEffort ?? storedSettings.reasoningEffort ?? '');
   const submissionId = String(body.submissionId ?? '');
   await logger.write('bridge', 'info', 'codex.thread.message.received', {
     threadId,
@@ -2528,6 +2905,29 @@ async function dispatchExistingThreadMessage({
     desktopOpen,
     preflight: buildDesktopSendPreflight(desktop, threadId)
   };
+  if (await shouldQueueMissingCodexRelaunch(config, desktop)) {
+    const task = store.createTask({
+      projectId,
+      prompt,
+      codexSessionId: threadId,
+      sessionFingerprint,
+      verifiedSessionTarget: verified,
+      verifiedDesktopStatus: relaunchingDesktopStatus(desktop),
+      submissionSource: 'phone_thread_message',
+      submissionId,
+      model,
+      reasoningEffort,
+      desktopRelaunch: 'missing'
+    });
+    await logger.write('bridge', 'info', 'codex.thread.message.desktop_relaunch.queued', {
+      taskId: task.id,
+      threadId,
+      projectId,
+      promptLength: prompt.length,
+      submissionId
+    });
+    return { statusCode: 202, payload: { run: task } };
+  }
   if (shouldUseDesktopPrimaryFallback(config) && !verifiedDesktopStatus.preflight.ok) {
     const run = await threadService.sendMessage({
       threadId,
@@ -2677,6 +3077,7 @@ function serializeOutboxRun(item) {
       type: `outbox.${item.status}`,
       payload: {
         outboxId: item.id,
+        message: item.error || (item.status === 'dispatching' ? '正在确认这条消息是否进入官方会话' : ''),
         attemptCount: item.attemptCount,
         retryable: item.retryable,
         nextAttemptAt: item.nextAttemptAt
@@ -2704,6 +3105,82 @@ async function readJsonObjectBody(request, maxBytes) {
   return body;
 }
 
+// 管理路由的 master-only 闸门：设备凭证即使 token+OTP 全对，也不允许操作配对控制台。
+function requireMasterAuth(request, response) {
+  if (request.codexAuth?.kind !== 'master') {
+    sendJson(response, 403, { error: 'master_required' });
+    return false;
+  }
+  return true;
+}
+
+// publicUrl 来源：请求体覆盖 > CODEX_BRIDGE_PUBLIC_URL > 空串（空则二维码不含地址，
+// 手机端手填，服务端不得报错）。不从 Host 头推导，避免注入任意扫码地址。
+function resolvePairingPublicUrl({ requestedPublicUrl }) {
+  const fromBody = String(requestedPublicUrl ?? '').trim().replace(/\/+$/, '');
+  if (fromBody) {
+    return fromBody;
+  }
+  return String(process.env.CODEX_BRIDGE_PUBLIC_URL ?? '').trim().replace(/\/+$/, '');
+}
+
+// 配对/设备审计：只记录类别、来源、deviceId、deviceName、reason；
+// 绝不落 token、totpSecret、完整配对码。
+function auditPairingEvent(logger, level, event, payload) {
+  logger.write('security', level, event, payload).catch(() => {});
+}
+
+async function handlePairEnroll({ request, response, url, logger, authGate, deviceRegistry, pairingSessions, enrollLimiter }) {
+  if (enrollLimiter.isRateLimited(request)) {
+    auditPairingEvent(logger, 'warn', 'bridge.pairing.failed', {
+      category: 'pairing_rate_limited',
+      pathname: url.pathname,
+      ...authGate.describeSource(request)
+    });
+    response.setHeader('retry-after', String(enrollLimiter.retryAfterSeconds(request)));
+    sendJson(response, 429, { error: 'pairing_rate_limited' });
+    return;
+  }
+  let body;
+  try {
+    body = await readJsonObjectBody(request, PAIRING_ENROLL_MAX_BODY_BYTES);
+  } catch (error) {
+    sendJson(response, error.statusCode ?? 400, { error: 'invalid_request' });
+    return;
+  }
+  const validated = validatePairEnrollBody(body);
+  if (!validated.ok) {
+    sendJson(response, 400, { error: 'invalid_request' });
+    return;
+  }
+  const outcome = pairingSessions.tryEnroll(validated.pairingCode);
+  if (!outcome.ok) {
+    enrollLimiter.recordFailure(request);
+    auditPairingEvent(logger, 'warn', 'bridge.pairing.failed', {
+      category: outcome.reason === 'code_expired' ? 'pairing_expired' : 'pairing_invalid',
+      reason: outcome.reason,
+      pathname: url.pathname,
+      ...authGate.describeSource(request)
+    });
+    sendJson(response, 401, { error: 'pairing_failed', reason: outcome.reason });
+    return;
+  }
+  const created = await deviceRegistry.createDevice({ deviceName: validated.deviceName });
+  auditPairingEvent(logger, 'info', 'bridge.pairing.enrolled', {
+    pathname: url.pathname,
+    deviceId: created.deviceId,
+    deviceName: created.deviceName,
+    ...authGate.describeSource(request)
+  });
+  sendJson(response, 200, {
+    deviceId: created.deviceId,
+    deviceName: created.deviceName,
+    token: created.token,
+    totpSecret: created.totpSecret,
+    pairedAt: created.pairedAt
+  });
+}
+
 async function writeAppLog(logger, body) {
   return logger.write(
     body.source ?? 'app',
@@ -2728,28 +3205,263 @@ function delay(ms) {
   });
 }
 
-function requireAuth({ request, url }) {
-  const token = process.env.CODEX_BRIDGE_TOKEN ?? '';
-  if (token.trim().length === 0) {
-    return;
+const AUTH_FAILURE_WINDOW_MS = 60_000;
+const AUTH_MAX_FAILURES_PER_WINDOW = 10;
+// 仅 NAT 回环形态算 loopback；经反代（Tailscale Funnel 等）进来的流量 x-forwarded-for 恒非空，
+// 不会落入下面的豁免，红线是不对任何可被外网伪装的来源豁免 OTP。
+const AUTH_LOOPBACK_REMOTE_ADDRESSES = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
+
+// 桥接鉴权闸门：token 单因子 + 可选 TOTP 动态码（CODEX_BRIDGE_TOTP_SECRET，空 = 关闭），
+// 附带失败审计（logs/current-run/security.jsonl）与按来源限速（60 秒内失败 >10 次后 429）。
+// 二期新增设备分支：主控 token 未命中时按 SHA-256 查设备注册表，命中则强制该校验设备
+// 自带 totpSecret（不享受任何本地豁免）；认证结果挂到 request.codexAuth 供 master-only 路由检查。
+function createAuthGate({ logger, now = () => Date.now(), remoteAddressResolver = null, deviceRegistry = null }) {
+  const totp = createTotpVerifier({ secret: process.env.CODEX_BRIDGE_TOTP_SECRET ?? '', now });
+  const recentFailures = new Map();
+  // 每设备一个 verifier：滑动窗口的 highestAcceptedStep 是跨请求记忆，必须缓存复用，
+  // 每请求新建会丢防重放状态。
+  const deviceVerifiers = new Map();
+  const resolveRemoteAddress = typeof remoteAddressResolver === 'function'
+    ? (request) => String(remoteAddressResolver(request) ?? '')
+    : (request) => String(request.socket?.remoteAddress ?? '');
+
+  // 本地 token-only 消费者三族：/desktop/script/*（桌面注入脚本，跑在 Codex Desktop webview，
+  // 只能安全持有 token）、/desktop/live/*（桌面直连宿主与 watchdog）、/health（start-stack 健康检查、
+  // doctor、smoke 等本地运维探测），它们都拿不到 TOTP secret；本机直连（loopback 且无
+  // x-forwarded-for）访问 /desktop/* 或 /health 时豁免 OTP，token 校验不变。
+  // 不放宽到 /desktop、/health 之外：中继转发的 App 流量（/api/codex/*、/tasks、/projects、/mobile/*）
+  // 同样以 loopback 无 xff 形态抵达 8787，全路径豁免会退化成单因子。
+  function isLocalOpsLoopbackWithoutForwarder(request, url) {
+    if (!totp.enabled
+      || (!url.pathname.startsWith('/desktop/') && url.pathname !== '/health')) {
+      return false;
+    }
+    if (!AUTH_LOOPBACK_REMOTE_ADDRESSES.has(resolveRemoteAddress(request))) {
+      return false;
+    }
+    return request.headers['x-forwarded-for'] === undefined;
   }
 
-  const authorization = request.headers.authorization ?? '';
-  const bearer = authorization.startsWith('Bearer ') ? authorization.slice('Bearer '.length) : '';
-  const queryToken = url.searchParams.get('token') ?? '';
-  const headerToken = request.headers['x-codex-bridge-token'] ?? '';
-  const provided = Array.isArray(headerToken) ? headerToken[0] : headerToken;
-
-  if (bearer === token || queryToken === token || provided === token) {
-    return;
+  function sourceKey(request) {
+    const remoteAddress = resolveRemoteAddress(request) || 'unknown';
+    const forwarded = firstHeader(request.headers['x-forwarded-for']) ?? '';
+    return `${remoteAddress}|${String(forwarded).trim()}`;
   }
 
-  if (url.pathname.startsWith('/desktop/script/')) {
-    desktopScriptBridge.recordUnauthorized(url.pathname);
+  function failureTimestamps(request) {
+    const key = sourceKey(request);
+    let timestamps = recentFailures.get(key);
+    if (!timestamps) {
+      timestamps = [];
+      recentFailures.set(key, timestamps);
+    }
+    return timestamps;
   }
-  const error = new Error('Unauthorized');
-  error.statusCode = 401;
-  throw error;
+
+  function pruneFailures(timestamps, nowMs) {
+    while (timestamps.length > 0 && nowMs - timestamps[0] >= AUTH_FAILURE_WINDOW_MS) {
+      timestamps.shift();
+    }
+  }
+
+  function isRateLimited(request) {
+    const timestamps = failureTimestamps(request);
+    pruneFailures(timestamps, now());
+    return timestamps.length > AUTH_MAX_FAILURES_PER_WINDOW;
+  }
+
+  function retryAfterSeconds(request) {
+    const nowMs = now();
+    const timestamps = failureTimestamps(request);
+    pruneFailures(timestamps, nowMs);
+    if (timestamps.length === 0) {
+      return Math.ceil(AUTH_FAILURE_WINDOW_MS / 1000);
+    }
+    return Math.max(1, Math.ceil((timestamps[0] + AUTH_FAILURE_WINDOW_MS - nowMs) / 1000));
+  }
+
+  function recordAuthFailure(request) {
+    const timestamps = failureTimestamps(request);
+    pruneFailures(timestamps, now());
+    timestamps.push(now());
+  }
+
+  function auditAuthFailure(request, url, category, extra = {}) {
+    // 只记录类别与来源，绝不记录 token / OTP 明文。
+    logger.write('security', 'warn', 'bridge.auth.failed', {
+      category,
+      pathname: url.pathname,
+      remoteAddress: resolveRemoteAddress(request) || null,
+      xForwardedFor: firstHeader(request.headers['x-forwarded-for']) ?? null,
+      ...extra
+    }).catch(() => {});
+  }
+
+  function rejectAuth({ request, url, category, statusCode = 401, headers = null, countTowardsRateLimit = true, extraAudit = null }) {
+    if (url.pathname.startsWith('/desktop/script/')) {
+      desktopScriptBridge.recordUnauthorized(url.pathname);
+    }
+    const auditExtra = { ...(extraAudit ?? {}) };
+    if (headers && headers['retry-after'] !== undefined) {
+      auditExtra.retryAfterSeconds = Number(headers['retry-after']);
+    }
+    auditAuthFailure(request, url, category, auditExtra);
+    if (countTowardsRateLimit) {
+      recordAuthFailure(request);
+    }
+    const error = new Error(statusCode === 429 ? 'Too Many Requests' : 'Unauthorized');
+    error.statusCode = statusCode;
+    if (headers) {
+      error.responseHeaders = headers;
+    }
+    throw error;
+  }
+
+  function getDeviceVerifier(device) {
+    let verifier = deviceVerifiers.get(device.deviceId);
+    if (!verifier) {
+      verifier = createTotpVerifier({ secret: device.totpSecret, now });
+      deviceVerifiers.set(device.deviceId, verifier);
+    }
+    return verifier;
+  }
+
+  // 设备凭证解析：provided token 非空且 ≠ 主控时调用。命中未吊销设备 → 强制设备 OTP
+  // （缺失/错误一律 401 + x-codex-bridge-2fa: required，且不享受任何本地豁免）；
+  // 命中已吊销凭证 → device_auth_invalid；完全未知 → 返回 null 由调用方按 token 类别拒绝。
+  async function resolveDeviceAuth({ request, url, candidateTokens }) {
+    if (!deviceRegistry || typeof deviceRegistry.findByTokenHash !== 'function') {
+      return null;
+    }
+    if (typeof deviceRegistry.initialize === 'function') {
+      await deviceRegistry.initialize();
+    }
+    const seenHashes = new Set();
+    let revokedHit = false;
+    for (const candidate of candidateTokens) {
+      const tokenText = typeof candidate === 'string' ? candidate : '';
+      if (!tokenText) {
+        continue;
+      }
+      const tokenHash = createHash('sha256').update(tokenText, 'utf8').digest('hex');
+      if (seenHashes.has(tokenHash)) {
+        continue;
+      }
+      seenHashes.add(tokenHash);
+      const device = await deviceRegistry.findByTokenHash(tokenHash);
+      if (device) {
+        const otpHeader = firstHeader(request.headers['x-codex-bridge-otp']) ?? '';
+        const otpQuery = url.searchParams.get('otp') ?? '';
+        const otpCode = String(otpHeader || otpQuery).trim();
+        if (!otpCode) {
+          rejectAuth({
+            request,
+            url,
+            category: 'device_otp_invalid',
+            headers: { 'x-codex-bridge-2fa': 'required' },
+            extraAudit: { reason: 'otp_missing', deviceId: device.deviceId }
+          });
+        }
+        if (!getDeviceVerifier(device).verify(otpCode)) {
+          rejectAuth({
+            request,
+            url,
+            category: 'device_otp_invalid',
+            headers: { 'x-codex-bridge-2fa': 'required' },
+            extraAudit: { reason: 'otp_invalid', deviceId: device.deviceId }
+          });
+        }
+        return device;
+      }
+      if (typeof deviceRegistry.findAnyByTokenHash === 'function') {
+        const any = await deviceRegistry.findAnyByTokenHash(tokenHash);
+        if (any && any.revokedAt !== null && any.revokedAt !== undefined) {
+          revokedHit = true;
+        }
+      }
+    }
+    if (revokedHit) {
+      rejectAuth({ request, url, category: 'device_auth_invalid' });
+    }
+    return null;
+  }
+
+  async function requireAuth({ request, url }) {
+    const token = process.env.CODEX_BRIDGE_TOKEN ?? '';
+    const tokenRequired = token.trim().length > 0;
+    if (!tokenRequired && !totp.enabled) {
+      // open 模式维持现状：直接放行；管理路由按 master 处理。
+      request.codexAuth = { kind: 'master' };
+      return;
+    }
+
+    if (isRateLimited(request)) {
+      rejectAuth({
+        request,
+        url,
+        category: 'rate_limited',
+        statusCode: 429,
+        headers: { 'retry-after': String(retryAfterSeconds(request)) },
+        countTowardsRateLimit: false
+      });
+    }
+
+    if (tokenRequired) {
+      const authorization = request.headers.authorization ?? '';
+      const bearer = authorization.startsWith('Bearer ') ? authorization.slice('Bearer '.length) : '';
+      const queryToken = url.searchParams.get('token') ?? '';
+      const headerToken = request.headers['x-codex-bridge-token'] ?? '';
+      const provided = Array.isArray(headerToken) ? headerToken[0] : headerToken;
+
+      if (bearer !== token && queryToken !== token && provided !== token) {
+        const device = await resolveDeviceAuth({ request, url, candidateTokens: [bearer, queryToken, provided] });
+        if (!device) {
+          rejectAuth({ request, url, category: 'token' });
+        }
+        request.codexAuth = { kind: 'device', deviceId: device.deviceId };
+        if (typeof deviceRegistry.touch === 'function') {
+          deviceRegistry.touch(device.deviceId, now());
+        }
+      } else {
+        request.codexAuth = { kind: 'master' };
+      }
+    }
+
+    if (totp.enabled && request.codexAuth?.kind !== 'device' && !isLocalOpsLoopbackWithoutForwarder(request, url)) {
+      const headerOtp = firstHeader(request.headers['x-codex-bridge-otp']) ?? '';
+      const queryOtp = url.searchParams.get('otp') ?? '';
+      const code = String(headerOtp || queryOtp).trim();
+      if (!code) {
+        rejectAuth({
+          request,
+          url,
+          category: 'otp_missing',
+          headers: { 'x-codex-bridge-2fa': 'required' }
+        });
+      }
+      if (!totp.verify(code)) {
+        rejectAuth({
+          request,
+          url,
+          category: 'otp_invalid',
+          headers: { 'x-codex-bridge-2fa': 'required' }
+        });
+      }
+    }
+  }
+
+  return {
+    requireAuth,
+    isTotpRequired: () => totp.enabled,
+    sourceKey,
+    describeSource: (request) => ({
+      remoteAddress: resolveRemoteAddress(request) || null,
+      xForwardedFor: firstHeader(request.headers['x-forwarded-for']) ?? null
+    }),
+    forgetDevice: (deviceId) => {
+      deviceVerifiers.delete(deviceId);
+    }
+  };
 }
 
 function isBridgeAuthRequired() {

@@ -2,6 +2,7 @@ import http from 'node:http';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { readRecentDesktopThread } from './desktopRecentThread.js';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -61,6 +62,13 @@ export class CodexDesktopCdpClient {
       useStateDbOnly: true,
       archived: false
     });
+  }
+
+  async readRecentThread(threadId, options = {}) {
+    // Resolving the current turn must not serialize an unbounded conversation.
+    // The official turns endpoint returns newest first; adapter consumers use
+    // chronological order. Do not retry a failed page with a full-history read.
+    return readRecentDesktopThread(this, threadId, options);
   }
 
   async getCurrentConversationId() {

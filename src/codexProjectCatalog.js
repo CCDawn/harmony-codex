@@ -1,7 +1,6 @@
 import { createHash } from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { isSameOrChildPath } from './workspaceGuard.js';
 
 const DEFAULT_MAX_PROJECTS = 100;
 
@@ -51,8 +50,12 @@ export class CodexProjectCatalog {
   }
 
   findProjectByRoot(root) {
+    const key = normalizeProjectRoot(root);
     return this.projects.find((project) => {
-      return isSameOrChildPath(root, project.root) || isSameOrChildPath(project.root, root);
+      const candidate = normalizeProjectRoot(project.root);
+      return process.platform === 'win32'
+        ? candidate.toLowerCase() === key.toLowerCase()
+        : candidate === key;
     }) ?? null;
   }
 

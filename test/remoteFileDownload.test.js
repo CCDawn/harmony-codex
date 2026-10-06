@@ -9,12 +9,15 @@ import { DiagnosticLogger } from '../src/diagnosticLogger.js';
 import { MockCodexAdapter } from '../src/mockCodexAdapter.js';
 
 function createRemoteFileTestConfig(session) {
+  // 设备注册表指向独立临时文件，避免测试读取仓库 logs/state 下的真实数据。
+  const testRoot = path.join(os.tmpdir(), `codex-remote-file-test-${Date.now()}-${Math.random().toString(16).slice(2)}`);
   return {
     outboxEnabled: false,
     remoteFileMaxBytes: 1024 * 1024,
     logger: new DiagnosticLogger({
-      root: path.join(os.tmpdir(), `codex-remote-file-test-${Date.now()}-${Math.random().toString(16).slice(2)}`)
+      root: testRoot
     }),
+    deviceRegistryPath: path.join(testRoot, 'state', 'device-registry.json'),
     desktopLiveRecovery: {
       shouldRecover() {
         return false;

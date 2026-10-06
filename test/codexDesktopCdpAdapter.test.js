@@ -2,6 +2,96 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { CodexDesktopCdpAdapter } from '../src/codexDesktopCdpAdapter.js';
 
+test('active desktop thread preparation uses recent turns without loading full history', async () => {
+  const adapter = new CodexDesktopCdpAdapter({ client: {
+    async request(method, params) {
+      assert.equal(method, 'thread/read');
+      assert.equal(params.includeTurns, false);
+      return { thread: { id: 'target', status: { type: 'active' } } };
+    },
+    async readRecentThread(id) {
+      assert.equal(id, 'target');
+      return { thread: { id, turns: [{ id: 'old', status: 'completed' }, { id: 'current', status: 'inProgress' }] } };
+    }
+  } });
+  const result = await adapter.prepareExistingThread({ codexSessionId: 'target' }, {}, () => {});
+  assert.equal(result.activeTurnId, 'current');
+  assert.equal(result.resumed, false);
+  adapter.close();
+});
+
+for (const outcome of ['accepted', 'ended', 'transport_failed']) {
+  test(`desktop-owned active turn is adopted without resume: ${outcome}`, async () => {
+    const calls = [];
+    const adapter = new CodexDesktopCdpAdapter({ client: {
+      async request(method, params) {
+        calls.push({ method, params });
+        if (method === 'thread/read') return { thread: { id: 'thread', status: { type: 'active', activeFlags: [] },
+          turns: params.includeTurns ? [{ id: 'desktop-turn', status: 'inProgress' }] : [] } };
+        if (method === 'turn/steer') {
+          if (outcome === 'ended') throw new Error('no active turn to steer');
+          if (outcome === 'transport_failed') throw new Error('transport disconnected');
+          return { turnId: 'desktop-turn' };
+        }
+        if (method === 'turn/start') return { turn: { id: 'new-turn', status: 'inProgress' } };
+        assert.fail(`unexpected operation ${method}`);
+      }
+    } });
+    adapter.captureSessionFileCursor = async () => null;
+    adapter.clearDesktopNotificationNoise = async () => ({ ok: true });
+    adapter.startNotificationPolling = () => ({ stop() {} });
+    adapter.waitForDesktopTurnCompletion = async ({ turnId }) => ({ turn: { id: turnId, status: 'completed' } });
+    adapter.completeDesktopTurnResult = ({ completed }) => completed;
+    const operation = adapter.run({ task: { id: 'task', codexSessionId: 'thread', prompt: '追加消息' }, project: {}, emit() {} });
+    if (outcome === 'transport_failed') await assert.rejects(operation, /transport disconnected/);
+    else assert.equal((await operation).turn.id, outcome === 'accepted' ? 'desktop-turn' : 'new-turn');
+    assert.equal(calls.some((call) => call.method === 'thread/resume'), false);
+    assert.equal(calls.filter((call) => call.method === 'turn/start').length, outcome === 'ended' ? 1 : 0);
+    const steer = calls.find((call) => call.method === 'turn/steer');
+    assert.equal(steer.params.expectedTurnId, 'desktop-turn');
+    assert.equal(steer.params.input[0].text, '追加消息');
+    adapter.close();
+  });
+}
+
+test('interrupt during resume uses the pending turn/start acknowledgement without a history lookup', async () => {
+  const prepared = Promise.withResolvers();
+  const completed = Promise.withResolvers();
+  const calls = [];
+  const adapter = new CodexDesktopCdpAdapter({ client: {
+    async request(method, params) {
+      calls.push({ method, params });
+      if (method === 'turn/start') return { turn: { id: 'new-turn' } };
+      if (method === 'turn/interrupt') return {};
+      throw new Error('Full history lookup must not block a pending turn acknowledgement');
+    }
+  } });
+  adapter.prepareExistingThread = () => prepared.promise;
+  adapter.captureSessionFileCursor = async () => null;
+  adapter.clearDesktopNotificationNoise = async () => ({ ok: true });
+  adapter.startNotificationPolling = () => ({ stop() {} });
+  adapter.waitForDesktopTurnCompletion = () => completed.promise;
+  adapter.completeDesktopTurnResult = ({ completed }) => completed;
+  adapter.waitForTurnTerminalAfterInterrupt = async () => ({ status: 'interrupted' });
+  const task = { id: 'pending-task', codexSessionId: 'thread', prompt: 'test' };
+  const emit = (type, payload) => {
+    if (type === 'codex.app_server.turn.started') task.activeCodexTurnId = payload.turn.id;
+  };
+  const run = adapter.run({ task, project: { root: '.' }, emit });
+  const stop = adapter.interrupt({ task, emit });
+  prepared.resolve({ thread: { id: 'thread' }, resumed: true });
+  try {
+    const result = await stop;
+    assert.equal(result.confirmed, true);
+    assert.deepEqual(calls.map(({ method }) => method), ['turn/start', 'turn/interrupt']);
+    assert.deepEqual(calls[1].params, { threadId: 'thread', turnId: 'new-turn' });
+  } finally {
+    completed.resolve({ status: 'interrupted' });
+    await run;
+    adapter.close();
+  }
+});
+
 test('CodexDesktopCdpAdapter exposes authoritative desktop thread runtime states', async () => {
   const requests = [];
   const adapter = new CodexDesktopCdpAdapter({

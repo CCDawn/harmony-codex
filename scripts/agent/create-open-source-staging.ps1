@@ -58,6 +58,7 @@ function Write-SanitizedHarmonyBuildProfile {
 function Remove-ForbiddenStagingResidue {
   $forbiddenDirs = @(
     '.git',
+    '__pycache__',
     '.hvigor',
     '.idea',
     '.deveco',
@@ -80,7 +81,7 @@ function Remove-ForbiddenStagingResidue {
       ForEach-Object { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
   }
 
-  $forbiddenExtensions = @('.hap', '.p12', '.p7b', '.cer', '.log', '.jsonl', '.rdp')
+  $forbiddenExtensions = @('.hap', '.p12', '.p7b', '.cer', '.log', '.jsonl', '.rdp', '.pyc', '.pyo')
   $forbiddenNames = @('BridgeConfig.ets', 'RelayConfig.ets', 'bootstrap.js', 'preload.js')
   Get-ChildItem -LiteralPath $OutputPath -Recurse -Force -File -ErrorAction SilentlyContinue |
     Where-Object {
@@ -102,6 +103,7 @@ function Test-SkippedPath {
   $parts = $normalized -split '\\'
   $skipDirs = @(
     '.git',
+    '__pycache__',
     '.hvigor',
     '.idea',
     '.deveco',
@@ -133,7 +135,7 @@ function Test-SkippedPath {
 
   $name = Split-Path -Leaf $normalized
   $extension = [System.IO.Path]::GetExtension($name)
-  if (@('.hap', '.p12', '.p7b', '.cer', '.log', '.jsonl', '.rdp') -contains $extension) {
+  if (@('.hap', '.p12', '.p7b', '.cer', '.log', '.jsonl', '.rdp', '.pyc', '.pyo') -contains $extension) {
     return $true
   }
   if ($name -like '*.local.psd1') {
@@ -202,6 +204,7 @@ foreach ($file in @(
 
 foreach ($dir in @(
   'src',
+  'voice',
   'scripts',
   'tools',
   'docs',

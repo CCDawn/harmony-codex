@@ -3,6 +3,9 @@ import { createServer } from 'node:http';
 import test from 'node:test';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import { inspectMobileLink, summarizeMobileLink } from '../tools/windows/mobile-link-diagnostics.mjs';
 
 const profile = { id: 'bear', roomId: 'room' };
@@ -189,7 +192,21 @@ test('running task with a remote forwarding failure is reported as a tunnel fail
   assert.match(voice.message, /远端端口转发被拒绝/);
 });
 
-test('diagnostics CLI preserves the concrete voice tunnel state from its argument', async () => {
+test('diagnostics CLI preserves the concrete voice tunnel state from its argument', async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'diagnostics-cli-'));
+  t.after(async () => {
+    assert.equal(path.dirname(root), path.resolve(os.tmpdir()));
+    await fs.rm(root, { recursive: true, force: true });
+  });
+  const configDirectory = path.join(root, 'HarmonyCodexRemote/entry/src/main/ets/config');
+  await fs.mkdir(configDirectory, { recursive: true });
+  await fs.mkdir(path.join(root, 'tools/windows'), { recursive: true });
+  await fs.mkdir(path.join(root, 'src'), { recursive: true });
+  await fs.writeFile(path.join(root, 'package.json'), '{"type":"module"}');
+  await fs.writeFile(path.join(configDirectory, 'BridgeConfig.ets'),
+    "export const DEFAULT_BRIDGE_TOKEN: string = 'mock-diagnostics-token';\n");
+  await fs.copyFile(new URL('../tools/windows/mobile-link-diagnostics.mjs', import.meta.url), path.join(root, 'tools/windows/mobile-link-diagnostics.mjs'));
+  await fs.copyFile(new URL('../src/totp.js', import.meta.url), path.join(root, 'src/totp.js'));
   const server = createServer((request, response) => {
     response.setHeader('Content-Type', 'application/json');
     const url = new URL(request.url, 'http://127.0.0.1');
@@ -205,7 +222,7 @@ test('diagnostics CLI preserves the concrete voice tunnel state from its argumen
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   try {
-    const script = fileURLToPath(new URL('../tools/windows/mobile-link-diagnostics.mjs', import.meta.url));
+    const script = path.join(root, 'tools/windows/mobile-link-diagnostics.mjs');
     const port = String(server.address().port);
     const child = spawn(process.execPath, [script, '--port', port, '--voice-state', 'forward-failed'], { windowsHide: true });
     let stdout = '';

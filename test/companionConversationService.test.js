@@ -54,6 +54,7 @@ test('each read creates a fresh desktop client and closes it in finally', async 
   });
   assert.deepEqual(await service.getMessages({ profileId: 'profile-1', roomId: 'room-1', before: 'cursor-1' }), {
     entries: [{ itemId: 'room:m1', role: 'user', text: '你好', final: true }],
+    calls: [],
     nextCursor: 'next-1'
   });
 
@@ -195,7 +196,7 @@ test('missing or duplicate identifiers receive 400 without calling the service',
   }
 });
 
-test('unmatched paths fall through; known non-GET paths return 405', async () => {
+test('unmatched paths fall through; profile remains read-only', async () => {
   const ignoredResponse = responseCapture();
   const ignored = await handleCompanionRoute({
     request: makeRequest(), response: ignoredResponse,
@@ -207,7 +208,7 @@ test('unmatched paths fall through; known non-GET paths return 405', async () =>
   const response = responseCapture();
   const handled = await handleCompanionRoute({
     request: makeRequest('POST'), response,
-    url: 'http://127.0.0.1/companion/messages', service: {}
+    url: 'http://127.0.0.1/companion/profile', service: {}
   });
   assert.equal(handled, true);
   assert.equal(response.statusCode, 405);

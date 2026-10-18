@@ -1545,6 +1545,40 @@ test('uploads a permitted phone document and rejects sensitive or oversized file
   }
 });
 
+test('desktop interaction routes expose desktop-owned requests without a bridge run', async () => {
+  const config = createTestConfig();
+  let submitted = null;
+  config.desktopInteractions = {
+    async list(threadId) {
+      assert.equal(threadId, 'desktop-thread');
+      return [{ id: 'ticket-1', threadId, kind: 'approval', supportsResponse: true }];
+    },
+    async respond(id, body) {
+      submitted = { id, body };
+      if (id === 'stale') throw Object.assign(new Error('expired'), { statusCode: 409 });
+      return { resolved: true };
+    }
+  };
+  const { server } = createApp({ config, adapter: new MockCodexAdapter() });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  try {
+    const base = `http://127.0.0.1:${server.address().port}`;
+    const snapshot = await fetch(base + '/api/desktop-interactions?threadId=desktop-thread');
+    assert.equal(snapshot.status, 200);
+    assert.equal((await snapshot.json()).requests[0].id, 'ticket-1');
+    const body = { threadId: 'desktop-thread', decision: 'denied' };
+    const response = await fetch(base + '/api/desktop-interactions/ticket-1', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body)
+    });
+    assert.deepEqual(await response.json(), { resolved: true });
+    assert.deepEqual(submitted, { id: 'ticket-1', body });
+    assert.equal((await fetch(base + '/api/desktop-interactions/stale', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body)
+    })).status, 409);
+  } finally { server.close(); }
+});
+
 test('lists and answers structured App Server user input requests over HTTP', async () => {
   const config = createTestConfig();
   let receivedAnswers = null;
@@ -3156,10 +3190,13 @@ test('waits for desktop verification before creating an existing phone thread ta
   config.threadService = new FakeThreadService();
   config.sessions = new FakeSessionVerifier();
   let releaseVerification;
+  let markVerificationStarted;
+  const verificationStarted = new Promise((resolve) => { markVerificationStarted = resolve; });
   const adapter = {
     async getDesktopLiveStatus(timeoutMs, sessionId) {
       await new Promise((resolve) => {
         releaseVerification = resolve;
+        markVerificationStarted();
       });
       return {
         ok: true,
@@ -3206,7 +3243,12 @@ test('waits for desktop verification before creating an existing phone thread ta
       resolved = true;
       return response;
     });
-    await new Promise((resolve) => setTimeout(resolve, 30));
+    let verificationTimer;
+    try {
+      await Promise.race([verificationStarted, new Promise((_, reject) => {
+        verificationTimer = setTimeout(() => reject(new Error('Desktop verification did not start')), 2000);
+      })]);
+    } finally { clearTimeout(verificationTimer); }
     assert.equal(resolved, false);
     assert.equal(store.listTasks().length, 0);
     releaseVerification();

@@ -1,11 +1,23 @@
 import { http } from '@kit.NetworkKit';
+import { GuardianStatus } from '../model/BridgeModels';
+import { BridgeDesktopInteraction, BridgeDesktopInteractionResponse } from '../model/BridgeModels';
 import { CredentialRuntime } from '../config/CredentialRuntime';
 import { TotpGenerator } from '../utils/TotpGenerator';
-import { CompanionMessagesResponse, CompanionProfile, CompanionProfileResponse } from '../model/CompanionModels';
+import { CompanionCallRecord, CompanionMessagesResponse, CompanionProfile, CompanionProfileResponse, CompanionTextReceipt } from '../model/CompanionModels';
 import { BridgeOutboxItem, BridgeProject, BridgeRuntimeStatus, BridgeTask, BridgeTaskSummary, BridgeUserInput, CodexAccountUsage, CodexRuntimeSnapshot, CodexSessionDetail, CodexSessionFingerprint, CodexSessionSummary, DesktopLiveStatus, DesktopScreenshotImage, MobileFileUpload, MobileImageUpload, RemoteSessionFile, SessionSettings, SlashIndexItem, SystemLinkStatus, SystemRepairStatus, VoiceTranscriptEntry } from '../model/BridgeModels';
 
 interface ProjectsResponse {
   projects?: BridgeProject[];
+}
+
+interface GuardianResponse {
+  guardian?: GuardianStatus;
+}
+
+class GuardianUpdatePayload {
+  enabled: boolean;
+
+  constructor(enabled: boolean) { this.enabled = enabled; }
 }
 
 interface TaskResponse {
@@ -31,6 +43,14 @@ interface ApprovalResponse {
 
 interface UserInputResponse {
   userInput?: BridgeUserInput;
+}
+
+interface DesktopInteractionsResponse {
+  requests?: BridgeDesktopInteraction[];
+}
+
+interface DesktopInteractionResult {
+  resolved?: boolean;
 }
 
 interface OutboxItemsResponse {
@@ -140,6 +160,28 @@ const BRIDGE_CLIENT_PROTOCOL: number = 1;
 const BRIDGE_CLIENT_VERSION: string = '1.0.13';
 
 export class BridgeClient {
+  static async getGuardianStatus(baseUrl: string, token: string = ''): Promise<GuardianStatus> {
+    const raw = await BridgeClient.request(http.RequestMethod.GET, `${baseUrl}/system/guardian?client=phone`, '', token);
+    return BridgeClient.parseGuardianStatus(raw);
+  }
+
+  static async setGuardianEnabled(baseUrl: string, token: string, enabled: boolean): Promise<GuardianStatus> {
+    const raw = await BridgeClient.request(http.RequestMethod.PUT, `${baseUrl}/system/guardian`,
+      JSON.stringify(new GuardianUpdatePayload(enabled)), token);
+    const guardian = BridgeClient.parseGuardianStatus(raw);
+    if (guardian.enabled !== enabled) { throw new Error('自动守护设置未确认，请刷新状态'); }
+    return guardian;
+  }
+
+  private static parseGuardianStatus(raw: string): GuardianStatus {
+    const guardian = (JSON.parse(raw) as GuardianResponse).guardian;
+    if (!guardian || typeof guardian.enabled !== 'boolean' || typeof guardian.phase !== 'string'
+      || !Array.isArray(guardian.faults) || !Array.isArray(guardian.history)) {
+      throw new Error('自动守护状态格式不完整，请更新电脑端');
+    }
+    return guardian;
+  }
+
   private static async request(method: http.RequestMethod, url: string, payload: string = '', token: string = '', options: BridgeRequestOptions = {}): Promise<string> {
     const retries = Math.max(0, options.retries ?? 0);
     const retryDelayMs = Math.max(200, options.retryDelayMs ?? 700);
@@ -364,6 +406,23 @@ export class BridgeClient {
       { connectTimeout: 10000, readTimeout: 45000, retries: 0 });
   }
 
+  static async sendCompanionText(baseUrl: string, profileId: string, roomId: string,
+    text: string, requestId: string, token: string = ''): Promise<CompanionTextReceipt> {
+    if (!profileId.trim() || !roomId.trim() || !text.trim() || text.length > 20000
+      || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(requestId)) {
+      throw new Error('文字消息内容或个人助手身份无效');
+    }
+    const raw = await BridgeClient.request(http.RequestMethod.POST, `${baseUrl}/companion/messages`,
+      JSON.stringify({ profileId, roomId, text, requestId }), token,
+      { connectTimeout: 10000, readTimeout: 45000, retries: 0 });
+    const parsed = JSON.parse(raw) as CompanionTextReceipt;
+    if (parsed.requestId !== requestId || (parsed.state !== 'submitted' && parsed.state !== 'uncertain')
+      || (parsed.itemId !== null && (typeof parsed.itemId !== 'string' || !parsed.itemId.startsWith('room:')))) {
+      throw new Error('文字提交回执无效，请核对官方记录，避免重复发送');
+    }
+    return { requestId, state: parsed.state, itemId: parsed.itemId };
+  }
+
   static async getCompanionProfile(baseUrl: string, token: string = ''): Promise<CompanionProfile> {
     const raw = await BridgeClient.request(
       http.RequestMethod.GET,
@@ -377,7 +436,7 @@ export class BridgeClient {
     if (!profile || typeof profile.id !== 'string' || profile.id.trim().length === 0
       || typeof profile.name !== 'string' || profile.name.trim().length === 0
       || typeof profile.roomId !== 'string' || profile.roomId.trim().length === 0) {
-      throw new Error('桥接服务没有返回熊大个人助手资料');
+      throw new Error('桥接服务没有返回个人助手资料');
     }
     return {
       id: profile.id.trim(),
@@ -419,8 +478,24 @@ export class BridgeClient {
         text: entry.text,
         final: entry.final === true
       }));
+    const calls: CompanionCallRecord[] = (Array.isArray(parsed.calls) ? parsed.calls : [])
+      .filter((call: CompanionCallRecord) => typeof call.messageId === 'string' && call.messageId.trim().length > 0
+        && typeof call.callId === 'string' && call.callId.trim().length > 0)
+      .map((call: CompanionCallRecord): CompanionCallRecord => ({
+        messageId: call.messageId.trim(),
+        callId: call.callId.trim(),
+        createdAt: typeof call.createdAt === 'string' ? call.createdAt.trim() : '',
+        endedAt: typeof call.endedAt === 'string' && call.endedAt.trim().length > 0 ? call.endedAt.trim() : null,
+        durationMs: typeof call.durationMs === 'number' && Number.isFinite(call.durationMs) && call.durationMs >= 0
+          ? call.durationMs : null,
+        outcome: typeof call.outcome === 'string' && call.outcome.trim().length > 0 ? call.outcome.trim() : 'unknown',
+        transcriptStatus: typeof call.transcriptStatus === 'string' && call.transcriptStatus.trim().length > 0
+          ? call.transcriptStatus.trim() : 'unknown',
+        summary: typeof call.summary === 'string' && call.summary.trim().length > 0 ? call.summary.trim() : null
+      }));
     return {
       entries,
+      calls,
       nextCursor: typeof parsed.nextCursor === 'string' && parsed.nextCursor.trim().length > 0
         ? parsed.nextCursor : null
     };
@@ -635,6 +710,25 @@ export class BridgeClient {
       throw new Error('桥接服务没有返回问题表单处理结果');
     }
     return parsed.userInput;
+  }
+
+  static async listDesktopInteractions(baseUrl: string, threadId: string, token: string = ''): Promise<BridgeDesktopInteraction[]> {
+    const raw = await BridgeClient.request(http.RequestMethod.GET,
+      `${baseUrl}/api/desktop-interactions?threadId=${encodeURIComponent(threadId)}`, '', token);
+    const parsed = JSON.parse(raw) as DesktopInteractionsResponse;
+    if (!Array.isArray(parsed.requests)) {
+      throw new Error('桥接服务没有返回桌面待处理请求');
+    }
+    return parsed.requests;
+  }
+
+  static async respondDesktopInteraction(baseUrl: string, requestId: string, response: BridgeDesktopInteractionResponse, token: string = ''): Promise<void> {
+    const raw = await BridgeClient.request(http.RequestMethod.POST,
+      `${baseUrl}/api/desktop-interactions/${encodeURIComponent(requestId)}`, JSON.stringify(response), token);
+    const parsed = JSON.parse(raw) as DesktopInteractionResult;
+    if (parsed.resolved !== true) {
+      throw new Error('桌面没有确认处理成功，请刷新后重试');
+    }
   }
 
   static async listOutbox(baseUrl: string, threadId: string = '', token: string = ''): Promise<BridgeOutboxItem[]> {

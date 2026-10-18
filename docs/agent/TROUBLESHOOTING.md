@@ -33,6 +33,13 @@ Actions:
 3. Check `/codex/sessions` through the bridge.
 4. Do not assume the phone app is broken until the bridge API is verified.
 
+Personal-assistant history reads verify the selected profile and room first.
+Room members and message pages are then fetched concurrently; messages are
+returned only after member validation provides the author roles. A failed member
+read fails the request rather than presenting messages with guessed roles.
+This reduces one sequential network wait without caching conversation data or
+retaining a shared desktop client across requests.
+
 ## CDP Offline
 
 Symptoms:
@@ -47,6 +54,25 @@ Actions:
 2. Try soft recovery first if the bridge is online.
 3. If Codex Desktop was launched without CDP, the user must explicitly start the CDP-capable desktop path.
 4. Do not silently restart Codex Desktop.
+
+The doctor's top-level `ok` requires Node, the package, bridge, and sessions
+checks to pass. Optional CDP/HDC/relay warnings still need separate inspection.
+A successful HTTP response from `/desktop/live/status` is only marked ready
+when its body explicitly reports `desktop.desktopLive=true`.
+
+## Voice Cold Start And Recovery
+
+The `/voice` proxy allows up to six seconds for managed-process startup and
+upstream TCP connection, below the phone's eight-second WebSocket timeout.
+Each TCP attempt has a 750 ms timeout. Cancelling the phone connection cancels
+pending upstream work. `voice.tunnel.opened` records `startupMs` and `attempts`;
+it proves TCP connectivity, not assistant media readiness or audible speech.
+
+Repeated early voice-process exits increase the restart delay up to 30 seconds.
+The crash streak resets after a process remains alive for 30 seconds. Closing
+the supervisor cancels both restart and stability timers. An SSH task running,
+a voice process running, or a successful WebSocket upgrade still needs media
+and microphone/playback verification before claiming a working phone call.
 
 ## HDC Offline
 

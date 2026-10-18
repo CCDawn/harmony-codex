@@ -1,9 +1,19 @@
+import { PairingPanel } from '../components/PairingPanel';
+import { SettingsPanel } from '../components/SettingsPanel';
+import { GuardianStatus } from '../model/BridgeModels';
+import { GuardianPresentation } from '../services/GuardianPresentation';
+import { CompanionComputerLifecycle } from '../services/CompanionComputerLifecycle';
 import { CompanionComputerPanel } from '../components/CompanionComputerPanel';
 import { VoiceTranscriptReducer } from '../services/VoiceTranscriptReducer';
-import { CompanionProfile } from '../model/CompanionModels';
+import { CompanionCallRecord, CompanionProfile, CompanionVoiceIdentity, CompanionTextMessage } from '../model/CompanionModels';
+import { CompanionTextService, CompanionTextPartition } from '../services/CompanionTextService';
+import { CompanionTranscriptStore, CompanionTranscriptPartition } from '../services/CompanionTranscriptStore';
+import { CompanionHistoryReducer } from '../services/CompanionHistoryReducer';
 import { CompanionConversationPanel } from '../components/CompanionConversationPanel';
 import { AppLogPayload, BridgeClient } from '../services/BridgeClient';
-import { BridgeEvent, BridgeOutboxItem, BridgeProject, BridgeRuntimeStatus, BridgeTask, BridgeTaskSummary, BridgeUserInput, BridgeUserInputOption, BridgeUserInputQuestion, CodexAccountUsage, CodexAccountUsageItem, CodexModelOption, CodexRuntimeSnapshot, CodexSessionAgentRef, CodexSessionDetail, CodexSessionEntry, CodexSessionFingerprint, CodexSessionSummary, CodexSessionSync, DesktopLiveStatus, DesktopScreenshotImage, MobileFileUpload, MobileImageUpload, RemoteSessionFile, SlashIndexItem, SystemLinkStatus, SystemRepairStatus, VoiceCallStatus, VoiceTranscriptEntry } from '../model/BridgeModels';
+import { BridgeEvent, BridgeOutboxItem, BridgeProject, BridgeRuntimeStatus, BridgeTask, BridgeTaskSummary, BridgeUserInput, BridgeUserInputOption, BridgeUserInputQuestion, CodexAccountUsage, CodexAccountUsageItem, CodexModelOption, CodexRuntimeSnapshot, CodexSessionAgentRef, CodexSessionDetail, CodexSessionEntry, CodexSessionFingerprint, CodexSessionSummary, CodexSessionSync, DesktopLiveStatus, DesktopScreenshotImage, MobileFileUpload, MobileImageUpload, RemoteSessionFile, SlashIndexItem, SystemLinkStatus, SystemRepairStatus, VoiceCallStage, VoiceCallFailure, VoiceCallStatus, VoiceTranscriptEntry } from '../model/BridgeModels';
+import { BridgeDesktopInteraction, BridgeDesktopInteractionResponse } from '../model/BridgeModels';
+import { SessionInteractionPanel } from '../components/SessionInteractionPanel';
 import { HdcRelayConfig, HdcRelayState, HdcRelayTunnel } from '../services/HdcRelayTunnel';
 import { ContentActionService } from '../services/ContentActionService';
 import { AttachmentService, PickedMobileFile } from '../services/AttachmentService';
@@ -23,6 +33,7 @@ import {
 } from '../services/SessionPresentationService';
 import {
   appendOptimisticSessionMessage,
+  OptimisticSessionFile,
   OptimisticSessionMessage,
   optimisticSessionMessagesForTarget,
   removeOptimisticSessionMessage
@@ -46,6 +57,7 @@ import { StandbyMonitorSnapshot } from '../model/StandbyMonitorModels';
 import { StandbyMonitorSnapshotService } from '../services/StandbyMonitorSnapshotService';
 import { BridgeCredential, BridgeCredentialStore } from '../services/BridgeCredentialStore';
 import { BridgePairingService } from '../services/BridgePairingService';
+import { SessionConnectionFailure, SessionConnectionFailurePresentation } from '../services/SessionConnectionFailure';
 import { SessionRuntimeStore } from '../services/SessionRuntimeStore';
 import { AppBackgroundRuntimeService } from '../services/AppBackgroundRuntimeService';
 import { common, ConfigurationConstant } from '@kit.AbilityKit';
@@ -90,6 +102,14 @@ const SESSION_READ_BASELINE_STORAGE_KEY = 'codexRemoteSessionReadBaseline';
 PersistentStorage.persistProp(THEME_MODE_STORAGE_KEY, DEFAULT_THEME_MODE);
 PersistentStorage.persistProp(FONT_SCALE_STORAGE_KEY, DEFAULT_FONT_SCALE_MODE);
 PersistentStorage.persistProp(SESSION_READ_BASELINE_STORAGE_KEY, '{}');
+
+interface PairingComputerStatus {
+  ready?: boolean;
+  assistantId?: string;
+  roomId?: string;
+  threadId?: string;
+  environmentId?: string;
+}
 
 interface PendingSessionImage {
   id: string;
@@ -197,8 +217,8 @@ struct Index {
   @StorageLink(NOTIFICATION_EVENT_TYPE_STORAGE_KEY) notificationTargetEventType: string = '';
   @StorageLink(NOTIFICATION_EVENT_ID_STORAGE_KEY) notificationTargetEventId: string = '';
   @StorageLink(NOTIFICATION_REVISION_STORAGE_KEY) notificationTargetRevision: string = '';
-  @State bridgeUrl: string = DEFAULT_BRIDGE_URL;
-  @State bridgeToken: string = DEFAULT_BRIDGE_TOKEN;
+  @State @Watch('guardianCredentialChanged') bridgeUrl: string = DEFAULT_BRIDGE_URL;
+  @State @Watch('guardianCredentialChanged') bridgeToken: string = DEFAULT_BRIDGE_TOKEN;
   @State bridgeOtpCode: string = '';
   @State pairingBusy: boolean = false;
   @State pairingScanAvailable: boolean = false;
@@ -212,14 +232,26 @@ struct Index {
   @State tasks: BridgeTaskSummary[] = [];
   @State sessions: CodexSessionSummary[] = [];
   @State sessionsLoadError: string = '';
+  @State sessionsFailureDiagnosticsAvailable: boolean = false;
+  @State sessionsFailureDetailsExpanded: boolean = false;
   @State lastGoodSessionCount: number = 0;
   @State selectedSession: CodexSessionDetail | null = null;
+  @State sessionSearchQuery: string = '';
+  @State companionAvatarFailed: boolean = false;
   @State companionProfile: CompanionProfile | null = null;
   @State companionComputerVisible: boolean = false;
   @State companionSelected: boolean = false;
   @State companionEntries: VoiceTranscriptEntry[] = [];
+  @State companionCalls: CompanionCallRecord[] = [];
+  @State companionTextMessages: CompanionTextMessage[] = [];
+  @State companionTextDraft: string = '';
+  @State companionTextReady: boolean = false;
+  @State companionTextError: string = '';
+  private companionTextPartitionKey: string = '';
+  private companionTextDrafts: Map<string, string> = new Map<string, string>();
   @State companionLoading: boolean = false;
   @State companionError: string = '';
+  @State companionTranscriptStorageError: string = '';
   @State companionNextCursor: string | null = null;
   private companionTimer: number = 0;
   private companionGeneration: number = 0;
@@ -227,11 +259,27 @@ struct Index {
   private companionOlderPending: boolean = false;
   private companionProfileLoading: boolean = false;
   private companionProfileCheckedAt: number = 0;
+  private companionTranscriptPartitionKey: string = '';
+  private companionTranscriptLoadedPartitionKey: string = '';
+  private nextPhoneTranscriptSequence: number = 0;
+  private pendingVoiceTranscriptIds: Record<string, string> = {};
+  private voiceCallBridgeUrlSnapshot: string = '';
   @State selectedProjectId: string = 'probe';
   @State currentTask: BridgeTask | null = null;
   @State message: string = '就绪';
   @State isBusy: boolean = false;
-  @State activeTab: string = 'sessions';
+  @State @Watch('guardianNavigationChanged') activeTab: string = 'sessions';
+  @State pairingDraftUrl: string = '';
+  @State pairingDraftToken: string = '';
+  @State pairingChecking: boolean = false;
+  @State pairingConnectionFailed: boolean = false;
+  @State pairingMessageStatus: string = '未检测';
+  @State pairingComputerStatus: string = '未检测';
+  private pairingCheckGeneration: number = 0;
+  private homeMenuScroller: Scroller = new Scroller();
+  @State homeMenuCanScrollUp: boolean = false;
+  @State homeMenuCanScrollDown: boolean = false;
+  @StorageLink('codexRemoteBackgroundRuntimeState') backgroundRuntimeState: string = 'stopped';
   @State logSessionId: string = `app-${Date.now()}`;
   @State sessionSidebarCollapsed: boolean = false;
   @State sessionSidebarUserCollapsed: boolean = false;
@@ -275,13 +323,20 @@ struct Index {
   @State desktopLiveProcessMode: string = '';
   @State desktopLiveCdpPort: number = 0;
   @State systemRepairAction: string = '';
+  @State guardian: GuardianStatus | null = null;
+  @State guardianBusy: boolean = false;
+  @State guardianSaving: boolean = false;
+  @State guardianError: string = '';
+  @State guardianInitialSection: string = '';
+  private guardianTimer: number = -1;
+  private guardianGeneration: number = 0;
+  private guardianRequestSequence: number = 0;
+  private guardianPageVisible: boolean = true;
   @State systemRepairMessage: string = '';
   @State systemLinkSeverity: string = '';
   @State systemLinkRecoverableFromPhone: boolean = true;
   @State homeActionMenuVisible: boolean = false;
   @State homeActionMenuSource: string = '';
-  @State themeModeChooserVisible: boolean = false;
-  @State fontScaleChooserVisible: boolean = false;
   @State accountUsagePanelVisible: boolean = false;
   @State isLoadingAccountUsage: boolean = false;
   @State accountUsage: CodexAccountUsage | null = null;
@@ -294,8 +349,13 @@ struct Index {
   @State desktopMonitorBatteryPercent: number = 0;
   @State voiceCallVisible: boolean = false;
   @State voiceCallStatus: VoiceCallStatus = 'idle';
+  @State voiceCallStage: VoiceCallStage = 'channel';
+  @State voiceCallStageStartedAt: number = 0;
+  @State voiceCallFailure: VoiceCallFailure = '';
+  private voiceCallStartPending: boolean = false;
+  private voiceCallStartGeneration: number = 0;
   @State voiceCallStatusDetail: string = '';
-  @State voiceCallAssistantName: string = '熊大';
+  @State voiceCallAssistantName: string = '个人助手';
   @State voiceCallTranscripts: VoiceTranscriptEntry[] = [];
   @State voiceCallSpeaking: boolean = false;
   @State voiceCallMuted: boolean = false;
@@ -329,6 +389,11 @@ struct Index {
   @State swipedSessionId: string = '';
   @State swipedSessionOffsetX: number = 0;
   @State userInputAnswers: Record<string, string> = {};
+  @State desktopInteractions: BridgeDesktopInteraction[] = [];
+  @State desktopInteractionError: string = '';
+  @State interactionSubmitError: string = '';
+  @State interactionBusyKeys: string[] = [];
+  private desktopInteractionRefreshSeq: number = 0;
   @State remoteFileActionBusy: boolean = false;
   @State markdownReaderDocument: MarkdownReaderDocument | null = null;
 
@@ -419,6 +484,8 @@ struct Index {
     this.fontScaleMode = normalizeFontScaleMode(this.fontScaleMode);
     this.applyThemeMode();
     this.appForeground = true;
+    this.guardianPageVisible = true;
+    this.startGuardianRefresh();
     this.applyKeyboardAvoidMode();
     this.registerVoiceCallCallbacks();
     if (this.companionSelected) {
@@ -445,6 +512,8 @@ struct Index {
   }
 
   aboutToDisappear(): void {
+    this.guardianPageVisible = false;
+    this.stopGuardianRefresh();
     this.appForeground = false;
     this.stopCompanionPolling();
     this.stopDesktopMonitorRefresh();
@@ -456,7 +525,12 @@ struct Index {
   }
 
   onBackPress(): boolean {
-    if (this.companionComputerVisible) {
+    if (this.homeActionMenuVisible) {
+      this.homeActionMenuVisible = false;
+      this.homeActionMenuSource = '';
+      return true;
+    }
+    if (this.companionComputerVisible && this.activeTab === 'sessions') {
       this.companionComputerVisible = false;
       return true;
     }
@@ -480,6 +554,10 @@ struct Index {
       this.closeDesktopMonitor('system_back');
       return true;
     }
+    if (this.activeTab !== 'sessions') {
+      this.closeConfigurationPage();
+      return true;
+    }
     if (this.companionSelected) {
       this.returnToSessionHome('companion_system_back');
       return true;
@@ -501,30 +579,10 @@ struct Index {
 
   build() {
     Stack({ alignContent: Alignment.TopStart }) {
-      if (this.activeTab === 'sessions') {
-        this.SessionWorkspace()
-      } else {
-        Scroll() {
-          Column({ space: 12 }) {
-            this.Header()
-            this.SummaryStrip()
-            this.TabBar()
-            if (this.activeTab === 'overview') {
-            this.ConnectionPanel()
-            this.DashboardPanel()
-            } else {
-              this.TaskPanel()
-              this.StatusPanel()
-              this.EventPanel()
-            }
-          }
-          .width('100%')
-          .padding({ left: this.contentLeftPadding(), right: 14, top: 16, bottom: 24 })
-        }
-        .width('100%')
-        .height('100%')
-        .scrollBar(BarState.Auto)
-        .edgeEffect(EdgeEffect.Spring)
+      // Keep the conversation mounted so navigation preserves its draft and scroll state.
+      this.SessionWorkspace()
+      if (this.activeTab !== 'sessions') {
+        this.ConfigurationWorkspace()
       }
 
       if (this.previewImageUrl.length > 0) {
@@ -587,6 +645,18 @@ struct Index {
     VoiceCallPanel({
       status: this.voiceCallStatus,
       statusDetail: this.voiceCallStatusDetail,
+      stage: this.voiceCallStage,
+      stageStartedAt: this.voiceCallStageStartedAt,
+      failure: this.voiceCallFailure,
+      onRetry: () => { void this.startVoiceCallSession('retry'); },
+      onRecovery: () => {
+        if (this.voiceCallFailure === 'mic') {
+          void this.startVoiceCallSession('permission_retry');
+        } else {
+          this.voiceCallVisible = false;
+          this.openConfigurationPage('pairing');
+        }
+      },
       assistantName: this.voiceCallAssistantName,
       transcripts: this.voiceCallTranscripts,
       speaking: this.voiceCallSpeaking,
@@ -713,161 +783,71 @@ struct Index {
   }
 
   @Builder
-  TabBar() {
-    Row({ space: 8 }) {
-      this.TabButton('overview', '总览')
-      this.TabButton('sessions', '会话')
-      this.TabButton('tasks', '任务')
-    }
-    .width('100%')
-  }
-
-  @Builder
-  TabButton(tab: string, label: string) {
-    Button(label)
-      .height(38)
-      .layoutWeight(1)
-      .fontSize(this.scaledFontSize(13))
-      .fontColor(this.activeTab === tab ? this.theme().textOnAccent : this.themeColor('#17202A'))
-      .backgroundColor(this.activeTab === tab ? this.themeColor('#1F6FEB') : this.themeColor('#FFFFFF'))
-      .onClick(() => {
-        this.activeTab = tab;
-        this.log('info', 'ui.tab.changed', `tab=${tab}`);
+  ConfigurationWorkspace() {
+    if (this.activeTab === 'pairing') {
+      this.ConnectionPanel()
+    } else if (this.activeTab === 'settings') {
+      SettingsPanel({
+        darkMode: this.usesDarkTheme(), themeMode: this.themeMode,
+        fontScaleMode: this.fontScaleMode,
+        backgroundState: this.backgroundRuntimeState === 'running' ? '运行中' : '未运行',
+        voiceState: this.pairingVoiceStatus(),
+        guardian: this.guardian, guardianBusy: this.guardianBusy || this.guardianSaving,
+        guardianError: this.guardianError, initialSection: this.guardianInitialSection,
+        onGuardianToggle: (enabled: boolean) => { void this.setGuardianEnabled(enabled); },
+        onGuardianRefresh: () => { void this.refreshGuardianStatus(); },
+        onBack: () => this.closeConfigurationPage(),
+        onTheme: (mode: string) => this.changeThemeMode(mode),
+        onFontScale: (mode: string) => this.changeFontScaleMode(mode),
+        onAction: (action: string) => this.handleHomeAction(action, 'settings')
       })
+    } else {
+      Column() {
+        Row({ space: 12 }) {
+          Button('返回设置').height(44).fontSize(this.scaledFontSize(14))
+            .fontColor(this.theme().textPrimary).backgroundColor(this.theme().surfaceMuted)
+            .onClick(() => this.closeConfigurationPage())
+          Text(this.activeTab === 'overview' ? '项目总览' : '任务与事件')
+            .fontSize(this.scaledFontSize(18)).fontColor(this.theme().textPrimary)
+          Blank()
+        }.width('100%').padding(16)
+        Scroll() {
+          Column({ space: 12 }) {
+            if (this.activeTab === 'overview') {
+              this.DashboardPanel()
+            } else {
+              this.TaskPanel()
+              this.StatusPanel()
+              this.EventPanel()
+            }
+          }.width('100%').padding({ left: 16, right: 16, bottom: 32 })
+        }.width('100%').layoutWeight(1).scrollBar(BarState.Auto)
+      }.width('100%').height('100%').backgroundColor(this.theme().canvas)
+    }
   }
 
   @Builder
   ConnectionPanel() {
-    Column({ space: 10 }) {
-      Text('桥接地址')
-        .fontSize(this.scaledFontSize(15))
-        .fontWeight(FontWeight.Medium)
-        .fontColor(this.themeColor('#17202A'))
-
-      TextInput({ text: this.bridgeUrl, placeholder: 'http://电脑地址:8787' })
-        .height(44)
-        .fontSize(this.scaledFontSize(14))
-        .backgroundColor(this.themeColor('#FFFFFF'))
-        .borderRadius(6)
-        .onChange((value: string) => {
-          this.bridgeUrl = value.trim();
-          this.log('info', 'bridge.url.changed', `bridgeUrl=${this.bridgeUrl}`);
-        })
-
-      TextInput({ text: this.bridgeToken, placeholder: '公网访问令牌（本地 USB 可留空）' })
-        .height(44)
-        .fontSize(this.scaledFontSize(14))
-        .backgroundColor(this.themeColor('#FFFFFF'))
-        .borderRadius(6)
-        .type(InputType.Password)
-        .onChange((value: string) => {
-          this.bridgeToken = value.trim();
-          this.log('info', 'bridge.token.changed', `hasToken=${this.bridgeToken.length > 0}`);
-        })
-
-      Text('设备配对')
-        .fontSize(this.scaledFontSize(15))
-        .fontWeight(FontWeight.Medium)
-        .fontColor(this.themeColor('#17202A'))
-
-      if (this.pairingGuideVisible) {
-        Text('尚未配对：点击「扫码配对」扫描电脑端二维码，或手输配对码完成绑定')
-          .fontSize(this.scaledFontSize(12))
-          .fontColor(this.themeColor('#B68A00'))
-      }
-
-      if (this.pairedDeviceId.length > 0) {
-        Text(`已配对：${this.pairedDeviceName}（${this.pairedDeviceId}）`)
-          .fontSize(this.scaledFontSize(12))
-          .fontColor(this.themeColor('#14853D'))
-      }
-
-      Row({ space: 10 }) {
-        Button('扫码配对')
-          .height(40)
-          .layoutWeight(1)
-          .enabled(!this.pairingBusy)
-          .fontSize(this.scaledFontSize(14))
-          .fontColor(this.themeColor('#FFFFFF'))
-          .backgroundColor(this.themeColor('#1F6FEB'))
-          .onClick(() => {
-            this.log('info', 'ui.click.pairing_scan', '');
-            void this.startScanPairing();
-          })
-
-        Button('解除配对')
-          .height(40)
-          .layoutWeight(1)
-          .enabled(!this.pairingBusy && this.pairedDeviceId.length > 0)
-          .fontSize(this.scaledFontSize(14))
-          .fontColor(this.themeColor('#FFFFFF'))
-          .backgroundColor(this.themeColor('#8A95A3'))
-          .onClick(() => {
-            this.log('info', 'ui.click.pairing_unpair', `deviceId=${this.pairedDeviceId}`);
-            void this.unpairBridgeCredential('panel');
-          })
-      }
-      .width('100%')
-
-      TextInput({ text: $$this.pairingManualCode, placeholder: '手输配对码：XXXXX-XXXXX 或 10 位连串' })
-        .height(44)
-        .fontSize(this.scaledFontSize(14))
-        .backgroundColor(this.themeColor('#FFFFFF'))
-        .borderRadius(6)
-        .enterKeyType(EnterKeyType.Done)
-        .onSubmit(() => {
-          void this.pairWithManualCode();
-        })
-
-      Text(`已识别 ${this.pairingManualCode.replace(/[^0-9A-Za-z]/g, '').length}/10 位（输完可点键盘回车确认）`)
-        .fontSize(this.scaledFontSize(11))
-        .fontColor(this.themeColor('#68717D'))
-
-      Button('使用配对码配对')
-        .height(40)
-        .width('100%')
-        .enabled(!this.pairingBusy)
-        .fontSize(this.scaledFontSize(14))
-        .fontColor(this.themeColor('#FFFFFF'))
-        .backgroundColor(this.themeColor('#14853D'))
-        .onClick(() => {
-          this.log('info', 'ui.click.pairing_manual', '');
-          void this.pairWithManualCode();
-        })
-
-      if (!this.pairingScanAvailable) {
-        Text('本机不支持系统扫码，请使用手输配对码完成配对')
-          .fontSize(this.scaledFontSize(12))
-          .fontColor(this.themeColor('#68717D'))
-      }
-
-      if (this.pairingStatusText.length > 0) {
-        Text(this.pairingStatusText)
-          .fontSize(this.scaledFontSize(12))
-          .fontColor(this.themeColor('#68717D'))
-      }
-
-      Row({ space: 10 }) {
-        Button('加载项目')
-          .height(40)
-          .layoutWeight(1)
-          .enabled(!this.isBusy)
-          .onClick(() => {
-            this.log('info', 'ui.click.load_projects', '');
-            void this.loadProjects();
-          })
-
-        Button('刷新任务')
-          .height(40)
-          .layoutWeight(1)
-          .enabled(!this.isBusy)
-          .onClick(() => {
-            this.log('info', 'ui.click.refresh_task', `taskId=${this.currentTask?.id ?? ''}`);
-            void this.refreshDashboard(true);
-          })
-      }
-    }
-    .cardStyle(this.theme().surface)
+    PairingPanel({
+      darkMode: this.usesDarkTheme(), fontScaleMode: this.fontScaleMode,
+      paired: this.pairedDeviceId.length > 0,
+      deviceName: this.pairedDeviceName || '已绑定设备',
+      checking: this.pairingChecking, busy: this.pairingBusy,
+      connectionFailed: this.pairingConnectionFailed,
+      messageStatus: this.pairingMessageStatus, voiceStatus: this.pairingVoiceStatus(),
+      computerStatus: this.pairingComputerStatus, statusText: this.pairingStatusText,
+      scanAvailable: this.pairingScanAvailable,
+      draftUrl: this.pairingDraftUrl, draftToken: this.pairingDraftToken, manualCode: this.pairingManualCode,
+      onBack: () => this.closeConfigurationPage(),
+      onScan: () => { void this.startScanPairing(); },
+      onRetry: () => { void this.checkPairingConnection(); },
+      onUnpair: () => this.confirmUnpair(),
+      onSave: () => { void this.savePairingDraft(); },
+      onManualPair: () => { void this.pairWithManualCode(); },
+      onUrlChange: (value: string) => { this.pairingDraftUrl = value; },
+      onTokenChange: (value: string) => { this.pairingDraftToken = value; },
+      onCodeChange: (value: string) => { this.pairingManualCode = value; }
+    })
   }
 
   @Builder
@@ -968,7 +948,8 @@ struct Index {
           this.SessionSidebarResizeHandle()
         }
         Column() {
-          this.SessionPanel()
+          this.GuardianStatusRow()
+          Column() { this.SessionPanel() }.width('100%').layoutWeight(1)
         }
         .layoutWeight(1)
         .height('100%')
@@ -1001,9 +982,19 @@ struct Index {
     } else if (this.companionSelected) {
       CompanionConversationPanel({
         profile: this.companionProfile,
+        voiceOngoing: this.voiceCallStatus === 'connecting' || this.voiceCallStatus === 'ready' || this.voiceCallStatus === 'active',
         entries: this.companionEntries,
+        calls: this.companionCalls,
+        textMessages: this.companionTextMessages,
+        draft: this.companionTextDraft,
+        textReady: this.companionTextReady,
+        textError: this.companionTextError,
+        onDraftChange: (text: string) => this.changeCompanionTextDraft(text),
+        onSendText: () => { void this.sendCompanionText(); },
+        onRecoverText: (message: CompanionTextMessage) => this.recoverCompanionText(message),
         loading: this.companionLoading,
         errorMessage: this.companionError,
+        transcriptStorageError: this.companionTranscriptStorageError,
         hasOlder: this.companionNextCursor !== null,
         darkMode: this.usesDarkTheme(),
         fontScaleMode: this.fontScaleMode,
@@ -1011,6 +1002,8 @@ struct Index {
         onRefresh: () => { void this.refreshCompanionConversation(false); },
         onLoadEarlier: () => { void this.refreshCompanionConversation(true); },
         onComputer: () => { this.companionComputerVisible = true; },
+        onMarkdownLink: (href: string) => { void this.handleMarkdownReaderLink(href); },
+        onRetryTranscriptSave: (entry: VoiceTranscriptEntry) => { void this.retryPhoneTranscriptSave(entry); },
         onVoice: () => this.openVoiceCall('companion_conversation')
       })
     } else {
@@ -1348,49 +1341,28 @@ struct Index {
   @Builder
   HomeHeaderActions(source: string) {
     Row({ space: 8 }) {
-      Button('新建会话')
-        .height(34)
-        .padding({ left: 12, right: 12 })
-        .fontSize(this.scaledFontSize(12))
-        .fontColor(this.themeColor('#FFFFFF'))
-        .backgroundColor(this.themeColor('#14853D'))
-        .borderRadius(17)
-        .enabled(!this.isBusy)
-        .onClick(() => {
-          if (this.homeActionMenuVisible) {
-            this.toggleHomeActionMenu(source);
-          }
-          this.startNewSessionDraft();
-        })
-
       Button() {
-        SymbolGlyph($r('sys.symbol.arrow_clockwise'))
-          .fontSize(18)
-          .fontColor([this.isPullRefreshingSessions ? this.themeColor('#1F6FEB') : this.themeColor('#17202A')])
+        SymbolGlyph($r('sys.symbol.plus'))
+          .fontSize(21).fontColor([this.theme().textPrimary])
       }
-      .width(34)
-      .height(34)
-      .backgroundColor(this.themeColor('#FFFFFF'))
-      .border({ width: 1, color: this.themeColor('#DDE3EA') })
-      .borderRadius(17)
-      .enabled(!this.isPullRefreshingSessions)
+      .width(44).height(44).borderRadius(22)
+      .accessibilityText('新建会话')
+      .backgroundColor(Color.Transparent)
+      .enabled(this.canStartNewSessionDraft())
       .onClick(() => {
-        void this.refreshSessions(`home_actions_${source}`);
+        this.homeActionMenuVisible = false;
+        this.homeActionMenuSource = '';
+        this.startNewSessionDraft();
       })
-
       Button() {
         SymbolGlyph($r('sys.symbol.list_bullet'))
-          .fontSize(18)
-          .fontColor([this.homeActionMenuVisible ? this.themeColor('#1F6FEB') : this.themeColor('#17202A')])
+          .fontSize(20)
+          .fontColor([this.homeActionMenuVisible ? this.theme().accent : this.theme().textPrimary])
       }
-      .width(34)
-      .height(34)
-      .backgroundColor(this.homeActionMenuVisible ? this.themeColor('#EAF2FF') : this.themeColor('#FFFFFF'))
-      .border({ width: 1, color: this.homeActionMenuVisible ? this.themeColor('#BBD2FF') : this.themeColor('#DDE3EA') })
-      .borderRadius(17)
-      .onClick(() => {
-        this.toggleHomeActionMenu(source);
-      })
+      .width(44).height(44).borderRadius(22)
+      .accessibilityText('会话菜单')
+      .backgroundColor(this.homeActionMenuVisible ? this.theme().accentSurface : Color.Transparent)
+      .onClick(() => this.toggleHomeActionMenu(source))
     }
   }
 
@@ -1421,40 +1393,30 @@ struct Index {
 
   @Builder
   HomeActionMenu(source: string) {
-    Column({ space: 6 }) {
-      this.HomeActionMenuItem('go_overview', '前往总览', '桥接连接、设备配对与运行状态', this.themeColor('#1F6FEB'), source)
-      this.HomeActionMenuItem('go_tasks', '前往任务', '任务列表与事件动态', this.themeColor('#0E7490'), source)
-
-      Text('设置')
-        .fontSize(this.scaledFontSize(10))
-        .fontWeight(FontWeight.Medium)
-        .fontColor(this.theme().textSecondary)
-        .width('100%')
-        .padding({ left: 8, top: 4, bottom: 2 })
-
-      this.HomeActionMenuItem('theme', '主题', `当前：${themeModeLabel(this.themeMode)}`, this.theme().accent, source)
-      if (this.themeModeChooserVisible) {
-        this.ThemeModeSelector()
+    Column({ space: 0 }) {
+      if (this.homeMenuCanScrollUp) {
+        Text('向上滑动 ▴').fontSize(this.scaledFontSize(10)).fontColor(this.theme().textSecondary)
+          .height(22).width('100%').hitTestBehavior(HitTestMode.None)
       }
-      this.HomeActionMenuItem(
-        'font_size',
-        '字体大小',
-        `当前：${fontScaleLabel(this.fontScaleMode)} · ${fontScalePercent(this.fontScaleMode)}%`,
-        this.theme().accent,
-        source
-      )
-      if (this.fontScaleChooserVisible) {
-        this.FontScaleSelector()
+      Scroll(this.homeMenuScroller) {
+        Column({ space: 6 }) {
+          this.HomeActionMenuItem('pairing', '配对', '', this.theme().accent, source)
+          this.HomeActionMenuItem('settings', '设置', '', this.theme().accent, source)
+        }.width('100%').padding(8)
       }
-      this.HomeActionMenuItem('desktop_monitor', '桌面监控', '常亮显示任务、未读与额度', '#5FC7FF', source)
-      this.HomeActionMenuItem('voice_call', '熊大语音', '和熊大个人助手实时语音对话', '#5FC7FF', source)
-      this.HomeActionMenuItem('usage', '账号用量', '读取 Codex 桌面当前可见套餐信息', this.themeColor('#1F6FEB'), source)
-      this.HomeActionMenuItem('outbox', '发送队列', '查看、编辑、排序或取消待发送消息', this.themeColor('#7C3AED'), source)
-      this.HomeActionMenuItem('soft_repair', '恢复链路', '检测 bridge、CDP 与无线 HDC', this.themeColor('#B68A00'), source)
-      this.HomeActionMenuItem('hard_restart', '重启 Codex', '需要确认，会重启桌面 Codex', this.themeColor('#B42318'), source)
+      .width('100%')
+      .height(Math.min(this.homeActionMenuMaxHeight(source), 2 * Math.max(44, this.scaledFontSize(14) + 20) + 22))
+      .constraintSize({ maxHeight: this.homeActionMenuMaxHeight(source) })
+      .scrollBar(BarState.Auto)
+      .edgeEffect(EdgeEffect.None)
+      .onDidScroll(() => this.updateHomeMenuScrollHints())
+      .onAreaChange(() => this.updateHomeMenuScrollHints())
+      if (this.homeMenuCanScrollDown) {
+        Text('向下滑动 ▾').fontSize(this.scaledFontSize(10)).fontColor(this.theme().textSecondary)
+          .height(22).width('100%').hitTestBehavior(HitTestMode.None)
+      }
     }
-    .width(248)
-    .padding(8)
+    .width(Math.min(208, Math.max(140, (this.sessionWindowWidthVp() || 360) - 28)))
     .backgroundColor(this.themeColor('#FFFFFF'))
     .border({ width: 1, color: this.themeColor('#DDE3EA') })
     .borderRadius(14)
@@ -1463,73 +1425,15 @@ struct Index {
     .zIndex(60)
   }
 
-  @Builder
-  ThemeModeSelector() {
-    Column({ space: 6 }) {
-      Text('选择外观')
-        .fontSize(this.scaledFontSize(10))
-        .fontWeight(FontWeight.Medium)
-        .fontColor(this.theme().textSecondary)
-        .width('100%')
-      Row({ space: 6 }) {
-        this.ThemeModeButton('dark', '夜晚')
-        this.ThemeModeButton('light', '浅色')
-        this.ThemeModeButton('system', '跟随系统')
-      }
-      .width('100%')
-    }
-    .width('100%')
-    .padding({ left: 8, right: 8, top: 2, bottom: 4 })
+  private homeActionMenuMaxHeight(source: string): number {
+    const height = this.sessionWindowHeightVp() || 568;
+    // Reserve the header, system safe margins, hints and keyboard area.
+    return Math.max(44, height - (source === 'sidebar_header' ? 180 : 162));
   }
 
-  @Builder
-  ThemeModeButton(mode: string, label: string) {
-    Button(label)
-      .layoutWeight(1)
-      .height(30)
-      .fontSize(this.scaledFontSize(10))
-      .fontColor(this.themeMode === mode ? this.theme().textOnAccent : this.theme().textSecondary)
-      .backgroundColor(this.themeMode === mode ? this.theme().accent : this.theme().surfaceMuted)
-      .border({ width: 1, color: this.themeMode === mode ? this.theme().accent : this.theme().border })
-      .borderRadius(8)
-      .onClick(() => {
-        this.changeThemeMode(mode);
-      })
-  }
-
-  @Builder
-  FontScaleSelector() {
-    Column({ space: 6 }) {
-      Text('整体字体大小')
-        .fontSize(this.scaledFontSize(10))
-        .fontWeight(FontWeight.Medium)
-        .fontColor(this.theme().textSecondary)
-        .width('100%')
-      Row({ space: 6 }) {
-        this.FontScaleButton('small', '小')
-        this.FontScaleButton('standard', '标准')
-        this.FontScaleButton('large', '大')
-        this.FontScaleButton('extra_large', '特大')
-      }
-      .width('100%')
-    }
-    .width('100%')
-    .padding({ left: 8, right: 8, top: 2, bottom: 4 })
-  }
-
-  @Builder
-  FontScaleButton(mode: string, label: string) {
-    Button(label)
-      .layoutWeight(1)
-      .height(30)
-      .fontSize(this.scaledFontSize(10))
-      .fontColor(this.fontScaleMode === mode ? this.theme().textOnAccent : this.theme().textSecondary)
-      .backgroundColor(this.fontScaleMode === mode ? this.theme().accent : this.theme().surfaceMuted)
-      .border({ width: 1, color: this.fontScaleMode === mode ? this.theme().accent : this.theme().border })
-      .borderRadius(8)
-      .onClick(() => {
-        this.changeFontScaleMode(mode);
-      })
+  private updateHomeMenuScrollHints(): void {
+    this.homeMenuCanScrollUp = this.homeMenuScroller.currentOffset().yOffset > 1;
+    this.homeMenuCanScrollDown = !this.homeMenuScroller.isAtEnd();
   }
 
   @Builder
@@ -1539,14 +1443,17 @@ struct Index {
         this.HomeActionIcon(action, color)
         Column({ space: 1 }) {
           Text(title)
-            .fontSize(this.scaledFontSize(12))
+            .fontSize(this.scaledFontSize(14))
             .fontWeight(FontWeight.Medium)
             .fontColor(this.themeColor('#17202A'))
-          Text(description)
-            .fontSize(this.scaledFontSize(9))
-            .fontColor(this.themeColor('#68717D'))
-            .maxLines(1)
-            .textOverflow({ overflow: TextOverflow.Ellipsis })
+            .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+          if (description.length > 0) {
+            Text(description)
+              .fontSize(this.scaledFontSize(9))
+              .fontColor(this.themeColor('#68717D'))
+              .maxLines(1)
+              .textOverflow({ overflow: TextOverflow.Ellipsis })
+          }
         }
         .alignItems(HorizontalAlign.Start)
         .layoutWeight(1)
@@ -1554,8 +1461,8 @@ struct Index {
       .alignItems(VerticalAlign.Center)
     }
       .width('100%')
-      .height(42)
-      .padding({ left: 8, right: 8 })
+      .constraintSize({ minHeight: Math.max(44, this.scaledFontSize(14) + 20) })
+      .padding({ left: 8, right: 8, top: 8, bottom: 8 })
       .backgroundColor(this.themeColor('#FFFFFF'))
       .borderRadius(9)
       .enabled(this.canRunHomeAction(action))
@@ -1567,7 +1474,11 @@ struct Index {
   @Builder
   HomeActionIcon(action: string, color: string) {
     Stack({ alignContent: Alignment.Center }) {
-      if (action === 'theme') {
+      if (action === 'pairing') {
+        SymbolGlyph($r('sys.symbol.qrcode')).fontSize(19).fontColor([color])
+      } else if (action === 'settings') {
+        SymbolGlyph($r('sys.symbol.gearshape')).fontSize(19).fontColor([color])
+      } else if (action === 'theme') {
         Text('◐')
           .fontSize(this.scaledFontSize(14))
           .fontWeight(FontWeight.Bold)
@@ -1804,60 +1715,81 @@ struct Index {
               .fontSize(this.scaledFontSize(24))
               .fontWeight(FontWeight.Bold)
               .fontColor(this.themeColor('#17202A'))
-            Text(this.sessionMonitorSummaryText())
-              .fontSize(this.scaledFontSize(12))
-              .fontColor(this.themeColor('#68717D'))
-              .maxLines(1)
-              .textOverflow({ overflow: TextOverflow.Ellipsis })
           }
           .alignItems(HorizontalAlign.Start)
           .layoutWeight(1)
 
+          if (!this.isLandscapeSessionLayout() && (this.selectedSession !== null || this.isNewSessionDraft || this.companionSelected)) {
           Button() {
             SymbolGlyph($r('sys.symbol.chevron_left'))
               .fontSize(20)
               .fontColor([this.themeColor('#17202A')])
           }
-            .width(36)
-            .height(36)
+            .width(44)
+            .height(44)
             .backgroundColor(this.themeColor('#F0F2F5'))
-            .borderRadius(18)
-            .enabled(this.isLandscapeSessionLayout() || this.selectedSession !== null || this.isNewSessionDraft)
+            .borderRadius(22)
+            .accessibilityText('返回会话')
             .onClick(() => {
               this.closeSessionSidebar('header_button');
             })
+
+          }
 
           this.HomeHeaderActions('sidebar_header')
         }
         .width('100%')
 
-        Text(this.sessionRefreshHintText())
-          .fontSize(this.scaledFontSize(11))
-          .fontColor(this.themeColor('#8A95A3'))
-          .width('100%')
-          .maxLines(1)
-          .textOverflow({ overflow: TextOverflow.Ellipsis })
+        TextInput({ text: this.sessionSearchQuery, placeholder: '搜索会话' })
+          .height(40).fontSize(this.scaledFontSize(13))
+          .fontColor(this.theme().textPrimary).placeholderColor(this.theme().textSecondary)
+          .backgroundColor(this.theme().surfaceMuted).borderRadius(10)
+          .padding({ left: 12, right: 12 })
+          .onChange((value: string) => { this.sessionSearchQuery = value; })
 
-        this.CompanionSidebarItem()
+        if (this.sessionSearchQuery.trim().length === 0
+          || (this.companionProfile?.name ?? '个人助手').toLowerCase().includes(this.sessionSearchQuery.trim().toLowerCase())) {
+          this.CompanionSidebarItem()
+        }
 
         Refresh({ refreshing: $$this.isPullRefreshingSessions }) {
           if (this.sessions.length === 0) {
             Column({ space: 8 }) {
               if (this.sessionsLoadError.length > 0) {
-                Text('连接会话失败')
+                Text(this.sessionConnectionFailure().title)
                   .fontSize(this.scaledFontSize(18))
                   .fontWeight(FontWeight.Bold)
                   .fontColor(this.themeColor('#D74848'))
-                Text('检查 Bridge 地址和访问凭证后下拉重试。')
+                Text(this.sessionConnectionFailure().message)
                   .fontSize(this.scaledFontSize(13))
                   .fontColor(this.themeColor('#68717D'))
                   .textAlign(TextAlign.Center)
-                Text(this.sessionsLoadError)
+                Button(this.desktopLiveRestarting ? '正在恢复连接' : this.sessionConnectionFailure().actionLabel)
+                  .fontSize(this.scaledFontSize(13))
+                  .backgroundColor(this.theme().accent)
+                  .fontColor(this.theme().textOnAccent)
+                  .enabled(!this.desktopLiveRestarting && !this.isPullRefreshingSessions)
+                  .onClick(() => this.handleSessionConnectionFailureAction())
+                if (this.sessionConnectionFailure().action !== 'retry') {
+                  Button('刷新重试')
+                    .fontSize(this.scaledFontSize(13))
+                    .backgroundColor(this.theme().surfaceMuted)
+                    .fontColor(this.theme().textPrimary)
+                    .enabled(!this.desktopLiveRestarting && !this.isPullRefreshingSessions)
+                    .onClick(() => { void this.refreshSessions('pull'); })
+                }
+                Text(this.sessionsFailureDetailsExpanded ? '收起错误详情' : '查看错误详情')
                   .fontSize(this.scaledFontSize(11))
-                  .fontColor(this.themeColor('#8A95A3'))
-                  .textAlign(TextAlign.Center)
-                  .maxLines(3)
-                  .textOverflow({ overflow: TextOverflow.Ellipsis })
+                  .fontColor(this.theme().textSecondary)
+                  .onClick(() => { this.sessionsFailureDetailsExpanded = !this.sessionsFailureDetailsExpanded; })
+                if (this.sessionsFailureDetailsExpanded) {
+                  Text(this.sessionsLoadError)
+                    .fontSize(this.scaledFontSize(11))
+                    .fontColor(this.theme().textSecondary)
+                    .textAlign(TextAlign.Center)
+                    .maxLines(6)
+                    .textOverflow({ overflow: TextOverflow.Ellipsis })
+                }
               } else {
                 Text('暂无会话')
                   .fontSize(this.scaledFontSize(18))
@@ -1875,6 +1807,15 @@ struct Index {
           } else {
             Scroll() {
               Column({ space: 0 }) {
+                if (this.sessionSearchQuery.trim().length > 0) {
+                  ForEach(this.searchSessionResults(), (session: CodexSessionSummary) => {
+                    this.SessionSidebarItem(session)
+                  }, (session: CodexSessionSummary) => this.sessionSidebarItemKey(session))
+                  if (this.searchSessionResults().length === 0) {
+                    Text('没有匹配的项目会话').fontSize(this.scaledFontSize(13))
+                      .fontColor(this.theme().textSecondary).padding(24)
+                  }
+                } else {
                 this.PinnedSessionGroup()
                 if (this.sessionProjectLabels().length > 0) {
                   this.SessionSectionLabel('项目')
@@ -1883,12 +1824,14 @@ struct Index {
                   }, (projectLabel: string) => projectLabel)
                 }
                 this.RecentSessionGroup()
+                }
               }
               .width('100%')
             }
             .layoutWeight(1)
             .scrollBar(BarState.Auto)
             .edgeEffect(EdgeEffect.Spring)
+            .align(Alignment.TopStart)
           }
         }
         .layoutWeight(1)
@@ -1900,9 +1843,12 @@ struct Index {
       .width('100%')
       .height('100%')
       .padding({ left: 14, right: 14, top: 18, bottom: 14 })
-      .backgroundColor(this.themeColor('#FFFFFF'))
+      .backgroundColor(this.theme().surfaceSubtle)
 
       if (this.shouldShowHomeActionMenuInSidebar()) {
+        Row().width('100%').height('100%')
+          .backgroundColor(Color.Transparent)
+          .onClick(() => { this.homeActionMenuVisible = false; this.homeActionMenuSource = ''; })
         this.HomeActionMenu('sidebar_header')
       }
     }
@@ -1989,19 +1935,19 @@ struct Index {
           .fontSize(15)
           .fontColor([this.themeColor('#8A95A3')])
         Text(projectLabel)
-          .fontSize(this.scaledFontSize(13))
+          .fontSize(this.scaledFontSize(12))
           .fontWeight(FontWeight.Medium)
           .fontColor(this.themeColor('#68717D'))
           .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
-        Blank()
+          .layoutWeight(1)
         Text(this.projectGroupMetaText(projectLabel))
           .fontSize(this.scaledFontSize(11))
           .fontColor(this.themeColor('#A0A6AD'))
       }
       .width('100%')
-      .height(34)
-      .padding({ left: 4, right: 6 })
+      .constraintSize({ minHeight: 36 })
+      .padding({ left: 4, right: 6, top: 6, bottom: 6 })
       .onClick(() => {
         this.toggleSessionProject(projectLabel);
       })
@@ -2019,28 +1965,30 @@ struct Index {
   @Builder
   CompanionSidebarItem() {
     Row({ space: 10 }) {
-      if (this.companionProfile?.avatarUrl) {
+      if (this.companionProfile?.avatarUrl && !this.companionAvatarFailed) {
         Image(this.companionProfile.avatarUrl)
           .width(38).height(38).borderRadius(19).objectFit(ImageFit.Contain)
+          .onError(() => { this.companionAvatarFailed = true; })
       } else {
-        Text('熊').width(38).height(38).borderRadius(19)
+        Text((this.companionProfile?.name ?? '助手').substring(0, 1)).width(38).height(38).borderRadius(19)
           .textAlign(TextAlign.Center)
           .fontColor(this.theme().textPrimary)
           .backgroundColor(this.theme().accentSurface)
       }
       Column({ space: 2 }) {
-        Text(this.companionProfile?.name ?? '熊大')
-          .fontSize(this.scaledFontSize(16)).fontWeight(FontWeight.Medium)
+        Text(this.companionProfile?.name ?? '个人助手')
+          .fontSize(this.scaledFontSize(15)).fontWeight(FontWeight.Medium)
           .fontColor(this.theme().textPrimary)
-        Text('个人助手 · 语音对话')
+          .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis })
+        Text('个人助手')
           .fontSize(this.scaledFontSize(11)).fontColor(this.theme().textSecondary)
       }.alignItems(HorizontalAlign.Start).layoutWeight(1)
       SymbolGlyph($r('sys.symbol.chevron_right'))
         .fontSize(14).fontColor([this.theme().textTertiary])
     }
-    .width('100%').height(58).padding({ left: 8, right: 8 })
-    .backgroundColor(this.companionSelected ? this.theme().accentSurface : this.theme().surface)
-    .borderRadius(8)
+    .width('100%').constraintSize({ minHeight: 62 }).padding({ left: 8, right: 8, top: 8, bottom: 8 })
+    .backgroundColor(this.companionSelected ? this.theme().accentSurface : this.theme().surfaceSubtle)
+    .borderRadius(12)
     .onClick(() => { void this.openCompanionConversation(); })
   }
 
@@ -2070,14 +2018,14 @@ struct Index {
           })
       }
       .width('100%')
-      .height(40)
+      .height(Math.max(58, this.scaledLineHeight(36)))
       .justifyContent(FlexAlign.End)
 
       Row({ space: 8 }) {
         this.SessionActivityBadge(session)
         Column({ space: 0 }) {
           Text(session.title)
-            .fontSize(this.scaledFontSize(16))
+            .fontSize(this.scaledFontSize(15))
             .fontWeight(FontWeight.Medium)
             .fontColor(this.themeColor('#17202A'))
             .maxLines(1)
@@ -2094,7 +2042,7 @@ struct Index {
               .color(this.themeColor('#D92D20'))
           }
           Text(this.sessionTimeLabel(session))
-            .fontSize(this.scaledFontSize(13))
+            .fontSize(this.scaledFontSize(11))
             .fontColor(this.isSessionRunning(session.id) ? this.themeColor('#68717D') : this.themeColor('#8A95A3'))
             .maxLines(1)
             .textAlign(TextAlign.End)
@@ -2104,9 +2052,9 @@ struct Index {
         .alignItems(VerticalAlign.Center)
       }
       .width('100%')
-      .height(40)
+      .height(Math.max(58, this.scaledLineHeight(36)))
       .padding({ left: 8, right: 8, top: 6, bottom: 6 })
-      .backgroundColor(this.selectedSession?.id === session.id ? this.themeColor('#F0ECE9') : this.themeColor('#FFFFFF'))
+      .backgroundColor(this.selectedSession?.id === session.id ? this.theme().accentSurface : this.theme().surfaceSubtle)
       .borderRadius(8)
       .alignItems(VerticalAlign.Center)
       .translate({ x: this.sessionSwipeOffset(session.id), y: 0 })
@@ -2129,7 +2077,7 @@ struct Index {
       )
     }
     .width('100%')
-    .height(40)
+    .height(Math.max(58, this.scaledLineHeight(36)))
     .margin({ bottom: 2 })
     .clip(true)
   }
@@ -2171,7 +2119,7 @@ struct Index {
           .onSelect((index: number) => {
             this.selectedProjectId = this.projects[index].id;
           })
-        if (this.visibleNewSessionEntries().length > 0 || this.visibleFailedSessionMessages().length > 0) {
+        if (this.hasNewSessionConversation()) {
           Column({ space: 6 }) {
             Text('新建会话')
               .fontSize(this.scaledFontSize(14))
@@ -2233,6 +2181,7 @@ struct Index {
           this.SessionFloatingStatusPanel()
         }
 
+        this.SessionPendingInteractions()
         this.SessionComposer()
       } else if (this.selectedSession === null) {
         Column({ space: 10 }) {
@@ -2308,12 +2257,63 @@ struct Index {
           this.SessionFloatingStatusPanel()
         }
 
+        this.SessionPendingInteractions()
         this.SessionComposer()
       }
     }
     .layoutWeight(1)
     .width('100%')
     .height('100%')
+  }
+
+  @Builder
+  SessionPendingInteractions() {
+    if (this.visibleDesktopInteractions().length > 0 || this.pendingUserInput() !== null
+      || this.pendingApprovalId().length > 0 || this.desktopInteractionError.length > 0
+      || this.interactionSubmitError.length > 0) {
+      Scroll() {
+        Column({ space: 8 }) {
+          if (this.desktopInteractionError.length > 0 || this.interactionSubmitError.length > 0) {
+            Text(this.interactionSubmitError || this.desktopInteractionError)
+              .fontSize(this.scaledFontSize(13)).fontColor(this.theme().danger).width('100%')
+            Button('刷新待处理请求').height(44).onClick(() => { void this.refreshDesktopInteractions(); })
+          }
+          ForEach(this.visibleDesktopInteractions(), (request: BridgeDesktopInteraction) => {
+            SessionInteractionPanel({
+              request, darkMode: this.usesDarkTheme(), fontScaleMode: this.fontScaleMode,
+              answers: this.userInputAnswers,
+              busy: this.isInteractionBusy('desktop', request.threadId, request.id),
+              onAnswer: (interaction: BridgeDesktopInteraction, questionId: string, value: string) => {
+                this.setDesktopInteractionAnswer(interaction, questionId, value);
+              },
+              onRespond: (interaction: BridgeDesktopInteraction, decision: string) => {
+                void this.respondDesktopInteraction(interaction, decision);
+              }
+            })
+          }, (request: BridgeDesktopInteraction) => JSON.stringify([request.threadId, request.id]))
+          if (this.pendingApprovalId().length > 0) {
+            Column({ space: 8 }) {
+              Text('任务需要你确认').fontSize(this.scaledFontSize(14)).fontWeight(FontWeight.Bold)
+                .fontColor(this.theme().textPrimary).width('100%')
+              Text(this.pendingApprovalSummary()).fontSize(this.scaledFontSize(13))
+                .fontColor(this.theme().textSecondary).width('100%').copyOption(CopyOptions.LocalDevice)
+              Row({ space: 8 }) {
+                Button('同意').layoutWeight(1).height(44)
+                  .enabled(!this.isInteractionBusy('approval', '', this.pendingApprovalId()))
+                  .onClick(() => { void this.decideApproval(this.pendingApprovalId(), 'approved'); })
+                Button('拒绝').layoutWeight(1).height(44)
+                  .enabled(!this.isInteractionBusy('approval', '', this.pendingApprovalId()))
+                  .onClick(() => { void this.decideApproval(this.pendingApprovalId(), 'denied'); })
+              }.width('100%')
+            }.width('100%').padding(10).backgroundColor(this.theme().warningSurface).borderRadius(8)
+          }
+          if (this.pendingUserInput() !== null) {
+            this.UserInputForm()
+          }
+        }.width('100%')
+      }.width('100%').constraintSize({ maxHeight: this.isLandscapeSessionLayout() ? 190 : 300 })
+        .scrollBar(BarState.Auto).edgeEffect(EdgeEffect.Spring)
+    }
   }
 
   @Builder
@@ -2349,26 +2349,6 @@ struct Index {
       Blank()
 
       Column({ space: 5 }) {
-        Row({ space: 6 }) {
-          Text(this.sessionEntryTimeText({
-            timestamp: message.createdAt,
-            type: 'optimistic_user_message',
-            role: 'user',
-            text: message.text
-          }))
-            .fontSize(this.scaledFontSize(9))
-            .fontColor(this.themeColor('#8A95A3'))
-          Text('你')
-            .fontSize(this.scaledFontSize(10))
-            .fontColor(this.themeColor('#4E6278'))
-          LoadingProgress()
-            .width(11)
-            .height(11)
-            .color(this.themeColor('#1F6FEB'))
-        }
-        .width('100%')
-        .justifyContent(FlexAlign.End)
-
         if (message.images.length > 0) {
           ForEach(message.images, (image: PendingSessionImage) => {
             Row() {
@@ -2393,14 +2373,31 @@ struct Index {
             .fontColor(this.themeColor('#17202A'))
             .width('100%')
             .padding({ left: 12, right: 12, top: 9, bottom: 10 })
-            .backgroundColor(this.themeColor('#EAF4FF'))
-            .border({ width: 1, color: this.themeColor('#CFE3FF') })
-            .borderRadius(10)
+            .backgroundColor(this.theme().surfaceMuted)
+
+            .borderRadius(14)
             .copyOption(CopyOptions.LocalDevice)
         }
+        ForEach(message.files, (file: OptimisticSessionFile) => {
+          Text(file.fileName)
+            .fontSize(this.scaledFontSize(12))
+            .fontColor(this.theme().textPrimary)
+            .width('100%')
+            .padding(10)
+            .backgroundColor(this.theme().surfaceMuted)
+            .borderRadius(10)
+        }, (file: OptimisticSessionFile) => `${message.id}-${file.id}`)
+        Row({ space: 5 }) {
+          LoadingProgress().width(10).height(10).color(this.theme().textTertiary)
+          Text('发送中…')
+            .fontSize(this.scaledFontSize(10))
+            .fontColor(this.theme().textTertiary)
+        }
+        .width('100%')
+        .justifyContent(FlexAlign.End)
       }
-      .width(this.userTextBubbleWidth(message.text))
-      .constraintSize({ maxWidth: '82%' })
+      .width(message.files.length > 0 || message.images.length > 0 ? '78%' : this.userTextBubbleWidth(message.text))
+      .constraintSize({ maxWidth: '88%' })
     }
     .width('100%')
     .padding({ top: 3, bottom: 3 })
@@ -2438,10 +2435,6 @@ struct Index {
             Text(this.failedSessionMessageTimeText(message))
               .fontSize(this.scaledFontSize(9))
               .fontColor(this.themeColor('#B42318'))
-            Text(this.failedSessionMessageStatusText(message))
-              .fontSize(this.scaledFontSize(10))
-              .fontColor(this.themeColor('#B42318'))
-              .fontWeight(FontWeight.Regular)
           }
           .width('100%')
           .justifyContent(FlexAlign.End)
@@ -2475,6 +2468,17 @@ struct Index {
               .copyOption(CopyOptions.LocalDevice)
           }
 
+          ForEach(message.files, (file: PickedMobileFile) => {
+            Text(file.fileName)
+              .fontSize(this.scaledFontSize(12))
+              .fontColor(this.theme().textPrimary)
+              .width('100%')
+          }, (file: PickedMobileFile) => `${message.id}-${file.id}`)
+          Text(this.failedSessionMessageStatusText(message))
+            .fontSize(this.scaledFontSize(10))
+            .fontColor(this.theme().danger)
+            .width('100%')
+            .textAlign(TextAlign.End)
           Text(this.compactDisplayText(message.error, 90))
             .fontSize(this.scaledFontSize(9))
             .fontColor(this.themeColor('#B42318'))
@@ -2658,18 +2662,24 @@ struct Index {
             }
             .width('100%')
             .padding({ left: 12, right: 12, top: 9, bottom: 10 })
-            .backgroundColor(this.themeColor('#EAF4FF'))
-            .border({ width: 1, color: this.themeColor('#CFE3FF') })
-            .borderRadius(10)
+            .backgroundColor(this.theme().surfaceMuted)
+            .borderRadius(14)
             Row() {
               Blank()
               this.SessionContentActionRow(entry, '')
             }
             .width('100%')
           }
+          if (entry.type === 'live_user_message') {
+            Text(this.liveUserMessageStatus())
+              .fontSize(this.scaledFontSize(10))
+              .fontColor(this.theme().textTertiary)
+              .width('100%')
+              .textAlign(TextAlign.End)
+          }
         }
         .width(this.userSessionEntryWidth(entry))
-        .constraintSize({ maxWidth: '82%' })
+        .constraintSize({ maxWidth: '88%' })
       }
       .width('100%')
     } else {
@@ -2743,19 +2753,21 @@ struct Index {
           .width('100%')
         }
       }
-      .width('88%')
-      .padding({ left: 12, right: 0, top: 2, bottom: 4 })
+      .width('100%')
+      .padding({ left: 0, right: 0, top: 8, bottom: 12 })
     }
   }
 
   @Builder
   SessionContentActionRow(entry: CodexSessionEntry, imageUrl: string) {
     Row({ space: 4 }) {
-      Button(imageUrl.length > 0 ? '复制图片' : '复制')
+      Button() {
+        Image($r('app.media.action_copy')).width(16).height(16).fillColor(this.theme().textSecondary)
+      }
+        .accessibilityText(imageUrl.length > 0 ? '复制图片' : '复制')
         .type(ButtonType.Normal)
-        .height(24)
+        .width(40).height(40)
         .padding({ left: 8, right: 8 })
-        .fontSize(this.scaledFontSize(9))
         .fontColor(this.themeColor('#8A95A3'))
         .backgroundColor(Color.Transparent)
         .borderRadius(6)
@@ -2766,11 +2778,13 @@ struct Index {
             void this.copySessionText(entry);
           }
         })
-      Button(imageUrl.length > 0 ? '分享图片' : '分享')
+      Button() {
+        Image($r('app.media.action_share')).width(16).height(16).fillColor(this.theme().textSecondary)
+      }
+        .accessibilityText(imageUrl.length > 0 ? '分享图片' : '分享')
         .type(ButtonType.Normal)
-        .height(24)
+        .width(40).height(40)
         .padding({ left: 8, right: 8 })
-        .fontSize(this.scaledFontSize(9))
         .fontColor(this.theme().accent)
         .backgroundColor(Color.Transparent)
         .borderRadius(6)
@@ -3113,7 +3127,7 @@ struct Index {
 
   @Builder
   SessionMarkdownContent(entry: CodexSessionEntry, isUser: boolean) {
-    Column({ space: 4 }) {
+    Column({ space: 10 }) {
       ForEach(this.sessionEntryMarkdownBlocks(entry), (block: SessionMarkdownBlock) => {
         this.SessionMarkdownBlockView(entry, block, isUser)
       }, (block: SessionMarkdownBlock) => block.id)
@@ -3156,10 +3170,10 @@ struct Index {
         .alignItems(VerticalAlign.Center)
 
         Text(block.text)
-          .fontSize(this.scaledFontSize(10))
+          .fontSize(this.scaledFontSize(13))
           .fontColor(this.themeColor('#101828'))
           .fontFamily('monospace')
-          .lineHeight(this.scaledLineHeight(14))
+          .lineHeight(this.scaledLineHeight(21))
           .width('100%')
           .copyOption(CopyOptions.LocalDevice)
       }
@@ -3176,7 +3190,7 @@ struct Index {
           .backgroundColor(this.themeColor('#98A2B3'))
           .borderRadius(2)
         Column() {
-          this.SessionMarkdownInlineText(block.text, isUser, isUser ? 11 : 10, isUser ? 16 : 15, false)
+          this.SessionMarkdownInlineText(block.text, isUser, 14, 23, false)
         }
         .layoutWeight(1)
       }
@@ -3190,7 +3204,7 @@ struct Index {
           .width(16)
           .textAlign(TextAlign.Center)
         Column() {
-          this.SessionMarkdownInlineText(block.text, isUser, isUser ? 12 : 11, isUser ? 17 : 16, false)
+          this.SessionMarkdownInlineText(block.text, isUser, 15, 25, false)
         }
         .layoutWeight(1)
       }
@@ -3204,7 +3218,7 @@ struct Index {
           .width(16)
           .textAlign(TextAlign.Center)
         Column() {
-          this.SessionMarkdownInlineText(block.text, isUser, isUser ? 12 : 11, isUser ? 17 : 16, false)
+          this.SessionMarkdownInlineText(block.text, isUser, 15, 25, false)
         }
         .layoutWeight(1)
       }
@@ -3273,7 +3287,7 @@ struct Index {
         .backgroundColor(isUser ? this.themeColor('#CFE3FF') : this.themeColor('#E4E7EC'))
         .margin({ top: 3, bottom: 3 })
     } else {
-      this.SessionMarkdownInlineText(block.text, isUser, isUser ? 12 : 11, isUser ? 17 : 16, false)
+      this.SessionMarkdownInlineText(block.text, isUser, 15, 25, false)
     }
   }
 
@@ -3651,25 +3665,6 @@ struct Index {
           .textOverflow({ overflow: TextOverflow.Ellipsis })
           .layoutWeight(1)
 
-        if (this.pendingApprovalId().length > 0) {
-          Button('同意')
-            .height(24)
-            .fontSize(this.scaledFontSize(10))
-            .backgroundColor(this.themeColor('#137333'))
-            .onClick(() => {
-              this.log('info', 'ui.click.floating_approval', `approvalId=${this.pendingApprovalId()}; decision=approved`);
-              void this.decideApproval(this.pendingApprovalId(), 'approved');
-            })
-          Button('拒绝')
-            .height(24)
-            .fontSize(this.scaledFontSize(10))
-            .backgroundColor(this.themeColor('#B42318'))
-            .onClick(() => {
-              this.log('info', 'ui.click.floating_approval', `approvalId=${this.pendingApprovalId()}; decision=denied`);
-              void this.decideApproval(this.pendingApprovalId(), 'denied');
-            })
-        }
-
         Button() {
           SymbolGlyph(this.sessionStatusExpanded ? $r('sys.symbol.chevron_up') : $r('sys.symbol.chevron_down'))
             .fontSize(14)
@@ -3826,16 +3821,16 @@ struct Index {
       this.PendingSessionFileStrip()
 
       Column({ space: 4 }) {
-        Row({ space: 6 }) {
-          TextArea({ text: this.sessionMessage, placeholder: '', controller: this.sessionTextAreaController })
+        Column({ space: 6 }) {
+          TextArea({ text: this.sessionMessage, placeholder: '发送消息…', controller: this.sessionTextAreaController })
             .height(this.sessionComposerTextAreaHeight())
-            .fontSize(this.scaledFontSize(12))
+            .fontSize(this.scaledFontSize(15))
             .fontColor(this.themeColor('#17202A'))
-            .backgroundColor(this.themeColor('#FFFFFF'))
+            .backgroundColor(Color.Transparent)
             .border({ width: this.hasActiveComposerToken() ? 1 : 0, color: this.hasActiveComposerToken() ? this.themeColor('#1F6FEB') : this.themeColor('#FFFFFF') })
             .borderRadius(8)
             .padding({ left: 10, right: 10, top: 6, bottom: 6 })
-            .layoutWeight(1)
+            .width('100%')
             .onFocus(() => {
               this.sessionComposerFocused = true;
               this.scrollSessionToBottom();
@@ -3849,26 +3844,27 @@ struct Index {
               this.slashCommandPanelVisible = this.shouldOpenSlashCommandPanel(value);
             })
 
-          Stack({ alignContent: Alignment.Bottom }) {
+          Stack({ alignContent: Alignment.BottomStart }) {
             if (this.composerActionMenuExpanded) {
               Row() {
                 this.ComposerActionPopup()
               }
                 .translate({ x: 0, y: -234 })
+                .alignItems(VerticalAlign.Top)
                 .zIndex(1)
             }
 
-            Column({ space: 5 }) {
+            Row({ space: 8 }) {
               Button() {
                 SymbolGlyph($r('sys.symbol.plus'))
                   .fontSize(16)
                   .fontColor([this.composerActionMenuExpanded ? this.themeColor('#1F6FEB') : this.themeColor('#17202A')])
               }
-                .width(32)
-                .height(32)
+                .width(40)
+                .height(40)
                 .backgroundColor(this.composerActionMenuExpanded ? this.themeColor('#EAF2FF') : this.themeColor('#FFFFFF'))
                 .border({ width: 1, color: this.composerActionMenuExpanded ? this.themeColor('#BBD2FF') : this.themeColor('#DDE3EA') })
-                .borderRadius(16)
+                .borderRadius(10)
                 .enabled(this.canOpenComposerActionMenu())
                 .onClick(() => {
                   if (this.shouldIgnoreComposerActionToggle()) {
@@ -3881,13 +3877,14 @@ struct Index {
                   this.log('info', 'ui.composer_action_menu.toggle', `expanded=${this.composerActionMenuExpanded}; sessionId=${this.selectedSession?.id ?? ''}; isNewSession=${this.isNewSessionDraft}`);
                 })
 
+              Blank()
               Button() {
                 this.SessionPrimaryActionSymbol()
               }
-                .width(32)
-                .height(32)
+                .width(40)
+                .height(40)
                 .backgroundColor(this.sessionPrimaryActionColor())
-                .borderRadius(16)
+                .borderRadius(10)
                 .enabled(this.canUseSessionPrimaryAction())
                 .onClick(() => {
                   if (this.shouldUseSessionInterruptAction()) {
@@ -3901,21 +3898,23 @@ struct Index {
                   }
                 })
             }
-            .alignItems(HorizontalAlign.Center)
+            .width('100%')
+            .alignItems(VerticalAlign.Center)
             .zIndex(2)
           }
-          .width(34)
-          .height(this.sessionComposerTextAreaHeight())
+          .width('100%')
+          .height(40)
         }
         .width('100%')
-        .alignItems(VerticalAlign.Bottom)
+        .alignItems(HorizontalAlign.Start)
       }
       .width('100%')
     }
     .width('100%')
-    .padding({ left: 6, right: 6, top: 4, bottom: 1 })
+    .padding({ left: 10, right: 10, top: 8, bottom: 8 })
     .backgroundColor(this.themeColor('#F7F8FA'))
-    .borderRadius(8)
+    .border({ width: 1, color: this.theme().border })
+    .borderRadius(14)
     .margin({ bottom: this.sessionComposerBottomMargin() })
     .translate({ y: this.sessionComposerBottomShift() })
   }
@@ -4319,7 +4318,7 @@ struct Index {
             }, (option: BridgeUserInputOption) => `${question.id}:${option.label}`)
           }
 
-          if (question.options === null || question.isOther) {
+          if ((question.options ?? []).length === 0 || question.isOther) {
             TextInput({
               text: this.userInputAnswer(question.id),
               placeholder: question.isSecret ? '请输入保密答案' : '请输入答案'
@@ -4870,6 +4869,7 @@ struct Index {
       submissionId,
       outgoing,
       draftImages,
+      draftFiles,
       retryFailedMessageId
     );
     try {
@@ -4909,7 +4909,7 @@ struct Index {
         const composed = await this.composeOutgoingSessionMessage(outgoing, draftImages, draftFiles);
         const messageText = composed.text;
         this.clearLocalRunningOverride(targetSessionId);
-        this.currentTask = await BridgeClient.sendCodexThreadMessage(
+        const receivedTask = await BridgeClient.sendCodexThreadMessage(
           this.normalizedBridgeUrl(),
           targetSessionId,
           messageText,
@@ -4920,6 +4920,14 @@ struct Index {
           this.sessionModel,
           submissionId
         );
+        if (this.isSubmittedOutboxReceipt(receivedTask) && (this.readSessionNavigation().revision !== navigation.revision
+          || this.selectedSession?.id !== targetSessionId)) {
+          this.completeOptimisticSessionSend(submissionId);
+          sent = true;
+          this.log('info', 'session.receipt.send.stale_ignored', `taskId=${receivedTask.id}`);
+          return;
+        }
+        this.currentTask = receivedTask;
         this.completeOptimisticSessionSend(submissionId);
         this.applyTaskExecutionContract(this.currentTask, targetSessionId, 'send_session_created');
         sent = true;
@@ -4937,7 +4945,7 @@ struct Index {
           retryFailedMessageId
         });
         this.rememberTaskForSession(targetSessionId, this.currentTask.id, this.currentTask.status);
-        this.markSessionRunning(targetSessionId);
+        if (!this.isSubmittedOutboxReceipt(this.currentTask)) this.markSessionRunning(targetSessionId);
         this.message = this.currentTask.runtime?.kind === 'durable_outbox'
           ? '消息已排队，将在当前回合结束后按顺序自动发送'
           : guidanceSend
@@ -4952,7 +4960,11 @@ struct Index {
         this.showTaskEventDetails = false;
         this.log('info', 'session.message.sent', `taskId=${this.currentTask.id}; sessionId=${targetSessionId}; project=${targetProjectLabel}; title=${targetSessionTitle}; status=${this.currentTask.status}; mode=${guidanceSend ? 'guidance_send' : 'send'}; model=${this.sessionModel || 'auto'}; effort=${this.sessionReasoningEffort || 'auto'}; uploadedImages=${composed.uploadedImages.length}; failedImages=${composed.failedImages.length}`);
         this.scrollSessionToBottom();
-        this.startPolling();
+        if (this.isSubmittedOutboxReceipt(this.currentTask)) {
+          await this.settleSubmittedOutboxReceipt(this.currentTask);
+        } else {
+          this.startPolling();
+        }
       });
       if (sent) {
         if (retryFailedMessageId.length > 0) {
@@ -4994,6 +5006,7 @@ struct Index {
     const draftImages = this.pendingSessionImages.slice();
     const draftFiles = this.pendingSessionFiles.slice();
     const submissionId = this.submissionIdForRetry(retryFailedMessageId);
+    const navigationRevision = this.readSessionNavigation().revision;
     let sent = false;
     this.isSendingSessionMessage = true;
     this.sendingSessionTargetId = '__new_session__';
@@ -5004,6 +5017,7 @@ struct Index {
       submissionId,
       outgoing,
       draftImages,
+      draftFiles,
       retryFailedMessageId
     );
     try {
@@ -5011,7 +5025,7 @@ struct Index {
         this.message = '正在创建 Codex 官方会话';
         const composed = await this.composeOutgoingSessionMessage(outgoing, draftImages, draftFiles);
         const messageText = composed.text;
-        this.currentTask = await BridgeClient.startCodexThread(
+        const receivedTask = await BridgeClient.startCodexThread(
           this.normalizedBridgeUrl(),
           this.selectedProjectId,
           messageText,
@@ -5020,6 +5034,14 @@ struct Index {
           this.sessionModel,
           submissionId
         );
+        if (this.isSubmittedOutboxReceipt(receivedTask) && (this.readSessionNavigation().revision !== navigationRevision
+          || !this.isNewSessionDraft)) {
+          this.completeOptimisticSessionSend(submissionId);
+          sent = true;
+          this.log('info', 'session.receipt.new.stale_ignored', `taskId=${receivedTask.id}`);
+          return;
+        }
+        this.currentTask = receivedTask;
         this.completeOptimisticSessionSend(submissionId);
         sent = true;
         this.lastDesktopSyncWarningTaskId = '';
@@ -5047,7 +5069,11 @@ struct Index {
         this.showTaskEventDetails = false;
         this.log('info', 'session.new.sent', `taskId=${this.currentTask.id}; status=${this.currentTask.status}; model=${this.sessionModel || 'auto'}; effort=${this.sessionReasoningEffort || 'auto'}; uploadedImages=${composed.uploadedImages.length}; failedImages=${composed.failedImages.length}`);
         this.scrollSessionToBottom();
-        this.startPolling();
+        if (this.isSubmittedOutboxReceipt(this.currentTask)) {
+          await this.settleSubmittedOutboxReceipt(this.currentTask);
+        } else {
+          this.startPolling();
+        }
       });
       if (sent) {
         if (retryFailedMessageId.length > 0) {
@@ -5114,6 +5140,11 @@ struct Index {
       return;
     }
     this.handoffPendingSessionSend(activeTaskId, task);
+    if (this.isSubmittedOutboxReceipt(task)) {
+      this.currentTask = task;
+      await this.settleSubmittedOutboxReceipt(task);
+      return;
+    }
     task = this.mergeTaskEventPage(activeTask, task);
     if (task.eventGap === true) {
       this.log('warn', 'task.event_cursor.gap', `taskId=${activeTaskId}; sessionId=${activeSessionId}; afterSeq=${afterSeq}; nextSeq=${task.eventCursor ?? 0}`);
@@ -5200,13 +5231,33 @@ struct Index {
   }
 
   private async decideApproval(approvalId: string, decision: string): Promise<void> {
-    await this.guard('decideApproval', async () => {
+    if (approvalId.length === 0 || this.isInteractionBusy('approval', '', approvalId)) {
+      return;
+    }
+    const navigation = this.readSessionNavigation();
+    const task = this.approvalContextTask();
+    this.setInteractionBusy('approval', '', approvalId, true);
+    this.interactionSubmitError = '';
+    try {
       await BridgeClient.decideApproval(this.normalizedBridgeUrl(), approvalId, decision, this.bridgeToken);
+      if (this.readSessionNavigation().revision !== navigation.revision) {
+        return;
+      }
       this.message = `确认结果：${this.decisionLabel(decision)}`;
       this.log('info', 'approval.decided.client', `approvalId=${approvalId}; decision=${decision}`);
-      await this.refreshTask();
-      this.startPolling();
-    });
+      await this.refreshInteractionTask(task, navigation.revision);
+    } catch (error) {
+      if (this.readSessionNavigation().revision === navigation.revision) {
+        this.interactionSubmitError = `确认提交失败：${this.errorText(error)}`;
+        try {
+          await this.refreshInteractionTask(task, navigation.revision);
+        } catch (refreshError) {
+          this.log('warn', 'approval.refresh.failed', this.errorText(refreshError));
+        }
+      }
+    } finally {
+      this.setInteractionBusy('approval', '', approvalId, false);
+    }
   }
 
   private async interruptCurrentTask(): Promise<void> {
@@ -5719,6 +5770,7 @@ struct Index {
     submissionId: string,
     text: string,
     images: PendingSessionImage[],
+    files: PickedMobileFile[],
     retryFailedMessageId: string
   ): string {
     if (retryFailedMessageId.length > 0) {
@@ -5732,6 +5784,7 @@ struct Index {
       submissionId,
       text,
       images: images.slice(),
+      files: files.map((file: PickedMobileFile): OptimisticSessionFile => ({ id: file.id, fileName: file.fileName })),
       createdAt: new Date().toISOString()
     };
     this.optimisticSessionMessages = appendOptimisticSessionMessage(this.optimisticSessionMessages, optimistic);
@@ -5844,6 +5897,90 @@ struct Index {
     });
     this.pendingSessionSendsByTaskId = next;
     this.log('info', 'session.message.pending.cleared', `taskId=${taskId}`);
+  }
+
+  private isSubmittedOutboxReceipt(task: BridgeTask): boolean {
+    return task.status === 'submitted' && task.runtime?.kind === 'durable_outbox' && task.runtime?.state === 'submitted';
+  }
+
+  private clearSubmittedOutboxReceiptIfVisible(task: BridgeTask): void {
+    if (this.currentTask?.id !== task.id || !this.submittedReceiptHasVisibleUserEntry(task)) return;
+    this.currentTask = null;
+    if (this.activeSessionTaskId === task.id) {
+      this.activeSessionTaskId = '';
+      this.activeSessionTaskTitle = '';
+    }
+    if (this.newSessionTaskId === task.id) this.newSessionTaskId = '';
+  }
+
+  private submittedReceiptHasVisibleUserEntry(task: BridgeTask): boolean {
+    const session = this.selectedSession;
+    const expected = this.normalizedFailedMessageText(task.prompt);
+    const expectedImages = this.sessionEntryImagePaths(task.prompt);
+    const createdAt = Date.parse(task.createdAt);
+    if (session === null || session.id !== this.taskSessionId(task)
+      || expected.length === 0 && expectedImages.length === 0 || !Number.isFinite(createdAt)) return false;
+    return session.entries.some((entry: CodexSessionEntry) => {
+      if (entry.role !== 'user' || !(Date.parse(entry.timestamp) >= createdAt)
+        || this.normalizedFailedMessageText(entry.text) !== expected) return false;
+      const entryImages = this.sessionEntryImagePaths(entry.text);
+      return expectedImages.every((imagePath: string) => entryImages.indexOf(imagePath) >= 0);
+    });
+  }
+
+  private async settleSubmittedOutboxReceipt(task: BridgeTask): Promise<void> {
+    if (!this.isSubmittedOutboxReceipt(task)) return;
+    const pending = this.pendingSessionSendsByTaskId[task.id];
+    this.clearPendingSessionSend(task.id);
+    if (pending && pending.retryFailedMessageId.length > 0) this.removeFailedSessionMessage(pending.retryFailedMessageId);
+    if (this.currentTask?.id !== task.id) return;
+    this.stopPolling();
+    const sessionId = this.taskSessionId(task);
+    const navigation = this.readSessionNavigation();
+    const newDraft = this.isNewSessionDraft && navigation.mode === 'new';
+    if (sessionId.length === 0 || (!newDraft && (navigation.mode !== 'session'
+      || navigation.sessionId !== sessionId || this.selectedSession?.id !== sessionId))) return;
+    this.message = '消息已进入 Codex 官方会话，正在同步会话';
+    try {
+      const detail = await BridgeClient.getSessionHistoryPage(this.normalizedBridgeUrl(), sessionId, this.bridgeToken, 160);
+      if (this.currentTask?.id !== task.id
+        || this.readSessionNavigation().revision !== navigation.revision
+        || (!newDraft && this.selectedSession?.id !== sessionId) || (newDraft && !this.isNewSessionDraft)) return;
+      if (detail.id !== sessionId) {
+        this.scheduleSubmittedReceiptHistoryRetry(task, navigation.revision);
+        return;
+      }
+      if (newDraft) {
+        this.selectedSession = detail;
+        this.activeSessionId = sessionId;
+        this.commitSessionNavigation('session', sessionId, 'delivery_receipt');
+        this.isNewSessionDraft = false;
+      } else if (this.selectedSession !== null) {
+        this.selectedSession = this.mergeSessionDetailPreservingHistory(this.selectedSession, detail);
+      }
+      this.applySessionActivitySnapshot(detail, 'delivery_receipt');
+      this.clearSubmittedOutboxReceiptIfVisible(task);
+      if (this.currentTask?.id === task.id) this.scheduleSubmittedReceiptHistoryRetry(task, this.readSessionNavigation().revision);
+      this.message = '消息已进入 Codex 官方会话';
+      this.scrollSessionToBottomIfFollowing('delivery_receipt');
+    } catch (error) {
+      // Delivery is confirmed. Re-read only history while preserving the user
+      // bubble; a new draft has no selected session for dashboard recovery yet.
+      this.log('warn', 'session.receipt.history.failed', `taskId=${task.id}; message=${this.errorText(error)}`);
+      this.scheduleSubmittedReceiptHistoryRetry(task, navigation.revision);
+    }
+  }
+
+  private scheduleSubmittedReceiptHistoryRetry(task: BridgeTask, navigationRevision: number): void {
+    if (this.currentTask?.id !== task.id || !this.isSubmittedOutboxReceipt(this.currentTask)
+      || this.readSessionNavigation().revision !== navigationRevision) return;
+    if (this.pollTimer >= 0) clearInterval(this.pollTimer);
+    this.pollTimer = setTimeout(async () => {
+      if (this.currentTask?.id !== task.id || !this.isSubmittedOutboxReceipt(this.currentTask)
+        || this.readSessionNavigation().revision !== navigationRevision) return;
+      this.pollTimer = -1;
+      await this.settleSubmittedOutboxReceipt(task);
+    }, 5000);
   }
 
   private rememberFailedSessionMessageForTerminalTask(task: BridgeTask): void {
@@ -6273,6 +6410,124 @@ struct Index {
     }
   }
 
+  onPageShow(): void {
+    this.guardianPageVisible = true;
+    this.startGuardianRefresh();
+  }
+
+  onPageHide(): void {
+    this.guardianPageVisible = false;
+    this.stopGuardianRefresh();
+  }
+
+  private guardianCredentialChanged(): void {
+    this.guardianGeneration++;
+    this.guardianRequestSequence++;
+    this.guardian = null;
+    this.guardianBusy = false;
+    this.guardianError = '';
+    if (this.guardianPageVisible) { void this.refreshGuardianStatus(); }
+  }
+
+  private guardianNavigationChanged(): void {
+    this.guardianGeneration++;
+    this.guardianRequestSequence++;
+    this.guardianBusy = false;
+    if (this.guardianPageVisible) { void this.refreshGuardianStatus(); }
+  }
+
+  private startGuardianRefresh(): void {
+    this.stopGuardianRefresh();
+    void this.refreshGuardianStatus();
+    this.scheduleGuardianRefresh();
+  }
+
+  private scheduleGuardianRefresh(): void {
+    if (!this.guardianPageVisible) { return; }
+    this.guardianTimer = setTimeout(() => {
+      this.guardianTimer = -1;
+      void this.refreshGuardianStatus();
+      this.scheduleGuardianRefresh();
+    }, 15000);
+  }
+
+  private stopGuardianRefresh(): void {
+    if (this.guardianTimer >= 0) { clearTimeout(this.guardianTimer); this.guardianTimer = -1; }
+    this.guardianGeneration++;
+    this.guardianRequestSequence++;
+    this.guardianBusy = false;
+  }
+
+  private guardianTargetMatches(url: string, token: string, generation: number, sequence: number, tab: string): boolean {
+    return this.guardianPageVisible && CompanionComputerLifecycle.foreground
+      && url === this.normalizedBridgeUrl() && token === this.bridgeToken
+      && generation === this.guardianGeneration && sequence === this.guardianRequestSequence && tab === this.activeTab;
+  }
+
+  private async refreshGuardianStatus(): Promise<void> {
+    if (!this.guardianPageVisible || !CompanionComputerLifecycle.foreground || this.guardianBusy || this.guardianSaving) { return; }
+    const url = this.normalizedBridgeUrl();
+    const token = this.bridgeToken;
+    const generation = this.guardianGeneration;
+    const sequence = ++this.guardianRequestSequence;
+    const tab = this.activeTab;
+    this.guardianBusy = true;
+    try {
+      const status = await BridgeClient.getGuardianStatus(url, token);
+      if (!this.guardianTargetMatches(url, token, generation, sequence, tab)) { return; }
+      this.guardian = status;
+      this.guardianError = '';
+    } catch (_) {
+      if (this.guardianTargetMatches(url, token, generation, sequence, tab)) {
+        this.guardianError = '守护状态读取失败，请检查电脑连接后刷新。开关状态尚未确认。';
+      }
+    } finally {
+      if (sequence === this.guardianRequestSequence) { this.guardianBusy = false; }
+    }
+  }
+
+  private async setGuardianEnabled(enabled: boolean): Promise<void> {
+    if (this.guardian === null || this.guardianSaving || this.guardianBusy || !this.guardianPageVisible
+      || !CompanionComputerLifecycle.foreground) { return; }
+    const url = this.normalizedBridgeUrl();
+    const token = this.bridgeToken;
+    const generation = this.guardianGeneration;
+    const sequence = ++this.guardianRequestSequence;
+    const tab = this.activeTab;
+    this.guardianSaving = true;
+    try {
+      const status = await BridgeClient.setGuardianEnabled(url, token, enabled);
+      if (!this.guardianTargetMatches(url, token, generation, sequence, tab)) { return; }
+      this.guardian = status;
+      this.guardianError = '';
+    } catch (_) {
+      if (this.guardianTargetMatches(url, token, generation, sequence, tab)) {
+        this.guardianError = '自动守护设置未确认，未显示为保存成功。请刷新后重试。';
+      }
+    } finally {
+      this.guardianSaving = false;
+    }
+  }
+
+  private showGuardianDetails(): void {
+    this.guardianInitialSection = 'guardian';
+    this.openConfigurationPage('settings');
+  }
+
+  @Builder
+  GuardianStatusRow() {
+    Button() {
+      Row({ space: 8 }) {
+        Text(`自动守护 · ${GuardianPresentation.summary(this.guardian, this.guardianError)}`)
+          .fontSize(this.scaledFontSize(11)).fontColor(this.theme().textSecondary)
+          .maxLines(1).textOverflow({ overflow: TextOverflow.Ellipsis }).layoutWeight(1)
+        Text('查看 ›').fontSize(this.scaledFontSize(11)).fontColor(this.theme().textSecondary)
+      }.width('100%')
+    }.width('100%').constraintSize({ minHeight: 36 }).padding({ left: 12, right: 12 })
+      .backgroundColor(this.theme().surfaceMuted).borderRadius(0)
+      .onClick(() => this.showGuardianDetails())
+  }
+
   private startDashboardRefresh(): void {
     this.stopDashboardRefresh();
     this.scheduleNextDashboardRefresh(500);
@@ -6314,6 +6569,7 @@ struct Index {
     if (this.isRefreshingDashboard) {
       return;
     }
+    void this.refreshDesktopInteractions();
     this.isRefreshingDashboard = true;
     try {
       const now = Date.now();
@@ -6372,7 +6628,8 @@ struct Index {
           : `已同步 ${this.sessions.length} 个会话`;
       }
     } catch (err) {
-      this.message = err instanceof Error ? err.message : String(err);
+      const errorMessage = this.errorText(err);
+      this.message = this.sessionsLoadError === errorMessage ? this.sessionConnectionFailure().title : errorMessage;
       this.dashboardFailureCount += 1;
       if (this.dashboardFailureCount === 1) {
         void this.publishConnectionNotification();
@@ -6495,10 +6752,48 @@ struct Index {
       sessions = await sessionsPromise;
     } catch (err) {
       await this.applyRuntimeSnapshotOutcome(runtimePromise, source);
+      this.sessionsLoadError = this.errorText(err);
+      this.sessionsFailureDiagnosticsAvailable = false;
+      this.sessionsFailureDetailsExpanded = false;
+      // Read-only diagnosis: a failed refresh never requests recovery or restart.
+      try {
+        const targetSessionId = (!this.isNewSessionDraft && this.selectedSession !== null) ? this.selectedSession.id : '';
+        const link = await BridgeClient.getSystemLinkStatus(this.normalizedBridgeUrl(), this.bridgeToken, targetSessionId);
+        this.applySystemLinkStatus(link, targetSessionId);
+        this.sessionsFailureDiagnosticsAvailable = link.desktop !== undefined;
+      } catch (diagnosticError) {
+        this.log('warn', 'sessions.failure.diagnostics_unavailable', `source=${source}; message=${this.errorText(diagnosticError)}`);
+      }
       throw new Error(this.errorText(err));
     }
     await this.applyRuntimeSnapshotOutcome(runtimePromise, source);
+    this.sessionsLoadError = '';
+    this.sessionsFailureDiagnosticsAvailable = false;
+    this.sessionsFailureDetailsExpanded = false;
     return this.sessionRuntimeStore.mergeSessions(sessions);
+  }
+
+  private sessionConnectionFailure(): SessionConnectionFailurePresentation {
+    return SessionConnectionFailure.present(this.sessionsLoadError, {
+      diagnosticsAvailable: this.sessionsFailureDiagnosticsAvailable,
+      failureClass: this.desktopLiveFailureClass,
+      requiresDesktopCdp: this.desktopLiveRequiresDesktopCdp,
+      desktopProcessMode: this.desktopLiveProcessMode,
+      repairAction: this.systemRepairAction
+    });
+  }
+
+  private handleSessionConnectionFailureAction(): void {
+    const action = this.sessionConnectionFailure().action;
+    if (action === 'hard_restart') {
+      this.confirmHardRestartCodexFromPhone('sessions_connection_failure');
+    } else if (action === 'soft_repair') {
+      void this.repairDesktopLiveFromPhone('sessions_connection_failure', true);
+    } else if (action === 'pairing') {
+      this.openConfigurationPage('pairing');
+    } else {
+      void this.refreshSessions('pull');
+    }
   }
 
   private async refreshSessions(source: string = 'manual'): Promise<void> {
@@ -6518,9 +6813,9 @@ struct Index {
       this.log('info', 'sessions.loaded', `source=${source}; count=${this.sessions.length}`);
     } catch (err) {
       this.sessionsLoadError = this.errorText(err);
-      this.message = this.sessionsLoadError;
+      this.message = this.sessionConnectionFailure().title;
       void this.publishStandbyMonitorSnapshot(`sessions_${source}`, false);
-      this.log('error', 'sessions.load.failed', `message=${this.message}`);
+      this.log('error', 'sessions.load.failed', `message=${this.sessionsLoadError}`);
     } finally {
       if (source === 'pull') {
         this.isPullRefreshingSessions = false;
@@ -6564,11 +6859,14 @@ struct Index {
       }
       this.activeSessionId = sessionId;
       this.applySessionActivitySnapshot(detail, 'detail');
+      const receiptTask = this.currentTask;
+      if (receiptTask && this.isSubmittedOutboxReceipt(receiptTask)) this.clearSubmittedOutboxReceiptIfVisible(receiptTask);
       this.lastSelectedSessionDetailRefreshAt = Date.now();
       this.markSessionRead(sessionId);
       this.message = `已打开会话：${this.selectedSession.title}`;
       this.log('info', 'session.detail.loaded', `sessionId=${sessionId}; entries=${this.selectedSession.entryCount}`);
       this.scrollSessionToBottomIfFollowing('detail_loaded');
+      void this.refreshDesktopInteractions();
       if (!sameSession) {
         await this.loadSessionReasoningEffort(sessionId);
       }
@@ -6613,6 +6911,10 @@ struct Index {
     };
     this.sessionNavigationState = JSON.stringify(next);
     this.activeSessionId = mode === 'session' ? sessionId : '';
+    this.desktopInteractions = [];
+    this.desktopInteractionError = '';
+    this.interactionSubmitError = '';
+    this.desktopInteractionRefreshSeq += 1;
     this.log('info', 'session.navigation.committed', `source=${source}; mode=${mode}; sessionId=${sessionId}; revision=${next.revision}`);
   }
 
@@ -6650,6 +6952,7 @@ struct Index {
     if (this.selectedSession === null) {
       return;
     }
+    void this.refreshDesktopInteractions();
     const previousSessionId = this.selectedSession.id;
     const previousEntryCount = this.selectedSession.entryCount;
     const previousBottomSignature = this.sessionBottomSignature(this.selectedSession);
@@ -6902,13 +7205,8 @@ struct Index {
   }
 
   private sessionComposerTextAreaHeight(): number {
-    if (this.pendingSessionImages.length > 0 || this.pendingSessionFiles.length > 0 || this.hasActiveComposerToken()) {
-      return 78;
-    }
-    if (this.sessionComposerFocused || this.sessionMessage.trim().length > 0) {
-      return 72;
-    }
-    return 66;
+    const lines = Math.min(4, Math.max(1, this.sessionMessage.split('\n').length));
+    return Math.max(42, this.scaledLineHeight(24) * lines + 12);
   }
 
   private sessionBottomSignature(session: CodexSessionDetail): string {
@@ -7160,6 +7458,9 @@ struct Index {
     if (this.isNewSessionDraft || this.selectedSession === null) {
       return;
     }
+    if (this.currentTask !== null && this.isSubmittedOutboxReceipt(this.currentTask)
+      && this.taskSessionId(this.currentTask) === this.selectedSession.id
+      && !this.submittedReceiptHasVisibleUserEntry(this.currentTask)) return;
     const summary = this.latestTaskSummaryForSession(tasks, this.selectedSession.id);
     if (summary === null) {
       return;
@@ -7186,10 +7487,13 @@ struct Index {
       const task = this.taskUsesCodexRunApi(summary)
         ? await BridgeClient.getCodexRun(this.normalizedBridgeUrl(), summary.id, this.bridgeToken)
         : await BridgeClient.getTask(this.normalizedBridgeUrl(), summary.id, this.bridgeToken);
-      this.handoffPendingSessionSend(summary.id, task);
       if (this.selectedSession === null || this.selectedSession.id !== currentSelected) {
         return;
       }
+      if (this.currentTask !== null && this.isSubmittedOutboxReceipt(this.currentTask)
+        && this.taskSessionId(this.currentTask) === currentSelected
+        && !this.submittedReceiptHasVisibleUserEntry(this.currentTask)) return;
+      this.handoffPendingSessionSend(summary.id, task);
       if (this.failedTaskHasCanonicalCompletion(task)) {
         this.currentTask = task;
         this.log('info', 'task.selected_session.adopt.skipped_canonical_completion', `taskId=${task.id}; sessionId=${currentSelected}`);
@@ -7943,6 +8247,134 @@ struct Index {
     }
   }
 
+  private openConfigurationPage(page: string): void {
+    this.homeActionMenuVisible = false;
+    this.homeActionMenuSource = '';
+    this.activeTab = page;
+    if (page === 'pairing') {
+      this.pairingDraftUrl = this.bridgeUrl;
+      this.pairingDraftToken = this.bridgeToken;
+      this.pairingStatusText = '';
+      this.refreshPairingUiState();
+      void this.checkPairingConnection();
+    }
+  }
+
+  private closeConfigurationPage(): void {
+    this.pairingCheckGeneration++;
+    this.pairingChecking = false;
+    this.activeTab = this.activeTab === 'overview' || this.activeTab === 'tasks' ? 'settings' : 'sessions';
+  }
+
+  private pairingVoiceStatus(): string {
+    if (this.voiceCallStatus === 'ready' || this.voiceCallStatus === 'active') {
+      return this.voiceCallMuted ? '通话已接通，麦克风静音' : '通话已接通';
+    }
+    if (this.voiceCallStatus === 'connecting') { return '正在连接语音'; }
+    if (this.voiceCallStatus === 'error') { return '上次通话失败，请重新发起验证'; }
+    return '未检测，通话时验证';
+  }
+
+  private confirmUnpair(): void {
+    AlertDialog.show({
+      title: '解除配对', message: '解除后需要重新扫码才能连接。是否继续？',
+      primaryButton: { value: '取消', action: () => {} },
+      secondaryButton: { value: '解除配对', action: () => { void this.unpairBridgeCredential('panel'); } }
+    });
+  }
+
+  private async savePairingDraft(): Promise<void> {
+    if (this.pairingBusy || this.pairingChecking) { return; }
+    const url = BridgePairingService.normalizeBaseUrl(this.pairingDraftUrl);
+    if (!/^https?:\/\/[^\s/?#]+/i.test(url)) {
+      this.pairingStatusText = '请输入有效的 http:// 或 https:// 桥接地址';
+      return;
+    }
+    this.pairingBusy = true;
+    try {
+      const current = CredentialRuntime.getRuntimeCredential();
+      if (current !== null) {
+        const credential: BridgeCredential = {
+          deviceId: current.deviceId, deviceName: current.deviceName, bridgeUrl: url,
+          token: this.pairingDraftToken.trim(), totpSecret: current.totpSecret, pairedAt: current.pairedAt
+        };
+        if (credential.token.length === 0) {
+          this.pairingStatusText = '已配对设备的访问令牌不能为空';
+          return;
+        }
+        await BridgeCredentialStore.saveCredential(getContext(this) as common.UIAbilityContext, credential);
+        this.applyRuntimeCredential(credential, 'manual_settings');
+      } else {
+        // Legacy, unpaired configuration is only applied for this app run.
+        this.bridgeUrl = url;
+        this.bridgeToken = this.pairingDraftToken.trim();
+        this.pairingStatusText = '参数已应用到当前运行；扫码配对后可安全保存';
+      }
+    } catch (_) {
+      this.pairingStatusText = '保存连接参数失败，当前连接未更改';
+      return;
+    } finally {
+      this.pairingBusy = false;
+    }
+    await this.checkPairingConnection();
+  }
+
+  private async checkPairingConnection(): Promise<void> {
+    if (this.pairingBusy || this.pairingChecking) { return; }
+    const generation = ++this.pairingCheckGeneration;
+    const url = this.normalizedBridgeUrl();
+    const token = this.bridgeToken;
+    this.pairingChecking = true;
+    this.pairingConnectionFailed = false;
+    this.pairingMessageStatus = '正在检测…';
+    this.pairingComputerStatus = '正在检测…';
+    try {
+      const profile = await BridgeClient.getCompanionProfile(url, token);
+      if (generation !== this.pairingCheckGeneration) { return; }
+      await Promise.all([
+        this.checkPairingMessages(url, token, profile, generation),
+        this.checkPairingComputer(url, token, profile, generation)
+      ]);
+    } catch (_) {
+      if (generation === this.pairingCheckGeneration) {
+        this.pairingConnectionFailed = true;
+        this.pairingMessageStatus = '连接失败，无法读取个人助手';
+        this.pairingComputerStatus = '未检测，个人助手连接失败';
+      }
+    } finally {
+      if (generation === this.pairingCheckGeneration) { this.pairingChecking = false; }
+    }
+  }
+
+  private async checkPairingMessages(url: string, token: string, profile: CompanionProfile, generation: number): Promise<void> {
+    try {
+      await BridgeClient.getCompanionMessages(url, profile.id, profile.roomId, token);
+      if (generation === this.pairingCheckGeneration) { this.pairingMessageStatus = '消息读取正常，发送结果以会话为准'; }
+    } catch (_) {
+      if (generation === this.pairingCheckGeneration) {
+        this.pairingMessageStatus = '消息读取失败';
+        this.pairingConnectionFailed = true;
+      }
+    }
+  }
+
+  private async checkPairingComputer(url: string, token: string, profile: CompanionProfile, generation: number): Promise<void> {
+    try {
+      const raw = await BridgeClient.getCompanionComputerStatus(url, profile.id, profile.roomId, token);
+      const status = JSON.parse(raw) as PairingComputerStatus;
+      if (generation !== this.pairingCheckGeneration) { return; }
+      this.pairingComputerStatus = status.ready === true
+        && status.assistantId === profile.id && status.roomId === profile.roomId
+        && !!status.threadId && !!status.environmentId
+        ? '云环境已就绪，画面与操作需进入后验证' : '云环境尚未就绪';
+    } catch (_) {
+      if (generation === this.pairingCheckGeneration) {
+        this.pairingComputerStatus = '云电脑状态读取失败';
+        this.pairingConnectionFailed = true;
+      }
+    }
+  }
+
   private async initializeBridgeCredential(): Promise<void> {
     this.pairingScanAvailable = this.detectScanPairingSupport();
     try {
@@ -7964,6 +8396,8 @@ struct Index {
     CredentialRuntime.setRuntimeCredential(credential);
     this.bridgeUrl = credential.bridgeUrl;
     this.bridgeToken = credential.token;
+    this.pairingDraftUrl = credential.bridgeUrl;
+    this.pairingDraftToken = this.bridgeToken;
     void this.refreshBridgeOtp();
     this.log('info', 'pairing.credential.applied',
       `source=${source}; deviceId=${credential.deviceId}; host=${this.safeBridgeHost(credential.bridgeUrl)}`);
@@ -8010,6 +8444,7 @@ struct Index {
       this.log('warn', 'pairing.scan.failed', `message=${this.errorText(error as Error)}`);
     } finally {
       this.pairingBusy = false;
+      if (this.activeTab === 'pairing') { void this.checkPairingConnection(); }
     }
   }
 
@@ -8036,15 +8471,16 @@ struct Index {
       this.applyRuntimeCredential(credential, `enroll_${source}`);
       this.pairingManualCode = '';
       this.pairingGuideVisible = false;
+      this.refreshPairingUiState();
       this.log('info', 'pairing.enroll.success',
         `source=${source}; deviceId=${credential.deviceId}; host=${this.safeBridgeHost(credential.bridgeUrl)}`);
       try {
         await BridgeClient.getRuntimeStatus(this.normalizedBridgeUrl(), this.bridgeToken);
-        this.pairingStatusText = `配对成功：${credential.deviceName}（${credential.deviceId}），与电脑端连接正常`;
+        this.pairingStatusText = `配对成功：${credential.deviceName}。各通道检测结果见下方`;
         this.log('info', 'pairing.verify.passed', `deviceId=${credential.deviceId}`);
       } catch (verifyError) {
         this.pairingStatusText =
-          `配对成功：${credential.deviceName}（${credential.deviceId}），暂时未连通电脑端，可稍后在总览页重试`;
+          `配对成功：${credential.deviceName}（${credential.deviceId}），暂时未连通电脑端，可在配对页重试`;
         this.log('warn', 'pairing.verify.failed', `message=${this.errorText(verifyError as Error)}`);
       }
     } catch (error) {
@@ -8064,7 +8500,7 @@ struct Index {
       this.pairingStatusText = '请输入 10 位配对码（XXXXX-XXXXX 或连续 10 位字母数字）';
       return;
     }
-    const bridgeUrl = BridgePairingService.normalizeBaseUrl(this.bridgeUrl);
+    const bridgeUrl = BridgePairingService.normalizeBaseUrl(this.pairingDraftUrl);
     if (bridgeUrl.length === 0) {
       this.pairingStatusText = '请先在上方填写电脑端桥接地址（http:// 或 https://）';
       return;
@@ -8074,6 +8510,7 @@ struct Index {
       await this.enrollPairing(bridgeUrl, pairingCode, 'manual');
     } finally {
       this.pairingBusy = false;
+      if (this.activeTab === 'pairing') { void this.checkPairingConnection(); }
     }
   }
 
@@ -8081,6 +8518,8 @@ struct Index {
     if (this.pairingBusy) {
       return;
     }
+    this.pairingCheckGeneration++;
+    this.pairingChecking = false;
     this.pairingBusy = true;
     try {
       const context = getContext(this) as common.UIAbilityContext;
@@ -8096,6 +8535,11 @@ struct Index {
     this.pairedDeviceId = '';
     this.pairingManualCode = '';
     this.pairingStatusText = '已解除配对';
+    this.pairingDraftUrl = this.bridgeUrl;
+    this.pairingDraftToken = this.bridgeToken;
+    this.pairingMessageStatus = '未检测';
+    this.pairingComputerStatus = '未检测';
+    this.pairingConnectionFailed = false;
     this.pairingGuideVisible = DEFAULT_BRIDGE_TOKEN.trim().length === 0;
     void this.refreshBridgeOtp();
     this.log('info', 'pairing.credential.cleared', `source=${source}`);
@@ -8514,7 +8958,7 @@ struct Index {
     }
   }
 
-  private async repairDesktopLiveFromPhone(source: string): Promise<boolean> {
+  private async repairDesktopLiveFromPhone(source: string, desktopOnly: boolean = false): Promise<boolean> {
     if (!this.canRepairDesktopLive()) {
       return false;
     }
@@ -8523,18 +8967,28 @@ struct Index {
     this.message = '正在从手机端恢复链路';
     this.log('warn', 'system.link.recover.requested', `source=${source}; sessionId=${targetSessionId}`);
     try {
-      const link: SystemLinkStatus = await BridgeClient.recoverSystemLink(this.normalizedBridgeUrl(), this.bridgeToken, targetSessionId, 'auto');
-      this.applySystemLinkStatus(link, targetSessionId);
-      const status = link.desktop;
-      this.message = link.severity === 'ok'
-        ? '链路已恢复，可以继续发送'
-        : this.systemLinkMessageText(link);
-      this.log(status?.desktopLive ? 'info' : 'warn', 'system.link.recover.completed', `source=${source}; action=${link.recommendedAction ?? ''}; mode=${link.repairMode ?? ''}; repaired=${link.repaired === true}; severity=${link.severity ?? ''}; desktopLive=${status?.desktopLive === true}; state=${this.desktopLiveState}; verified=${this.desktopLiveSessionVerified}; mobileRecoverable=${this.desktopLiveMobileRecoverable}; failureClass=${this.desktopLiveFailureClass}; processMode=${this.desktopLiveProcessMode}; cdpPort=${this.desktopLiveCdpPort}; reason=${this.desktopLiveReason}; hdc=${this.relayStateText}`);
+      let recovered: boolean = false;
+      if (desktopOnly) {
+        const system: SystemRepairStatus = await BridgeClient.repairSystemLink(this.normalizedBridgeUrl(), this.bridgeToken, targetSessionId, 'soft', false);
+        this.applySystemRepairStatus(system, targetSessionId);
+        recovered = system.severity !== 'blocked' && system.desktop?.desktopLive === true;
+        this.message = recovered ? '链路已恢复，可以继续发送' : this.systemRepairMessageText(system);
+        this.log(recovered ? 'info' : 'warn', 'system.link.recover.completed', `source=${source}; action=${system.recommendedAction ?? ''}; mode=${system.repairMode ?? ''}; repaired=${system.repaired === true}; severity=${system.severity ?? ''}; desktopLive=${system.desktop?.desktopLive === true}; state=${this.desktopLiveState}; reason=${this.desktopLiveReason}`);
+      } else {
+        const link: SystemLinkStatus = await BridgeClient.recoverSystemLink(this.normalizedBridgeUrl(), this.bridgeToken, targetSessionId, 'auto');
+        this.applySystemLinkStatus(link, targetSessionId);
+        const status = link.desktop;
+        recovered = link.severity !== 'blocked' && status?.desktopLive === true;
+        this.message = link.severity === 'ok'
+          ? '链路已恢复，可以继续发送'
+          : this.systemLinkMessageText(link);
+        this.log(status?.desktopLive ? 'info' : 'warn', 'system.link.recover.completed', `source=${source}; action=${link.recommendedAction ?? ''}; mode=${link.repairMode ?? ''}; repaired=${link.repaired === true}; severity=${link.severity ?? ''}; desktopLive=${status?.desktopLive === true}; state=${this.desktopLiveState}; verified=${this.desktopLiveSessionVerified}; mobileRecoverable=${this.desktopLiveMobileRecoverable}; failureClass=${this.desktopLiveFailureClass}; processMode=${this.desktopLiveProcessMode}; cdpPort=${this.desktopLiveCdpPort}; reason=${this.desktopLiveReason}; hdc=${this.relayStateText}`);
+      }
       await this.refreshDashboard(true);
       if (this.selectedSession !== null) {
         await this.loadSessionDetail(this.selectedSession.id);
       }
-      return link.severity !== 'blocked' && status?.desktopLive === true;
+      return recovered;
     } catch (error) {
       this.message = `链路恢复失败：${this.errorText(error)}`;
       this.log('error', 'system.link.recover.failed', `source=${source}; message=${this.errorText(error)}`);
@@ -8552,14 +9006,15 @@ struct Index {
     this.homeActionMenuVisible = !shouldClose;
     this.homeActionMenuSource = this.homeActionMenuVisible ? source : '';
     if (this.homeActionMenuVisible) {
+      this.dismissSessionKeyboardAfterSend('home_menu');
+      this.homeMenuCanScrollUp = false;
+      this.homeMenuCanScrollDown = false;
       this.homeActionMenuOpenedAt = Date.now();
       this.reasoningEffortMenuVisible = false;
       this.composerActionMenuExpanded = false;
       this.slashCommandPanelVisible = false;
     } else {
       this.homeActionMenuOpenedAt = 0;
-      this.themeModeChooserVisible = false;
-      this.fontScaleChooserVisible = false;
     }
     this.log('info', 'ui.home_action_menu.toggle', `visible=${this.homeActionMenuVisible}; source=${source}; owner=${this.homeActionMenuSource}`);
   }
@@ -8616,7 +9071,7 @@ struct Index {
       return true;
     }
     if (action === 'voice_call') {
-      return this.voiceCallStatus !== 'connecting' && this.voiceCallStatus !== 'active' && this.voiceCallStatus !== 'ready';
+      return true;
     }
     if (action === 'soft_repair') {
       return this.canRepairDesktopLive();
@@ -8628,27 +9083,17 @@ struct Index {
   }
 
   private handleHomeAction(action: string, source: string): void {
-    if (this.shouldIgnoreHomeActionMenuAction(action, source)) {
-      return;
-    }
-    if (action === 'theme') {
-      this.themeModeChooserVisible = !this.themeModeChooserVisible;
-      this.fontScaleChooserVisible = false;
-      this.log('info', 'ui.theme.menu.toggle', `visible=${this.themeModeChooserVisible}; source=${source}`);
-      return;
-    }
-    if (action === 'font_size') {
-      this.fontScaleChooserVisible = !this.fontScaleChooserVisible;
-      this.themeModeChooserVisible = false;
-      this.log('info', 'ui.font_scale.menu.toggle', `visible=${this.fontScaleChooserVisible}; source=${source}`);
+    if (!this.canRunHomeAction(action) || (source !== 'settings' && this.shouldIgnoreHomeActionMenuAction(action, source))) {
       return;
     }
     this.homeActionMenuVisible = false;
     this.homeActionMenuSource = '';
     this.homeActionMenuOpenedAt = 0;
-    this.themeModeChooserVisible = false;
-    this.fontScaleChooserVisible = false;
     this.log('info', 'ui.home_action_menu.action', `action=${action}; source=${source}`);
+    if (action === 'pairing' || action === 'settings') {
+      this.openConfigurationPage(action);
+      return;
+    }
     if (action === 'go_overview') {
       this.activeTab = 'overview';
       return;
@@ -8727,7 +9172,23 @@ struct Index {
         || profile.roomId !== this.companionProfile.roomId)) {
         this.companionGeneration += 1;
         this.companionEntries = [];
+        this.companionCalls = [];
         this.companionNextCursor = null;
+        this.companionTranscriptPartitionKey = '';
+        this.companionTranscriptLoadedPartitionKey = '';
+        this.companionTranscriptStorageError = '';
+        this.companionTextPartitionKey = '';
+        this.companionTextReady = false;
+        this.companionTextMessages = [];
+        this.companionTextDraft = '';
+        this.companionTextError = '';
+      }
+      if (!this.voiceCallVisible || (this.companionProfile?.id === profile.id
+        && this.companionProfile?.roomId === profile.roomId)) {
+        this.voiceCallAssistantName = profile.name;
+      }
+      if (this.companionProfile?.avatarUrl !== profile.avatarUrl) {
+        this.companionAvatarFailed = false;
       }
       this.companionProfile = profile;
     } catch (_) {
@@ -8745,8 +9206,17 @@ struct Index {
     this.activeTab = 'sessions';
     this.sessionSidebarCollapsed = true;
     this.companionEntries = [];
+    this.companionCalls = [];
     this.companionNextCursor = null;
     this.companionError = '';
+    this.companionTranscriptStorageError = '';
+    this.companionTranscriptPartitionKey = '';
+    this.companionTranscriptLoadedPartitionKey = '';
+    this.companionTextPartitionKey = '';
+    this.companionTextReady = false;
+    this.companionTextMessages = [];
+    this.companionTextDraft = '';
+    this.companionTextError = '';
     this.startCompanionPolling();
     await this.refreshCompanionConversation(false);
   }
@@ -8756,8 +9226,12 @@ struct Index {
       return;
     }
     this.companionTimer = setInterval(() => {
-      if (this.appForeground && this.activeTab === 'sessions' && this.companionSelected && !this.voiceCallVisible) {
-        void this.refreshCompanionConversation(false);
+      if (this.appForeground && this.activeTab === 'sessions' && this.companionSelected) {
+        if (this.voiceCallVisible) {
+          void this.loadCompanionProfile();
+        } else {
+          void this.refreshCompanionConversation(false);
+        }
       }
     }, 3000);
   }
@@ -8789,23 +9263,41 @@ struct Index {
       return;
     }
     const generation = this.companionGeneration;
+    const companionBridgeUrl = this.normalizedBridgeUrl();
+    const companionToken = this.bridgeToken;
     this.companionInFlight = true;
     this.companionLoading = older || this.companionEntries.length === 0;
     try {
       if (this.companionProfile === null) {
         await this.loadCompanionProfile(true);
+      } else if (!older) {
+        await this.loadCompanionProfile();
       }
       const profile = this.companionProfile;
       if (profile === null || (older && this.companionNextCursor === null)) {
         return;
       }
-      const page = await BridgeClient.getCompanionMessages(this.normalizedBridgeUrl(),
-        profile.id, profile.roomId, this.bridgeToken, older ? (this.companionNextCursor ?? '') : '');
+      if (generation !== this.companionGeneration || companionBridgeUrl !== this.normalizedBridgeUrl()
+        || companionToken !== this.bridgeToken || !this.companionSelected) {
+        return;
+      }
+      this.restoreCompanionText(profile, generation);
+      await this.restoreCompanionTranscripts(profile, generation);
       if (generation !== this.companionGeneration || !this.companionSelected
-        || this.activeTab !== 'sessions' || this.companionProfile?.roomId !== profile.roomId) {
+        || companionBridgeUrl !== this.normalizedBridgeUrl() || companionToken !== this.bridgeToken
+        || this.companionProfile?.id !== profile.id || this.companionProfile?.roomId !== profile.roomId) {
+        return;
+      }
+      const page = await BridgeClient.getCompanionMessages(companionBridgeUrl,
+        profile.id, profile.roomId, companionToken, older ? (this.companionNextCursor ?? '') : '');
+      if (generation !== this.companionGeneration || !this.companionSelected
+        || companionBridgeUrl !== this.normalizedBridgeUrl() || companionToken !== this.bridgeToken
+        || this.activeTab !== 'sessions' || this.companionProfile?.id !== profile.id
+        || this.companionProfile?.roomId !== profile.roomId) {
         return;
       }
       const existing = this.companionEntries;
+      this.reconcileCompanionText(profile, page.entries);
       const pageIds = page.entries.map((entry: VoiceTranscriptEntry) => entry.itemId ?? '');
       let merged: VoiceTranscriptEntry[] = [];
       if (older) {
@@ -8817,16 +9309,21 @@ struct Index {
         const prefix = firstIndex >= 0 ? existing.slice(0, firstIndex) : existing;
         const earlier = prefix.filter((entry: VoiceTranscriptEntry) =>
           (entry.itemId ?? '').indexOf('room:') === 0 && pageIds.indexOf(entry.itemId ?? '') < 0);
-        const live = existing.filter((entry: VoiceTranscriptEntry) =>
-          (entry.itemId ?? '').indexOf('voice:') === 0);
+        const live = existing.filter((entry: VoiceTranscriptEntry) => entry.phoneTranscript === true
+          || (entry.itemId ?? '').indexOf('voice:') === 0);
         merged = earlier.concat(page.entries).concat(live);
       }
+      const mergedCalls = CompanionHistoryReducer.mergeCalls(this.companionCalls, page.calls ?? []);
       if (older || existing.length === 0) {
         this.companionNextCursor = page.nextCursor;
       }
       if (JSON.stringify(merged) !== JSON.stringify(existing)) {
         this.companionEntries = merged;
         this.log('info', 'companion.history.synced', `entries=${merged.length}; older=${older}`);
+      }
+      if (JSON.stringify(mergedCalls) !== JSON.stringify(this.companionCalls)) {
+        this.companionCalls = mergedCalls;
+        this.log('info', 'companion.calls.synced', `calls=${mergedCalls.length}; older=${older}`);
       }
       this.companionError = '';
     } catch (_) {
@@ -8845,15 +9342,315 @@ struct Index {
     }
   }
 
+  private companionTextPartition(profile: CompanionProfile): CompanionTextPartition {
+    return { bridgeUrl: this.normalizedBridgeUrl(), profileId: profile.id, roomId: profile.roomId };
+  }
+
+  private restoreCompanionText(profile: CompanionProfile, generation: number): void {
+    if (generation !== this.companionGeneration || !this.companionSelected) {
+      return;
+    }
+    const partition = this.companionTextPartition(profile);
+    try {
+      const key = CompanionTextService.partitionKey(partition);
+      if (this.companionTextPartitionKey === key && this.companionTextReady) {
+        this.companionTextMessages = CompanionTextService.messages(partition);
+        return;
+      }
+      this.companionTextReady = false;
+      if (this.companionTextPartitionKey !== key) {
+        this.companionTextPartitionKey = key;
+        this.companionTextMessages = [];
+        this.companionTextDraft = this.companionTextDrafts.get(key) ?? '';
+      }
+      this.companionTextMessages = CompanionTextService.load(getContext(this) as common.UIAbilityContext, partition);
+      this.companionTextPartitionKey = key;
+      this.companionTextDraft = this.companionTextDrafts.get(key) ?? '';
+      this.companionTextReady = true;
+      this.companionTextError = '';
+    } catch (error) {
+      this.companionTextError = this.errorText(error as Error);
+    }
+  }
+
+  private changeCompanionTextDraft(text: string): void {
+    this.companionTextDraft = text;
+    if (this.companionTextPartitionKey.length > 0) {
+      this.companionTextDrafts.set(this.companionTextPartitionKey, text);
+    }
+  }
+
+  private recoverCompanionText(message: CompanionTextMessage): void {
+    if (!this.companionTextMessages.some((current: CompanionTextMessage) => current.requestId === message.requestId)) {
+      return;
+    }
+    this.changeCompanionTextDraft(CompanionTextService.recoverText(message, this.companionTextDraft));
+  }
+
+  private companionTextTargetMatches(partition: CompanionTextPartition, generation: number, token: string): boolean {
+    return generation === this.companionGeneration && this.companionSelected && this.activeTab === 'sessions'
+      && partition.bridgeUrl === this.normalizedBridgeUrl() && token === this.bridgeToken
+      && this.companionProfile?.id === partition.profileId && this.companionProfile?.roomId === partition.roomId
+      && this.companionTextPartitionKey === CompanionTextService.partitionKey(partition);
+  }
+
+  private async sendCompanionText(): Promise<void> {
+    const profile = this.companionProfile;
+    const text = this.companionTextDraft;
+    if (!this.companionSelected || this.activeTab !== 'sessions' || !this.companionTextReady
+      || profile === null || !text.trim() || text.length > 20000) {
+      return;
+    }
+    const partition = this.companionTextPartition(profile);
+    const generation = this.companionGeneration;
+    const token = this.bridgeToken;
+    if (!this.companionTextTargetMatches(partition, generation, token)) {
+      return;
+    }
+    const context = getContext(this) as common.UIAbilityContext;
+    const requestId = CompanionTextService.newRequestId();
+    try {
+      CompanionTextService.enqueue(partition, text, requestId);
+    } catch (error) {
+      this.companionTextError = this.errorText(error as Error);
+      return;
+    }
+    this.companionTextMessages = CompanionTextService.messages(partition);
+    this.changeCompanionTextDraft('');
+    this.companionTextError = '';
+    try {
+      CompanionTextService.save(context, partition);
+    } catch (_) {
+      CompanionTextService.markFailure(partition, requestId, '本机保存失败，消息尚未发送，可恢复文字后再发送', true);
+      this.companionTextMessages = CompanionTextService.messages(partition);
+      return;
+    }
+    try {
+      const receipt = await BridgeClient.sendCompanionText(partition.bridgeUrl, partition.profileId,
+        partition.roomId, text, requestId, token);
+      CompanionTextService.applyReceipt(partition, receipt);
+      // History can arrive before the POST response. Use the full visible official history too.
+      if (this.companionTextTargetMatches(partition, generation, token)) {
+        CompanionTextService.reconcile(partition, this.companionEntries);
+      }
+    } catch (error) {
+      const detail = this.errorText(error as Error);
+      const rejectedStatus = /HTTP (4\d{2})(?:[：:\s]|$)/.exec(detail);
+      const certain = rejectedStatus !== null && rejectedStatus[1] !== '408';
+      CompanionTextService.markFailure(partition, requestId, certain
+        ? detail : '提交结果不确定，请先核对官方记录，避免重复发送', certain);
+    }
+    let storageError = '';
+    try {
+      CompanionTextService.save(context, partition);
+    } catch (_) {
+      storageError = '发送状态未能保存到本机，当前气泡仍保留；重新打开后请先核对官方记录';
+    }
+    if (this.companionTextTargetMatches(partition, generation, token)) {
+      this.companionTextMessages = CompanionTextService.messages(partition);
+      this.companionTextError = storageError;
+      void this.refreshCompanionConversation(false);
+    }
+  }
+
+  private reconcileCompanionText(profile: CompanionProfile, history: VoiceTranscriptEntry[]): void {
+    if (!this.companionTextReady) {
+      return;
+    }
+    const partition = this.companionTextPartition(profile);
+    if (this.companionTextPartitionKey !== CompanionTextService.partitionKey(partition)) {
+      return;
+    }
+    if (CompanionTextService.reconcile(partition, history)) {
+      this.companionTextMessages = CompanionTextService.messages(partition);
+      try {
+        CompanionTextService.save(getContext(this) as common.UIAbilityContext, partition);
+      } catch (_) {
+        this.companionTextError = '官方记录已确认，本机待确认状态暂未更新';
+      }
+    }
+  }
+
+  private async restoreCompanionTranscripts(profile: CompanionProfile, generation: number): Promise<void> {
+    const partition: CompanionTranscriptPartition = {
+      bridgeUrl: this.normalizedBridgeUrl(),
+      assistantId: profile.id,
+      roomId: profile.roomId
+    };
+    let key: string;
+    try {
+      key = CompanionTranscriptStore.partitionKey(partition);
+    } catch (error) {
+      this.companionTranscriptStorageError = this.errorText(error as Error);
+      return;
+    }
+    if (this.companionTranscriptLoadedPartitionKey === key) {
+      return;
+    }
+    if (this.companionTranscriptPartitionKey !== key) {
+      this.companionTranscriptPartitionKey = key;
+      this.companionEntries = [];
+      this.companionCalls = [];
+      this.companionNextCursor = null;
+      this.companionTranscriptStorageError = '';
+    }
+    try {
+      const context = getContext(this) as common.UIAbilityContext;
+      const cached = await CompanionTranscriptStore.load(context, partition);
+      if (generation !== this.companionGeneration || !this.companionSelected
+        || this.companionTranscriptPartitionKey !== key) {
+        return;
+      }
+      this.companionEntries = VoiceTranscriptReducer.replaceHistory(this.companionEntries, cached);
+      this.companionTranscriptLoadedPartitionKey = key;
+      if (cached.length > 0) {
+        this.log('info', 'companion.transcript.cache.restored', `entries=${cached.length}`);
+      }
+    } catch (error) {
+      if (generation === this.companionGeneration && this.companionTranscriptPartitionKey === key) {
+        this.companionTranscriptStorageError = this.errorText(error as Error);
+        this.log('warn', 'companion.transcript.cache.load_failed', `message=${this.errorText(error as Error)}`);
+      }
+    }
+  }
+
+  private preparePhoneTranscriptEntry(entry: VoiceTranscriptEntry, identity: CompanionVoiceIdentity): VoiceTranscriptEntry {
+    if (entry.role !== 'user' && entry.role !== 'assistant') {
+      return entry;
+    }
+    const pendingKey = `${identity.callId}:${entry.role}`;
+    let itemId = '';
+    if (typeof entry.itemId === 'string' && entry.itemId.trim().length > 0) {
+      itemId = `voice:${identity.callId}:${encodeURIComponent(entry.itemId.trim())}`;
+    } else {
+      itemId = this.pendingVoiceTranscriptIds[pendingKey] ?? '';
+      if (itemId.length === 0) {
+        this.nextPhoneTranscriptSequence += 1;
+        itemId = `voice:${identity.callId}:local-${this.nextPhoneTranscriptSequence}`;
+      }
+      if (entry.final) {
+        this.pendingVoiceTranscriptIds[pendingKey] = '';
+      } else {
+        this.pendingVoiceTranscriptIds[pendingKey] = itemId;
+      }
+    }
+    const localBridgeUrl = this.voiceCallBridgeUrlSnapshot.length > 0
+      ? this.voiceCallBridgeUrlSnapshot : this.normalizedBridgeUrl();
+    return {
+      itemId,
+      role: entry.role,
+      text: entry.text,
+      final: entry.final,
+      phoneTranscript: true,
+      localStorageStatus: 'pending',
+      callId: identity.callId,
+      localBridgeOrigin: CompanionTranscriptStore.normalizeBridgeOrigin(localBridgeUrl),
+      localAssistantId: identity.profileId,
+      localRoomId: identity.roomId
+    };
+  }
+
+  private async persistPhoneTranscript(entry: VoiceTranscriptEntry, identity: CompanionVoiceIdentity): Promise<void> {
+    const partition: CompanionTranscriptPartition = {
+      bridgeUrl: entry.localBridgeOrigin ?? (this.voiceCallBridgeUrlSnapshot.length > 0
+        ? this.voiceCallBridgeUrlSnapshot : this.normalizedBridgeUrl()),
+      assistantId: entry.localAssistantId ?? identity.profileId,
+      roomId: entry.localRoomId ?? identity.roomId
+    };
+    try {
+      const context = getContext(this) as common.UIAbilityContext;
+      await CompanionTranscriptStore.appendFinal(context, partition, entry);
+      this.updatePhoneTranscriptStorageStatus(entry.itemId ?? '', 'saved');
+      this.updatePhoneTranscriptStorageWarning();
+      this.log('info', 'companion.transcript.cache.saved',
+        `role=${entry.role}; chars=${entry.text.length}; callId=${identity.callId}; officialSync=unconfirmed`);
+    } catch (error) {
+      const detail = this.errorText(error as Error);
+      this.updatePhoneTranscriptStorageStatus(entry.itemId ?? '', 'failed');
+      this.companionTranscriptStorageError = detail;
+      this.log('error', 'companion.transcript.cache.save_failed',
+        `role=${entry.role}; chars=${entry.text.length}; callId=${identity.callId}; message=${detail}`);
+    }
+  }
+
+  private async retryPhoneTranscriptSave(entry: VoiceTranscriptEntry): Promise<void> {
+    if (entry.phoneTranscript !== true || (entry.role !== 'user' && entry.role !== 'assistant')
+      || entry.callId === undefined || entry.itemId === undefined
+      || entry.localBridgeOrigin === undefined || entry.localAssistantId === undefined
+      || entry.localRoomId === undefined) {
+      this.companionTranscriptStorageError = '无法确认转写所属助手，未重试保存';
+      return;
+    }
+    const identity: CompanionVoiceIdentity = {
+      profileId: entry.localAssistantId,
+      roomId: entry.localRoomId,
+      callId: entry.callId
+    };
+    const pending: VoiceTranscriptEntry = {
+      itemId: entry.itemId,
+      role: entry.role,
+      text: entry.text,
+      final: true,
+      phoneTranscript: true,
+      localStorageStatus: 'pending',
+      callId: entry.callId,
+      localBridgeOrigin: entry.localBridgeOrigin,
+      localAssistantId: entry.localAssistantId,
+      localRoomId: entry.localRoomId
+    };
+    this.updatePhoneTranscriptStorageStatus(entry.itemId, 'pending');
+    await this.persistPhoneTranscript(pending, identity);
+  }
+
+  private updatePhoneTranscriptStorageStatus(itemId: string, status: 'pending' | 'saved' | 'failed'): void {
+    if (itemId.length === 0) {
+      return;
+    }
+    this.companionEntries = this.companionEntries.map((entry: VoiceTranscriptEntry) =>
+      entry.itemId === itemId && entry.phoneTranscript === true
+        ? this.phoneTranscriptWithStatus(entry, status) : entry);
+    this.voiceCallTranscripts = this.voiceCallTranscripts.map((entry: VoiceTranscriptEntry) =>
+      entry.itemId === itemId && entry.phoneTranscript === true
+        ? this.phoneTranscriptWithStatus(entry, status) : entry);
+  }
+
+  private phoneTranscriptWithStatus(entry: VoiceTranscriptEntry,
+    status: 'pending' | 'saved' | 'failed'): VoiceTranscriptEntry {
+    return {
+      itemId: entry.itemId, role: entry.role, text: entry.text, final: entry.final,
+      phoneTranscript: entry.phoneTranscript, callId: entry.callId,
+      localBridgeOrigin: entry.localBridgeOrigin, localAssistantId: entry.localAssistantId,
+      localRoomId: entry.localRoomId, localStorageStatus: status
+    };
+  }
+
+  private updatePhoneTranscriptStorageWarning(): void {
+    const failedCount = this.companionEntries.filter((entry: VoiceTranscriptEntry) =>
+      entry.phoneTranscript === true && entry.localStorageStatus === 'failed').length;
+    if (failedCount > 0) {
+      this.companionTranscriptStorageError = `${failedCount} 条手机转写尚未保存到本机，请在对应消息处重试`;
+    } else if (this.companionTranscriptStorageError.indexOf('手机转写保存失败') === 0) {
+      this.companionTranscriptStorageError = '';
+    }
+  }
+
   private registerVoiceCallCallbacks(): void {
     VoiceCallService.setCallbacks({
+      onMutedChanged: (muted: boolean) => {
+        this.voiceCallMuted = muted;
+      },
+      onProgress: (stage: VoiceCallStage, startedAt: number, failure: VoiceCallFailure) => {
+        this.voiceCallStage = stage;
+        this.voiceCallStageStartedAt = startedAt;
+        this.voiceCallFailure = failure;
+      },
       onStatus: (status: VoiceCallStatus, detail: string) => {
         this.voiceCallStatus = status;
         this.voiceCallStatusDetail = detail;
         this.log(status === 'error' ? 'warn' : 'info', 'voice_call.status', `status=${status}; detail=${detail}`);
       },
-      onTranscript: (entry: VoiceTranscriptEntry) => {
-        this.appendVoiceTranscript(entry);
+      onTranscript: (entry: VoiceTranscriptEntry, identity: CompanionVoiceIdentity | null) => {
+        this.appendVoiceTranscript(entry, identity);
       },
       onHistory: (entries: VoiceTranscriptEntry[]) => {
         this.replaceVoiceTranscriptHistory(entries);
@@ -8898,7 +9695,6 @@ struct Index {
     this.voiceCallAssistantName = this.companionProfile?.name ?? '个人助手';
     this.voiceCallTranscripts = [];
     this.voiceCallSpeaking = false;
-    this.voiceCallMuted = false;
     VoiceCallService.setMuted(false);
     this.log('info', 'voice_call.opened', `source=${source}`);
     void this.startVoiceCallSession(source);
@@ -8909,20 +9705,45 @@ struct Index {
     if (phase === 'connecting' || phase === 'ready' || phase === 'active') {
       return;
     }
-    // This menu action opens the configured personal-assistant voice room; it never follows selectedSession.
-    const context = getContext(this) as common.UIAbilityContext;
-    const granted = await VoiceCallService.requestMicPermission(context);
-    if (!granted) {
-      this.voiceCallStatus = 'error';
-      this.voiceCallStatusDetail = '未获得麦克风权限，无法进行语音通话';
-      this.log('warn', 'voice_call.permission.denied', `source=${source}`);
-      return;
+    if (this.voiceCallStartPending) { return; }
+    this.voiceCallStartPending = true;
+    const startGeneration = ++this.voiceCallStartGeneration;
+    this.voiceCallStatus = 'connecting';
+    this.voiceCallStatusDetail = '正在检查麦克风权限';
+    this.voiceCallStage = 'channel';
+    this.voiceCallStageStartedAt = Date.now();
+    this.voiceCallFailure = '';
+    try {
+      // This menu action opens the configured personal-assistant voice room; it never follows selectedSession.
+      const context = getContext(this) as common.UIAbilityContext;
+      const granted = await VoiceCallService.requestMicPermission(context, source === 'permission_retry');
+      if (startGeneration !== this.voiceCallStartGeneration) { return; }
+      if (!granted) {
+        this.voiceCallFailure = 'mic';
+        this.voiceCallStatus = 'error';
+        this.voiceCallStatusDetail = '未获得麦克风权限，无法进行语音通话';
+        this.log('warn', 'voice_call.permission.denied', `source=${source}`);
+        return;
+      }
+      this.log('info', 'voice_call.permission.granted', `source=${source}`);
+      const profile = this.companionProfile;
+      if (profile === null) {
+        this.voiceCallFailure = 'assistant';
+        this.voiceCallStatus = 'error';
+        this.voiceCallStatusDetail = '无法确认个人助手身份，请先刷新助手会话';
+        this.log('warn', 'voice_call.identity.missing', `source=${source}`);
+        return;
+      }
+      this.voiceCallBridgeUrlSnapshot = this.normalizedBridgeUrl();
+      await VoiceCallService.connect(this.voiceCallBridgeUrlSnapshot, this.bridgeToken, profile.id, profile.roomId);
+    } finally {
+      if (startGeneration === this.voiceCallStartGeneration) { this.voiceCallStartPending = false; }
     }
-    this.log('info', 'voice_call.permission.granted', `source=${source}`);
-    await VoiceCallService.connect(this.normalizedBridgeUrl(), this.bridgeToken);
   }
 
   private closeVoiceCall(source: string): void {
+    this.voiceCallStartGeneration += 1;
+    this.voiceCallStartPending = false;
     const wasVisible = this.voiceCallVisible;
     this.voiceCallVisible = false;
     this.voiceCallSpeaking = false;
@@ -8936,26 +9757,46 @@ struct Index {
   }
 
   private toggleVoiceCallMute(): void {
-    const muted = !this.voiceCallMuted;
-    this.voiceCallMuted = muted;
+    const muted = !VoiceCallService.mutedValue();
     VoiceCallService.setMuted(muted);
     this.log('info', 'voice_call.mute', `muted=${muted}`);
   }
 
-  private appendVoiceTranscript(entry: VoiceTranscriptEntry): void {
-    if (this.companionSelected) {
-      this.companionEntries = VoiceTranscriptReducer.append(this.companionEntries, entry);
+  private appendVoiceTranscript(entry: VoiceTranscriptEntry, identity: CompanionVoiceIdentity | null): void {
+    const currentProfile = this.companionProfile;
+    let visibleEntry = entry;
+    if (identity !== null && identity.profileId.length > 0 && identity.roomId.length > 0 && identity.callId.length > 0) {
+      visibleEntry = this.preparePhoneTranscriptEntry(entry, identity);
+      const currentPartition: CompanionTranscriptPartition | null = currentProfile === null ? null : {
+        bridgeUrl: this.normalizedBridgeUrl(),
+        assistantId: currentProfile.id,
+        roomId: currentProfile.roomId
+      };
+      const callPartition: CompanionTranscriptPartition = {
+        bridgeUrl: this.voiceCallBridgeUrlSnapshot.length > 0
+          ? this.voiceCallBridgeUrlSnapshot : this.normalizedBridgeUrl(),
+        assistantId: identity.profileId,
+        roomId: identity.roomId
+      };
+      const currentMatchesCall = currentPartition !== null
+        && CompanionTranscriptStore.partitionKey(currentPartition) === CompanionTranscriptStore.partitionKey(callPartition);
+      if (this.companionSelected && currentMatchesCall
+        && this.companionTranscriptPartitionKey === CompanionTranscriptStore.partitionKey(callPartition)) {
+        this.companionEntries = VoiceTranscriptReducer.append(this.companionEntries, visibleEntry);
+      }
+      if (visibleEntry.final) {
+        void this.persistPhoneTranscript(visibleEntry, identity);
+      }
     }
-    const next = VoiceTranscriptReducer.append(this.voiceCallTranscripts, entry);
-    this.voiceCallTranscripts = next.length > 200 ? next.slice(next.length - 200) : next;
+    this.voiceCallTranscripts = VoiceTranscriptReducer.append(this.voiceCallTranscripts, visibleEntry);
     if (entry.final) {
-      this.log('info', 'voice_call.transcript.final', `role=${entry.role}; chars=${entry.text.length}`);
+      this.log('info', 'voice_call.transcript.final', `role=${entry.role}; chars=${entry.text.length}; identity=${identity !== null}`);
     }
   }
 
   private replaceVoiceTranscriptHistory(entries: VoiceTranscriptEntry[]): void {
     const merged = VoiceTranscriptReducer.replaceHistory(entries, this.voiceCallTranscripts);
-    this.voiceCallTranscripts = merged.length > 200 ? merged.slice(merged.length - 200) : merged;
+    this.voiceCallTranscripts = merged;
     this.log('info', 'voice_call.history.loaded', `entries=${entries.length}; visible=${this.voiceCallTranscripts.length}`);
   }
 
@@ -9076,7 +9917,6 @@ struct Index {
   private changeThemeMode(mode: string): void {
     this.themeMode = normalizeThemeMode(mode);
     this.applyThemeMode();
-    this.themeModeChooserVisible = false;
     this.homeActionMenuVisible = false;
     this.homeActionMenuSource = '';
     this.homeActionMenuOpenedAt = 0;
@@ -9237,7 +10077,7 @@ struct Index {
   private confirmHardRestartCodexFromPhone(source: string): void {
     AlertDialog.show({
       title: '重启 Codex 桌面',
-      message: '此操作会重启桌面 Codex 并尝试重新注入 CDP。只在普通软恢复无效时使用。',
+      message: '此操作会重启桌面 Codex，并重新开启手机连接接口。请先保存电脑上正在进行的工作。',
       autoCancel: true,
       alignment: DialogAlignment.Center,
       primaryButton: {
@@ -11328,6 +12168,12 @@ struct Index {
     return this.normalizeVisibleSessionEntries(indexedEntries.map((item: SessionEntryWithOrder): CodexSessionEntry => item.entry));
   }
 
+  private hasNewSessionConversation(): boolean {
+    return this.visibleOptimisticSessionMessages().length > 0
+      || this.visibleNewSessionEntries().length > 0
+      || this.visibleFailedSessionMessages().length > 0;
+  }
+
   private visibleNewSessionEntries(): CodexSessionEntry[] {
     if (!this.hasNewSessionTask()) {
       return [];
@@ -11363,9 +12209,21 @@ struct Index {
     return this.taskLiveEntries(this.currentTask);
   }
 
+  private liveUserMessageStatus(): string {
+    const task = this.selectedVisibleTask();
+    if (task === null) return '';
+    if (task.status === 'submitted' && this.isSubmittedOutboxReceipt(task)) return '已发送';
+    if (task.runtime?.kind === 'durable_outbox') return '已排队';
+    if (this.taskBlocksDesktopConversation(task)) return '等待连接后发送';
+    if (task.events.some((event: BridgeEvent) => event.type === 'codex.app_server.user_message.persisted')) {
+      return '已发送';
+    }
+    return '已提交 · 等待确认';
+  }
+
   private taskLiveEntries(task: BridgeTask): CodexSessionEntry[] {
     const entries: CodexSessionEntry[] = [];
-    if (task.status !== 'failed' && task.prompt.trim().length > 0 && !this.taskBlocksDesktopConversation(task) && !this.taskIsFailedMessageRetry(task)) {
+    if (task.status !== 'failed' && task.prompt.trim().length > 0 && !this.taskIsFailedMessageRetry(task)) {
       // Terminal server history may lag behind the status flip; keep the bubble until the
       // canonical user entry lands so it does not blink away and back on the next refresh.
       if (task.status !== 'completed' && task.status !== 'interrupted' || !this.serverUserHistoryCoversTaskMessage(task)) {
@@ -11373,11 +12231,13 @@ struct Index {
           timestamp: task.createdAt,
           type: 'live_user_message',
           role: 'user',
+          threadId: this.taskSessionId(task),
+          turnId: task.activeCodexTurnId ?? undefined,
           text: task.prompt
         });
       }
     }
-    if (task.status === 'completed' || task.status === 'interrupted') {
+    if (task.status === 'completed' || task.status === 'interrupted' || task.status === 'submitted' && this.isSubmittedOutboxReceipt(task)) {
       return entries;
     }
     const streamingText = this.streamingAgentTextForTask(task);
@@ -11472,8 +12332,19 @@ struct Index {
 
   private sessionEntriesContain(entries: CodexSessionEntry[], candidate: CodexSessionEntry): boolean {
     return entries.some((entry: CodexSessionEntry) => {
-      return entry.role === candidate.role
-        && this.normalizeComparableSessionText(entry.text) === this.normalizeComparableSessionText(candidate.text);
+      if (entry.role !== candidate.role
+        || this.normalizeComparableSessionText(entry.text) !== this.normalizeComparableSessionText(candidate.text)) {
+        return false;
+      }
+      if (candidate.type === 'live_user_message') {
+        if (candidate.turnId && entry.turnId && candidate.turnId !== entry.turnId) return false;
+        // An older identical prompt must not consume this new submission. Some
+        // file-backed entries have no turn ID; require a current timestamp too.
+        const candidateTime = Date.parse(candidate.timestamp);
+        const entryTime = Date.parse(entry.timestamp);
+        return Number.isFinite(candidateTime) && Number.isFinite(entryTime) && entryTime >= candidateTime;
+      }
+      return true;
     });
   }
 
@@ -11482,9 +12353,12 @@ struct Index {
     if (session === null || session.id !== this.taskSessionId(task)) {
       return false;
     }
-    const expected = this.normalizeComparableSessionText(task.prompt);
-    return session.entries.some((entry: CodexSessionEntry) => {
-      return entry.role === 'user' && this.normalizeComparableSessionText(entry.text) === expected;
+    return this.sessionEntriesContain(session.entries, {
+      timestamp: task.createdAt,
+      type: 'live_user_message',
+      role: 'user',
+      text: task.prompt,
+      turnId: task.activeCodexTurnId ?? undefined
     });
   }
 
@@ -11635,6 +12509,12 @@ struct Index {
     return '';
   }
 
+  private searchSessionResults(): CodexSessionSummary[] {
+    const query = this.sessionSearchQuery.trim().toLowerCase();
+    return this.sessions.filter((session: CodexSessionSummary) =>
+      `${session.title} ${session.projectLabel ?? ''}`.toLowerCase().includes(query));
+  }
+
   private sessionProjectLabels(): string[] {
     const labels: string[] = [];
     this.sessions.forEach((session: CodexSessionSummary) => {
@@ -11664,24 +12544,40 @@ struct Index {
     request.questions.forEach((question: BridgeUserInputQuestion) => {
       answers[question.id] = [this.userInputAnswer(question.id).trim()];
     });
-    await this.guard('answerUserInput', async () => {
+    const task = this.approvalContextTask();
+    const navigation = this.readSessionNavigation();
+    this.setInteractionBusy('bridge', request.threadId, request.id, true);
+    this.interactionSubmitError = '';
+    try {
       await BridgeClient.answerUserInput(
         this.normalizedBridgeUrl(),
         request.id,
         answers,
         this.bridgeToken
       );
-      this.userInputAnswers = {};
+      if (this.readSessionNavigation().revision !== navigation.revision) {
+        return;
+      }
+      this.clearInteractionAnswers('bridge', request.threadId, request.id);
       this.message = '回答已提交，Codex 正在继续处理';
       this.log('info', 'user_input.answered.client', `requestId=${request.id}; questionCount=${request.questions.length}`);
-      if (this.currentTask !== null) {
-        this.currentTask = await BridgeClient.getCodexRun(
-          this.normalizedBridgeUrl(),
-          this.currentTask.id,
-          this.bridgeToken
-        );
+      if (task !== null && this.currentTask?.id === task.id) {
+        await this.refreshInteractionTask(task, navigation.revision);
       }
-    });
+    } catch (error) {
+      if (this.readSessionNavigation().revision === navigation.revision) {
+        this.interactionSubmitError = `回答提交失败：${this.errorText(error)}`;
+        try {
+          if (task !== null && this.currentTask?.id === task.id) {
+            await this.refreshInteractionTask(task, navigation.revision);
+          }
+        } catch (refreshError) {
+          this.log('warn', 'user_input.refresh.failed', this.errorText(refreshError));
+        }
+      }
+    } finally {
+      this.setInteractionBusy('bridge', request.threadId, request.id, false);
+    }
   }
 
   private sessionMonitorSummaryText(): string {
@@ -12213,7 +13109,7 @@ struct Index {
   }
 
   private sessionSidebarTimeWidth(): number {
-    return Math.ceil(84 * fontScalePercent(this.fontScaleMode) / 100);
+    return Math.ceil(64 * fontScalePercent(this.fontScaleMode) / 100);
   }
 
   private sessionDetailTimeLabel(): string {
@@ -12968,6 +13864,7 @@ struct Index {
   }
 
   private taskSummaryText(task: BridgeTask): string {
+    if (task.status === 'submitted' && this.isSubmittedOutboxReceipt(task)) return '消息已进入 Codex 官方会话';
     if (task.runtime?.kind === 'durable_outbox' && task.runtime?.state === 'uncertain') {
       return task.error || '送达结果待核对，已停止自动重发';
     }
@@ -13882,23 +14779,11 @@ struct Index {
   }
 
   private markdownHeadingFontSize(level: number, isUser: boolean): number {
-    if (level <= 1) {
-      return isUser ? 14 : 13;
-    }
-    if (level === 2) {
-      return isUser ? 13 : 12;
-    }
-    return isUser ? 12 : 11;
+    return level <= 1 ? 19 : level === 2 ? 17 : 16;
   }
 
   private markdownHeadingLineHeight(level: number, isUser: boolean): number {
-    if (level <= 1) {
-      return isUser ? 20 : 19;
-    }
-    if (level === 2) {
-      return isUser ? 19 : 18;
-    }
-    return isUser ? 17 : 16;
+    return level <= 1 ? 30 : level === 2 ? 28 : 26;
   }
 
   private markdownInlineDisplayText(text: string): string {
@@ -14017,6 +14902,141 @@ struct Index {
     return this.isLandscapeSessionLayout() ? '72%' : '58%';
   }
 
+  private async refreshInteractionTask(task: BridgeTask | null, navigationRevision: number): Promise<void> {
+    if (task === null || this.currentTask?.id !== task.id) {
+      return;
+    }
+    const refreshed = this.taskUsesCodexRunApi(task)
+      ? await BridgeClient.getCodexRun(this.normalizedBridgeUrl(), task.id, this.bridgeToken, this.currentTaskEventCursor(task))
+      : await BridgeClient.getTask(this.normalizedBridgeUrl(), task.id, this.bridgeToken, this.currentTaskEventCursor(task));
+    if (this.readSessionNavigation().revision !== navigationRevision || this.currentTask === null || this.currentTask.id !== task.id) {
+      return;
+    }
+    this.currentTask = this.mergeTaskEventPage(this.currentTask, refreshed);
+    this.syncSessionTaskMarkers(this.currentTask);
+    this.startPolling();
+  }
+
+  private desktopInteractionSessionId(): string {
+    if (this.isNewSessionDraft || this.selectedSession === null) {
+      return '';
+    }
+    const navigation = this.readSessionNavigation();
+    return navigation.mode === 'session' && navigation.sessionId === this.selectedSession.id
+      ? this.selectedSession.id : '';
+  }
+
+  private visibleDesktopInteractions(): BridgeDesktopInteraction[] {
+    const threadId = this.desktopInteractionSessionId();
+    return threadId.length === 0 ? [] : this.desktopInteractions.filter((request: BridgeDesktopInteraction) => {
+      return request.threadId === threadId && request.status === 'pending';
+    });
+  }
+
+  private async refreshDesktopInteractions(): Promise<void> {
+    const threadId = this.desktopInteractionSessionId();
+    if (threadId.length === 0) {
+      return;
+    }
+    const navigation = this.readSessionNavigation();
+    const requestSeq = ++this.desktopInteractionRefreshSeq;
+    try {
+      const requests = await BridgeClient.listDesktopInteractions(this.normalizedBridgeUrl(), threadId, this.bridgeToken);
+      if (requestSeq !== this.desktopInteractionRefreshSeq
+        || !this.isSessionNavigationCurrent(navigation.revision, threadId)
+        || this.desktopInteractionSessionId() !== threadId) {
+        return;
+      }
+      this.desktopInteractions = requests.filter((request: BridgeDesktopInteraction) => {
+        return request.threadId === threadId && request.status === 'pending';
+      });
+      this.desktopInteractionError = '';
+    } catch (error) {
+      if (requestSeq === this.desktopInteractionRefreshSeq
+        && this.isSessionNavigationCurrent(navigation.revision, threadId)
+        && this.desktopInteractionSessionId() === threadId) {
+        this.desktopInteractionError = `待处理请求刷新失败：${this.errorText(error)}`;
+      }
+    }
+  }
+
+  private isInteractionBusy(source: string, threadId: string, requestId: string): boolean {
+    return this.interactionBusyKeys.includes(JSON.stringify([source, threadId, requestId]));
+  }
+
+  private setInteractionBusy(source: string, threadId: string, requestId: string, busy: boolean): void {
+    const key = JSON.stringify([source, threadId, requestId]);
+    const next = this.interactionBusyKeys.filter((item: string) => item !== key);
+    if (busy) {
+      next.push(key);
+    }
+    this.interactionBusyKeys = next;
+  }
+
+  private clearInteractionAnswers(source: string, threadId: string, requestId: string): void {
+    const prefix = JSON.stringify([source, threadId, requestId]).slice(0, -1) + ',';
+    const next: Record<string, string> = {};
+    Object.keys(this.userInputAnswers).forEach((key: string) => {
+      if (!key.startsWith(prefix)) {
+        next[key] = this.userInputAnswers[key];
+      }
+    });
+    this.userInputAnswers = next;
+  }
+
+  private setDesktopInteractionAnswer(request: BridgeDesktopInteraction, questionId: string, value: string): void {
+    if (request.threadId === this.desktopInteractionSessionId()
+      && !this.isInteractionBusy('desktop', request.threadId, request.id)
+      && this.visibleDesktopInteractions().some((item: BridgeDesktopInteraction) => item.id === request.id)) {
+      this.setInteractionAnswer('desktop', request.threadId, request.id, questionId, value);
+    }
+  }
+
+  private async respondDesktopInteraction(request: BridgeDesktopInteraction, decision: string): Promise<void> {
+    const threadId = this.desktopInteractionSessionId();
+    if (request.threadId !== threadId || request.status !== 'pending' || request.supportsResponse !== true
+      || this.isInteractionBusy('desktop', threadId, request.id)
+      || !this.visibleDesktopInteractions().some((item: BridgeDesktopInteraction) => item.id === request.id)) {
+      return;
+    }
+    const response: BridgeDesktopInteractionResponse = { threadId };
+    if (request.kind === 'approval' && (decision === 'approved' || decision === 'denied')) {
+      response.decision = decision;
+    } else if (request.kind === 'user-input' && request.questions.length > 0) {
+      const answers: Record<string, string[]> = {};
+      for (const question of request.questions) {
+        const answer = this.interactionAnswer('desktop', threadId, request.id, question.id).trim();
+        if (answer.length === 0) {
+          return;
+        }
+        answers[question.id] = [answer];
+      }
+      response.answers = answers;
+    } else {
+      return;
+    }
+    const navigation = this.readSessionNavigation();
+    this.setInteractionBusy('desktop', threadId, request.id, true);
+    this.interactionSubmitError = '';
+    try {
+      await BridgeClient.respondDesktopInteraction(this.normalizedBridgeUrl(), request.id, response, this.bridgeToken);
+      if (!this.isSessionNavigationCurrent(navigation.revision, threadId)) {
+        return;
+      }
+      this.clearInteractionAnswers('desktop', threadId, request.id);
+      this.message = request.kind === 'approval' ? '桌面已确认处理结果' : '桌面已确认收到回答';
+    } catch (error) {
+      if (this.isSessionNavigationCurrent(navigation.revision, threadId)) {
+        this.interactionSubmitError = `${request.title || '桌面请求'}提交失败：${this.errorText(error)}`;
+      }
+    } finally {
+      if (this.isSessionNavigationCurrent(navigation.revision, threadId)) {
+        await this.refreshDesktopInteractions();
+      }
+      this.setInteractionBusy('desktop', threadId, request.id, false);
+    }
+  }
+
   private pendingUserInput(): BridgeUserInput | null {
     const task = this.selectedVisibleTask();
     if (task?.pendingUserInput && task.pendingUserInput.status === 'pending') {
@@ -14031,21 +15051,33 @@ struct Index {
   }
 
   private userInputAnswer(questionId: string): string {
-    return this.userInputAnswers[questionId] ?? '';
+    const request = this.pendingUserInput();
+    return request === null ? '' : this.interactionAnswer('bridge', request.threadId, request.id, questionId);
   }
 
   private setUserInputAnswer(questionId: string, value: string): void {
+    const request = this.pendingUserInput();
+    if (request !== null && !this.isInteractionBusy('bridge', request.threadId, request.id)) {
+      this.setInteractionAnswer('bridge', request.threadId, request.id, questionId, value);
+    }
+  }
+
+  private interactionAnswer(source: string, threadId: string, requestId: string, questionId: string): string {
+    return this.userInputAnswers[JSON.stringify([source, threadId, requestId, questionId])] ?? '';
+  }
+
+  private setInteractionAnswer(source: string, threadId: string, requestId: string, questionId: string, value: string): void {
     const next: Record<string, string> = {};
     Object.keys(this.userInputAnswers).forEach((key: string) => {
       next[key] = this.userInputAnswers[key];
     });
-    next[questionId] = value;
+    next[JSON.stringify([source, threadId, requestId, questionId])] = value;
     this.userInputAnswers = next;
   }
 
   private canAnswerPendingUserInput(): boolean {
     const request = this.pendingUserInput();
-    if (request === null || this.isBusy) {
+    if (request === null || this.isInteractionBusy('bridge', request.threadId, request.id) || request.questions.length === 0) {
       return false;
     }
     return request.questions.every((question: BridgeUserInputQuestion) => {
@@ -14396,6 +15428,7 @@ struct Index {
   }
 
   private statusLabel(status: string): string {
+    if (status === 'submitted') return '已送达';
     if (status === 'completed') {
       return '已完成';
     }

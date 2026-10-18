@@ -816,6 +816,7 @@ export class CodexDesktopCdpAdapter {
     let consecutiveThreadPollFailures = 0;
     let latestOfficialTurnStatus = '';
     let latestOfficialThreadStatus = '';
+    let interactionPendingAt = 0;
     let promptPersisted = false;
     const emitPromptPersisted = (source, extra = {}) => {
       if (promptPersisted) {
@@ -859,12 +860,6 @@ export class CodexDesktopCdpAdapter {
           });
         }
       }
-      const elapsedMs = Date.now() - startedAt;
-      const idleMs = Date.now() - lastActivityAt;
-      if (elapsedMs > timeoutMs && idleMs > this.idleTimeoutMs) {
-        break;
-      }
-
       const completed = notifications.find((message) => {
         if (message.method !== 'turn/completed') {
           return false;
@@ -911,6 +906,14 @@ export class CodexDesktopCdpAdapter {
           const polledTurn = findTurn(detail.thread, turnId);
           latestOfficialTurnStatus = normalizeDesktopRuntimeStatus(polledTurn?.status ?? '');
           latestOfficialThreadStatus = normalizeDesktopRuntimeStatus(detail.thread?.status ?? '');
+          // A confirmed human decision is activity, even without new model tokens.
+          // Failed polls do not renew this lease: disconnected tasks still time out.
+          if (desktopWaitingForInteraction(detail.thread?.status) || desktopWaitingForInteraction(polledTurn?.status)) {
+            lastActivityAt = Date.now();
+            interactionPendingAt = lastActivityAt;
+          } else {
+            interactionPendingAt = 0;
+          }
           if (turnHasPromptUserMessage(polledTurn, prompt)) {
             emitPromptPersisted('thread_read_poll');
           }
@@ -920,7 +923,7 @@ export class CodexDesktopCdpAdapter {
             status: polledTurn?.status ?? detail.thread?.status
           }));
           const turn = polledTurn;
-          if (turn && turn.status !== 'inProgress') {
+          if (turn && ['completed', 'failed', 'interrupted'].includes(normalizeDesktopRuntimeStatus(turn.status))) {
             if (!promptPersisted && normalizeMessageForMatch(prompt).length > 0) {
               emit('codex.app_server.user_message.missing', {
                 threadId,
@@ -957,6 +960,10 @@ export class CodexDesktopCdpAdapter {
         }
       }
 
+      if (Date.now() - startedAt > timeoutMs && Date.now() - lastActivityAt > this.idleTimeoutMs
+        && (!interactionPendingAt || Date.now() - interactionPendingAt > 5000)) {
+        break;
+      }
       await sleep(250);
     }
     if (sessionFileCursor) {
@@ -1991,7 +1998,15 @@ function normalizeDesktopRuntimeStatus(status) {
 
 function isDesktopRuntimeInProgress(status) {
   const normalized = normalizeDesktopRuntimeStatus(status).toLowerCase().replace(/[-_ ]/g, '');
-  return normalized === 'inprogress' || normalized === 'running' || normalized === 'active' || normalized === 'queued';
+  return normalized === 'inprogress' || normalized === 'running' || normalized === 'active' || normalized === 'queued'
+    || desktopWaitingForInteraction(status);
+}
+
+export function desktopWaitingForInteraction(status) {
+  const normalized = normalizeDesktopRuntimeStatus(status).toLowerCase().replace(/[-_ ]/g, '');
+  if (['waitingapproval', 'waitinginput', 'waitingforapproval', 'waitingforinput'].includes(normalized)) return true;
+  return normalized === 'active' && Array.isArray(status?.activeFlags)
+    && status.activeFlags.some(flag => /approval|input|question/i.test(String(flag)));
 }
 
 function isTurnAbortedText(value) {

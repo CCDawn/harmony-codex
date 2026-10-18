@@ -5,6 +5,11 @@ export interface OptimisticSessionImage {
   mimeType: string;
 }
 
+export interface OptimisticSessionFile {
+  id: string;
+  fileName: string;
+}
+
 export interface OptimisticSessionMessage {
   id: string;
   sessionId: string;
@@ -13,6 +18,7 @@ export interface OptimisticSessionMessage {
   submissionId: string;
   text: string;
   images: OptimisticSessionImage[];
+  files: OptimisticSessionFile[];
   createdAt: string;
 }
 

@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
   [int]$CdpPort = 9229,
   [string]$BridgeUrl = 'http://127.0.0.1:8787',
@@ -7,11 +7,33 @@ param(
   [string]$CodexAppPath = '',
   [switch]$KeepExistingCodex,
   [switch]$UsePackagedActivation,
-  [switch]$RefusePlainCodex
+  [switch]$RefusePlainCodex,
+  [switch]$StartOnly,
+  [switch]$GuardianRepair,
+  [string]$GuardianConfigVersion = '',
+  [string]$GuardianControlVersion = ''
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+function Assert-GuardianDesktopRepairAllowed {
+  if (-not $GuardianRepair) { return }
+  $allowed=$false
+  try {
+    $configPath=Join-Path $repoRoot 'logs\state\mobile-link-guardian-config.json'
+    $controlPath=Get-MobileLinkStatePath $repoRoot
+    $config=Get-Content -Raw -LiteralPath $configPath | ConvertFrom-Json
+    $controlVersion=if (Test-Path -LiteralPath $controlPath) { (Get-FileHash -LiteralPath $controlPath -Algorithm SHA256).Hash } else { 'missing' }
+    $allowed=$config.enabled -eq $true -and ($StartOnly -or $config.allowForceRestart -eq $true) -and
+      $GuardianConfigVersion -ne '' -and (Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash -eq $GuardianConfigVersion -and
+      $GuardianControlVersion -ne '' -and $controlVersion -eq $GuardianControlVersion -and -not (Test-MobileLinkPaused $repoRoot)
+  } catch { $allowed=$false }
+  if (-not $allowed) {
+    Write-Host 'Guardian desktop recovery cancelled: persisted intent changed.'
+    exit 12
+  }
+}
 
 function Resolve-CompatiblePowerShellHost {
   $currentHost = Get-Process -Id $PID -ErrorAction SilentlyContinue
@@ -222,6 +244,7 @@ function Stop-DesktopLiveHost {
     foreach ($child in $children) {
       Stop-ProcessTreeLocal -TargetProcessId ([int]$child.ProcessId)
     }
+    Assert-GuardianDesktopRepairAllowed
     Stop-Process -Id $TargetProcessId -Force -ErrorAction SilentlyContinue
   }
 
@@ -256,6 +279,7 @@ function Stop-CodexDesktopShell {
 
     foreach ($proc in $desktopProcesses) {
       Write-Host "停止 Codex 桌面进程 PID=$($proc.ProcessId)" -ForegroundColor DarkGray
+      Assert-GuardianDesktopRepairAllowed
       Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue
     }
 
@@ -398,6 +422,7 @@ if (-not $relaunchMutexOwned) {
 
 try {
 $repoRoot = Split-Path -Parent $PSScriptRoot
+if ($GuardianRepair) { . (Join-Path $repoRoot 'tools\windows\mobile-link-lifecycle.ps1') }
 $BridgeUrl = $BridgeUrl.TrimEnd('/')
 $codexAppDir = Resolve-CodexAppDir -ExplicitPath $CodexAppPath
 $packagedDesktopExe = Join-Path $codexAppDir 'ChatGPT.exe'
@@ -412,9 +437,17 @@ if ($RefusePlainCodex -and (Test-PlainCodexShellRunning)) {
   Write-Host '检测到普通 Codex 正在运行，已停止自动拉起。'
   exit 11
 }
+if ($StartOnly -and @(Get-CodexDesktopProcesses).Count -gt 0) {
+  Write-Host 'Codex 已在运行，本次仅启动请求不操作现有桌面。'
+  exit 11
+}
 if (-not $KeepExistingCodex) {
-  Stop-DesktopLiveHost
-  Stop-CodexDesktopShell
+  if (-not $StartOnly) {
+    Assert-GuardianDesktopRepairAllowed
+    Stop-DesktopLiveHost
+    Assert-GuardianDesktopRepairAllowed
+    Stop-CodexDesktopShell
+  }
 } else {
   Write-Host "保留现有 Codex 进程；如果单实例拦截启动参数，CDP 可能不会出现。" -ForegroundColor Yellow
 }
@@ -441,12 +474,16 @@ if ($KeepExistingCodex -and (Test-CdpReady -Port $selectedCdpPort)) {
 } elseif ($KeepExistingCodex) {
   throw "保留现有 Codex 时 CDP 端口未在线: 127.0.0.1:$selectedCdpPort。为避免启动第二个 Codex 桌面壳或触发 Electron 协议弹窗，已停止注入。请手动重启带 CDP 的 Codex，或不使用 -KeepExistingCodex。"
 } elseif ($UsePackagedActivation -and -not [string]::IsNullOrWhiteSpace($appUserModelId)) {
+  if ($StartOnly -and @(Get-CodexDesktopProcesses).Count -gt 0) { exit 11 }
+  Assert-GuardianDesktopRepairAllowed
   $activatedProcessId = Start-PackagedCodex -AppUserModelId $appUserModelId -Arguments $argumentString
   Write-Host "已通过 Windows AppUserModelId 激活 Codex PID=$activatedProcessId" -ForegroundColor DarkGray
 } else {
   if (-not (Test-Path -LiteralPath $codexDesktopExe)) {
     throw "Codex 桌面可执行文件不存在: $codexDesktopExe"
   }
+  if ($StartOnly -and @(Get-CodexDesktopProcesses).Count -gt 0) { exit 11 }
+  Assert-GuardianDesktopRepairAllowed
   Start-Process -FilePath $codexDesktopExe -ArgumentList $arguments -WorkingDirectory $codexAppDir
   Write-Host "已直接启动 Codex Electron 桌面壳并保留 CDP 参数: $codexDesktopExe" -ForegroundColor DarkGray
 }
@@ -457,6 +494,7 @@ $pages = @($targets | Where-Object { $_.type -eq 'page' })
 Write-Host "CDP targets: $(@($targets).Count), pages: $($pages.Count)" -ForegroundColor DarkGray
 
 Write-Step "启动桌面 CDP live host"
+Assert-GuardianDesktopRepairAllowed
 Stop-DesktopLiveHost
 $hostStdout = Join-Path $repoRoot 'logs\startup\desktop-cdp-live-host.stdout.log'
 $hostStderr = Join-Path $repoRoot 'logs\startup\desktop-cdp-live-host.stderr.log'
@@ -467,6 +505,7 @@ $hostCommand = @"
 `$env:CODEX_DESKTOP_CDP_PORT='$selectedCdpPort'
 node .\scripts\start-desktop-cdp-live-host.mjs
 "@
+Assert-GuardianDesktopRepairAllowed
 Start-Process -WindowStyle Hidden -FilePath $powerShellHostPath -ArgumentList @(
   '-NoProfile',
   '-ExecutionPolicy', 'Bypass',

@@ -1,11 +1,17 @@
 import net from 'node:net';
 import { once } from 'node:events';
+import { PassThrough } from 'node:stream';
+import { setTimeout as delay } from 'node:timers/promises';
 
 // /voice WebSocket 代理：不解析、不终结 WebSocket——把客户端原始 upgrade 请求
 // （请求行 + rawHeaders）原样转发给 127.0.0.1:voicePort 上的 voice_server.py，
 // 之后双向裸字节管道。WS 握手（含 Sec-WebSocket-Accept 计算）由上游端到端完成，
 // 与手机→中继→桥的纯 TCP 透传形态一致。只记录连接/断开/错误事件，不记帧内容。
 const VOICE_PATHNAME = '/voice';
+// Keep the entire lazy-start budget below the phone's eight-second WS timeout.
+const UPSTREAM_START_TIMEOUT_MS = 6_000;
+const CONNECT_ATTEMPT_TIMEOUT_MS = 750;
+const CONNECT_RETRY_DELAY_MS = 150;
 
 export function attachVoiceUpgrade({ server, config, logger, authGate, supervisor }) {
   server.on('upgrade', (request, socket, head) => {
@@ -27,6 +33,19 @@ async function handleVoiceUpgrade({ request, socket, head, config, logger, authG
     return;
   }
 
+  const abort = new AbortController();
+  const cancel = () => abort.abort();
+  socket.once('close', cancel);
+  socket.once('end', cancel);
+  socket.on('error', cancel);
+  socket.read(0);
+  let pending = null;
+  let upstream = null;
+  let timer = null;
+  let timedOut = false;
+  let attempts = 0;
+  let startedAt = null;
+  let connected = false;
   try {
     // /voice 不在 loopback 豁免名单内：走与普通路由一致的完整鉴权闸门
     // （token + TOTP 开启时的动态码）。失败路径由这里改成裸 TCP 响应，
@@ -43,9 +62,20 @@ async function handleVoiceUpgrade({ request, socket, head, config, logger, authG
       return;
     }
 
+    abort.signal.throwIfAborted();
+    // Consume EOF while starting, with bounded stream backpressure for any early
+    // bytes. Preserve them until the upstream receives the original upgrade head.
+    pending = new PassThrough();
+    socket.pipe(pending);
+    startedAt = performance.now();
+    timer = setTimeout(() => {
+      timedOut = true;
+      abort.abort();
+    }, UPSTREAM_START_TIMEOUT_MS);
     try {
-      await supervisor.ensureRunning();
+      await withAbort(supervisor.ensureRunning(), abort.signal);
     } catch (error) {
+      if (abort.signal.aborted) throw error;
       logEvent(logger, 'error', 'voice.upstream.start_failed', {
         message: error?.message ?? String(error)
       });
@@ -53,27 +83,24 @@ async function handleVoiceUpgrade({ request, socket, head, config, logger, authG
       return;
     }
 
-    // 懒启动在 spawn 即返回，Python 绑定 voicePort 还需 1-2s；
-    // 首连用短退避重试兜住冷启动窗口，避免客户端白白吃一次 502。
-    let upstream = null;
-    for (let attempt = 1; attempt <= 4; attempt += 1) {
+    while (!upstream) {
+      abort.signal.throwIfAborted();
+      attempts += 1;
       const candidate = net.connect({ host: '127.0.0.1', port: config.voicePort });
-      try {
-        await once(candidate, 'connect');
-        upstream = candidate;
-        break;
-      } catch {
-        candidate.destroy();
-        await new Promise((resolve) => setTimeout(resolve, 450));
-      }
-    }
-    if (!upstream) {
-      logEvent(logger, 'warn', 'voice.upstream.unreachable', {
-        voicePort: config.voicePort,
-        attempts: 4
+      candidate.on('error', () => {});
+      candidate.setTimeout(CONNECT_ATTEMPT_TIMEOUT_MS, () => {
+        candidate.destroy(new Error('voice upstream connect timed out'));
       });
-      writeRawRejection(socket, 502, 'Bad Gateway');
-      return;
+      try {
+        await once(candidate, 'connect', { signal: abort.signal });
+        abort.signal.throwIfAborted();
+        candidate.setTimeout(0);
+        upstream = candidate;
+      } catch (error) {
+        candidate.destroy();
+        if (abort.signal.aborted) throw error;
+        await delay(CONNECT_RETRY_DELAY_MS, undefined, { signal: abort.signal });
+      }
     }
     socket.setNoDelay(true);
     upstream.setNoDelay(true);
@@ -82,12 +109,14 @@ async function handleVoiceUpgrade({ request, socket, head, config, logger, authG
     if (head && head.length > 0) {
       upstream.write(head);
     }
-    socket.pipe(upstream);
+    pending.pipe(upstream);
     upstream.pipe(socket);
 
     logEvent(logger, 'info', 'voice.tunnel.opened', {
       remoteAddress: socket.remoteAddress ?? null,
-      voicePort: config.voicePort
+      voicePort: config.voicePort,
+      attempts,
+      startupMs: Math.round(performance.now() - startedAt)
     });
 
     socket.on('error', (error) => {
@@ -98,22 +127,60 @@ async function handleVoiceUpgrade({ request, socket, head, config, logger, authG
       logEvent(logger, 'warn', 'voice.tunnel.upstream_error', { message: error?.message ?? String(error) });
       socket.destroy();
     });
+    let closed = false;
     const closeTunnel = () => {
+      if (closed) return;
+      closed = true;
       logEvent(logger, 'info', 'voice.tunnel.closed', {
         remoteAddress: socket.remoteAddress ?? null,
         voicePort: config.voicePort
       });
       socket.destroy();
       upstream.destroy();
+      pending.destroy();
     };
     socket.once('close', closeTunnel);
     upstream.once('close', closeTunnel);
+    connected = true;
   } catch (error) {
+    if (abort.signal.aborted) {
+      if (timedOut) {
+        logEvent(logger, 'warn', 'voice.upstream.unreachable', {
+          voicePort: config.voicePort, attempts,
+          startupMs: Math.round(performance.now() - startedAt)
+        });
+        writeRawRejection(socket, 502, 'Bad Gateway');
+      } else {
+        socket.destroy();
+      }
+      return;
+    }
     logEvent(logger, 'error', 'voice.upgrade.failed', {
       message: error?.message ?? String(error)
     });
     writeRawRejection(socket, 502, 'Bad Gateway');
+  } finally {
+    clearTimeout(timer);
+    socket.off('close', cancel);
+    socket.off('end', cancel);
+    socket.off('error', cancel);
+    if (!connected) {
+      if (pending) socket.unpipe(pending);
+      pending?.destroy();
+      upstream?.destroy();
+    }
   }
+}
+
+function withAbort(promise, signal) {
+  return new Promise((resolve, reject) => {
+    const onAbort = () => reject(signal.reason);
+    signal.addEventListener('abort', onAbort, { once: true });
+    Promise.resolve(promise).then(resolve, reject).finally(() => {
+      signal.removeEventListener('abort', onAbort);
+    });
+    if (signal.aborted) onAbort();
+  });
 }
 
 // 从 upgrade request 重建原始请求头字节（method 行 + rawHeaders 原样拼回），

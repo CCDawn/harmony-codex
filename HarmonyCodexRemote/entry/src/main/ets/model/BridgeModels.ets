@@ -1,3 +1,33 @@
+export interface GuardianFault {
+  id: string;
+  title: string;
+  state: string;
+  message: string;
+}
+
+export interface GuardianHistoryEntry {
+  at: string;
+  action: string;
+  outcome: string;
+  message: string;
+}
+
+export interface GuardianStatus {
+  version: number;
+  enabled: boolean;
+  allowForceRestart: boolean;
+  phase: string;
+  summary: string;
+  checkedAt: string;
+  heartbeatAt: string;
+  lastSuccessAt: string;
+  lastRepairAt: string;
+  attempts: number;
+  nextCheckAt: string;
+  faults: GuardianFault[];
+  history: GuardianHistoryEntry[];
+}
+
 export interface BridgeProject {
   id: string;
   name: string;
@@ -317,6 +347,23 @@ export interface BridgeUserInput {
   expireReason?: string;
 }
 
+export interface BridgeDesktopInteraction {
+  id: string;
+  threadId: string;
+  kind: string;
+  status: string;
+  title: string;
+  detail: string;
+  questions: BridgeUserInputQuestion[];
+  supportsResponse: boolean;
+}
+
+export interface BridgeDesktopInteractionResponse {
+  threadId: string;
+  decision?: string;
+  answers?: Record<string, string[]>;
+}
+
 export interface BridgeOutboxItem {
   id: string;
   kind: string;
@@ -478,4 +525,17 @@ export interface VoiceTranscriptEntry {
   role: string;
   text: string;
   final: boolean;
+  /** True only for locally captured voice text whose Codex persistence is unconfirmed. */
+  phoneTranscript?: boolean;
+  /** Per-turn local durability state; never represents official Codex synchronization. */
+  localStorageStatus?: 'pending' | 'saved' | 'failed';
+  /** The voice call that produced this local transcript, when the server supplied an identity. */
+  callId?: string;
+  /** Original local partition identity used for safe retry after assistant or bridge changes. */
+  localBridgeOrigin?: string;
+  localAssistantId?: string;
+  localRoomId?: string;
 }
+
+export type VoiceCallStage = 'channel' | 'assistant' | 'media' | 'mic' | 'listening';
+export type VoiceCallFailure = '' | 'auth' | 'channel' | 'assistant' | 'media' | 'mic';

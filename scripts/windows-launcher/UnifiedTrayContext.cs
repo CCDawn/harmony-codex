@@ -19,6 +19,11 @@ internal sealed class UnifiedTrayContext : ApplicationContext
     private readonly System.Threading.EventWaitHandle exitSignal;
     private readonly System.Threading.EventWaitHandle showSignal;
     private Dictionary<string, object> snapshot;
+    private Dictionary<string, object> guardian;
+    private ToolStripMenuItem guardianToggle;
+    private ToolStripMenuItem guardianStatus;
+    private bool guardianBusy;
+    private string guardianError = "";
     private bool busy;
     private bool exiting;
     private bool pendingStatus;
@@ -38,8 +43,18 @@ internal sealed class UnifiedTrayContext : ApplicationContext
             Visible = true, Text = "Codex 手机链路" };
         var menu = new ContextMenuStrip();
         menu.Items.Add("查看统一状态", null, delegate { Execute("Status", true); });
+        guardianToggle = new ToolStripMenuItem("自动守护 · 状态未确认");
+        guardianToggle.Enabled = false;
+        guardianToggle.Click += delegate {
+            if (guardian != null) ExecuteGuardian(Convert.ToBoolean(guardian["enabled"]) ? "Disable" : "Enable", false);
+        };
+        menu.Items.Add(guardianToggle);
+        menu.Items.Add(new ToolStripMenuItem("必要时会强制重启 Codex，可能中断任务和通话") { Enabled = false });
+        guardianStatus = new ToolStripMenuItem("查看守护故障与最近修复");
+        guardianStatus.Click += delegate { ExecuteGuardian("Status", true); };
+        menu.Items.Add(guardianStatus);
         AddOperation(menu, "启动链路", "Start");
-        AddOperation(menu, "安全修复 / 补齐服务", "Repair");
+        AddOperation(menu, "修复链路（必要时重启 Codex）", "Repair");
         menu.Items.Add(new ToolStripSeparator());
         AddOperation(menu, "手机配对二维码", "Pair");
         menu.Items.Add("打开日志目录", null, delegate { OpenPath(Path.Combine(repoRoot, "logs")); });
@@ -59,11 +74,114 @@ internal sealed class UnifiedTrayContext : ApplicationContext
             if (exitSignal.WaitOne(0)) { ExitApp(); return; }
             if (showSignal.WaitOne(0)) { Execute("Status", true); }
             WriteHeartbeat();
-            if (++ticks % 6 == 0 && !busy) Execute("Maintain", false);
+            if (++ticks % 6 == 0) {
+                ExecuteGuardian("Ensure", false);
+                if (!busy) Execute("Maintain", false);
+            }
         };
         timer.Start();
         // Persisted stop survives application exit and Windows reboot.
         Execute("Status", false);
+        ExecuteGuardian("Ensure", false);
+    }
+
+    // Ensure only keeps the independent worker alive. It never changes the persisted mode.
+    private void ExecuteGuardian(string action, bool show)
+    {
+        if (guardianBusy || exiting) return;
+        guardianBusy = true;
+        guardianToggle.Enabled = false;
+        guardianStatus.Enabled = false;
+        Task.Run(delegate {
+            var script = Path.Combine(repoRoot, "tools", "windows", "mobile-link-guardian.ps1");
+            var result = Run(HiddenProcess(pwsh, "-NoProfile -ExecutionPolicy Bypass -File \"" + script + "\" -Action " + action), 30000);
+            if (exiting) return;
+            try { dispatcher.BeginInvoke((Action)delegate { CompleteGuardian(action, show, result); }); }
+            catch (InvalidOperationException) { }
+        });
+    }
+
+    private void CompleteGuardian(string action, bool show, CommandResult result)
+    {
+        if (exiting) return;
+        guardianBusy = false;
+        guardianStatus.Enabled = true;
+        Dictionary<string, object> next = null;
+        try {
+            var data = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(result.Output.Trim());
+            object value;
+            if (data != null && data.TryGetValue("guardian", out value)) next = value as Dictionary<string, object>;
+        } catch { }
+        if (result.ExitCode != 0 || next == null || !next.ContainsKey("enabled") || !(next["enabled"] is bool)
+            || !next.ContainsKey("phase") || ((action == "Enable" || action == "Disable")
+            && Convert.ToBoolean(next["enabled"]) != (action == "Enable"))) {
+            guardianError = "自动守护状态或设置未确认，请刷新状态后重试。";
+            guardianToggle.Text = "自动守护 · 状态读取失败";
+            if (show || action == "Enable" || action == "Disable")
+                MessageBox.Show(guardianError, "自动守护", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+        guardian = next;
+        guardianError = "";
+        guardianToggle.Checked = Convert.ToBoolean(guardian["enabled"]);
+        var phase = Convert.ToString(guardian["phase"]);
+        guardianToggle.Text = "自动守护 · " + (guardianToggle.Checked ? "已开启" : "已关闭")
+            + (!guardianToggle.Checked && phase == "disabled" ? "" : " · " + GuardianPhaseLabel(phase));
+        guardianToggle.Enabled = true;
+        if (show) ShowGuardianStatus();
+    }
+
+    private static string GuardianPhaseLabel(string phase)
+    {
+        switch (phase) {
+            case "disabled": return "已关闭";
+            case "checking": return "正在检查";
+            case "healthy": return "读取健康";
+            case "suspect": return "发现异常，正在确认";
+            case "repairing": return "正在修复";
+            case "cooldown": return "等待复查";
+            case "needs_attention": return "需要处理";
+            case "paused": return "链路已暂停";
+            default: return "状态未确认";
+        }
+    }
+
+    private static string GuardianValue(Dictionary<string, object> data, string key)
+    {
+        object value;
+        return data != null && data.TryGetValue(key, out value) ? Convert.ToString(value) : "";
+    }
+
+    private void ShowGuardianStatus()
+    {
+        if (guardian == null) return;
+        var text = new StringBuilder();
+        text.AppendLine(guardianToggle.Text);
+        text.AppendLine(GuardianValue(guardian, "summary"));
+        text.AppendLine("必要时会强制重启 Codex，可能中断任务和通话。");
+        text.AppendLine("模式保存在电脑；桌面重开后继续，退出管理应用或手机不影响独立守护。");
+        text.AppendLine("上次检查：" + GuardianValue(guardian, "checkedAt"));
+        text.AppendLine("最近修复：" + GuardianValue(guardian, "lastRepairAt"));
+        text.AppendLine("下次检查：" + GuardianValue(guardian, "nextCheckAt"));
+        object value;
+        text.AppendLine();
+        text.AppendLine("故障与检测：");
+        var faults = guardian.TryGetValue("faults", out value) ? value as System.Collections.IEnumerable : null;
+        if (faults != null) foreach (var entry in faults) {
+            var fault = entry as Dictionary<string, object>;
+            if (fault != null) text.AppendLine("• " + GuardianValue(fault, "title") + " · " + GuardianValue(fault, "state") + "：" + GuardianValue(fault, "message"));
+        }
+        text.AppendLine();
+        text.AppendLine("最近处理记录：");
+        var entries = new List<Dictionary<string, object>>();
+        var history = guardian.TryGetValue("history", out value) ? value as System.Collections.IEnumerable : null;
+        if (history != null) foreach (var entry in history) {
+            var record = entry as Dictionary<string, object>;
+            if (record != null) entries.Add(record);
+        }
+        for (int i = entries.Count - 1; i >= Math.Max(0, entries.Count - 5); i--)
+            text.AppendLine("• " + GuardianValue(entries[i], "at") + " · " + GuardianValue(entries[i], "action") + " · " + GuardianValue(entries[i], "outcome") + "：" + GuardianValue(entries[i], "message"));
+        MessageBox.Show(text.ToString(), "自动守护 · 状态", MessageBoxButtons.OK, MessageBoxIcon.Information);
     }
 
     private void AddOperation(ContextMenuStrip menu, string label, string action)
@@ -91,8 +209,10 @@ internal sealed class UnifiedTrayContext : ApplicationContext
         foreach (var item in operations) item.Enabled = false;
         icon.Text = "Codex 手机链路 · 正在处理";
         Task.Run(delegate {
-            var info = HiddenProcess(pwsh, "-NoProfile -ExecutionPolicy Bypass -File \"" + Path.Combine(repoRoot, "tools", "windows", "mobile-link-control.ps1") + "\" -Action " + action);
-            var result = Run(info, action == "Start" || action == "Repair" ? 180000 : 30000);
+            var repairSwitch = action == "Repair" ? " -RestartDesktop" : "";
+            var info = HiddenProcess(pwsh, "-NoProfile -ExecutionPolicy Bypass -File \"" + Path.Combine(repoRoot, "tools", "windows", "mobile-link-control.ps1") + "\" -Action " + action + repairSwitch);
+            var timeout = action == "Repair" ? 300000 : action == "Start" ? 180000 : 30000;
+            var result = Run(info, timeout);
             if (exiting) return;
             try { dispatcher.BeginInvoke((Action)delegate { Complete(action, show, result); }); } catch (InvalidOperationException) { }
         });
@@ -108,7 +228,9 @@ internal sealed class UnifiedTrayContext : ApplicationContext
         foreach (var item in operations) item.Enabled = true;
         Dictionary<string, object> data = null;
         try { data = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(result.Output.Trim()); } catch { }
-        if (result.ExitCode != 0 || data == null || data.ContainsKey("error")) {
+        bool incompleteStartup = result.ExitCode == 2 && data != null && data.ContainsKey("startupOutcome")
+            && data.ContainsKey("diagnostics") && data.ContainsKey("bridgeHealthy");
+        if ((result.ExitCode != 0 && !incompleteStartup) || data == null || data.ContainsKey("error")) {
             // Raw subprocess output can contain secrets; it never reaches the desktop UI.
             lastStatus = result.TimedOut ? "操作超时，请查看启动日志。" : "操作未完成，请查看日志和统一状态。";
             icon.Text = "Codex 手机链路 · 需要检查";
@@ -123,8 +245,14 @@ internal sealed class UnifiedTrayContext : ApplicationContext
         }
         snapshot = data;
         bool paused = Convert.ToBoolean(data["paused"]);
-        lastStatus = paused ? "已停止；点击启动链路恢复。" : "统一管理已运行。";
-        icon.Text = paused ? "Codex 手机链路 · 已停止" : "Codex 手机链路";
+        object diagnosticValue;
+        var diagnostics = data.TryGetValue("diagnostics", out diagnosticValue) ? diagnosticValue as Dictionary<string, object> : null;
+        var severity = diagnostics == null ? "unknown" : Convert.ToString(diagnostics["severity"]);
+        lastStatus = paused ? "已停止；点击启动链路恢复。" : diagnostics == null
+            ? "部分状态未检测，请刷新统一状态。" : Convert.ToString(diagnostics["summary"]);
+        icon.Text = paused ? "Codex 手机链路 · 已停止" : severity == "degraded"
+            ? "Codex 手机链路 · 连接异常" : severity == "unverified"
+            ? "Codex 手机链路 · 读取正常，通话未验收" : "Codex 手机链路 · 状态未确认";
         WriteHeartbeat();
         if (show || requestedStatus) ShowStatus();
         if (initialCheck) {
@@ -137,10 +265,45 @@ internal sealed class UnifiedTrayContext : ApplicationContext
     private void ShowStatus()
     {
         var text = new StringBuilder();
+        object startupValue;
+        var startup = snapshot.TryGetValue("startupOutcome", out startupValue) ? startupValue as Dictionary<string, object> : null;
+        if (startup != null) text.AppendLine("本次启动：" + startup["message"]);
         text.AppendLine(lastStatus);
+        text.AppendLine("自动守护：" + (guardianError.Length > 0 ? guardianError : guardianToggle.Text));
         text.AppendLine("桥接健康：" + (Convert.ToBoolean(snapshot["bridgeHealthy"]) ? "正常" : "未确认"));
         text.AppendLine("Codex 实时连接：" + (Convert.ToBoolean(snapshot["desktopLive"]) ? "在线" : "未连接"));
         text.AppendLine("运行模式：" + Convert.ToString(snapshot["runtimeMode"]));
+        object diagnosticValue;
+        var diagnostics = snapshot.TryGetValue("diagnostics", out diagnosticValue) ? diagnosticValue as Dictionary<string, object> : null;
+        if (diagnostics != null) {
+            text.AppendLine();
+            text.AppendLine("连接与业务检测（本机读取，不代表手机端实际体验）：");
+            var checks = diagnostics["checks"] as System.Collections.IEnumerable;
+            if (checks != null) foreach (var entry in checks) {
+                var check = entry as Dictionary<string, object>;
+                if (check != null) text.AppendLine("• " + check["title"] + "：" + check["message"]);
+            }
+            var nextAction = Convert.ToString(diagnostics["nextAction"]);
+            text.AppendLine();
+            if (nextAction == "desktop_restart_required")
+                text.AppendLine("建议操作：点击菜单中的“修复链路（必要时重启 Codex）”。");
+            else if (nextAction == "safe_repair")
+                text.AppendLine("建议操作：点击菜单中的“修复链路（必要时重启 Codex）”，随后重新检查状态。");
+            else if (nextAction == "check_logs")
+                text.AppendLine("建议操作：打开日志目录，检查检测工具或本地配置。");
+        }
+        object recoveryValue;
+        var recovery = snapshot.TryGetValue("desktopRecovery", out recoveryValue) ? recoveryValue as Dictionary<string, object> : null;
+        if (recovery != null) text.AppendLine("本次桌面连接恢复：" + recovery["message"]);
+        object tunnelValue;
+        var tunnel = snapshot.TryGetValue("voiceTunnel", out tunnelValue) ? tunnelValue as Dictionary<string, object> : null;
+        if (tunnel != null) {
+            object message;
+            string label = tunnel.TryGetValue("message", out message) ? Convert.ToString(message) :
+                !Convert.ToBoolean(tunnel["configured"]) ? "未配置独立隧道" :
+                Convert.ToBoolean(tunnel["running"]) ? "任务运行中（隧道连接和实际通话未验证）" : "未运行 / 需要恢复";
+            text.AppendLine("国内语音隧道：" + label);
+        }
         text.AppendLine();
         text.AppendLine("本应用管理的后台组件：");
         var services = snapshot["services"] as System.Collections.IEnumerable;
@@ -163,9 +326,9 @@ internal sealed class UnifiedTrayContext : ApplicationContext
             if (port != null) text.AppendLine("• " + port["port"] + "  PID " + port["pid"] + "  " + (Convert.ToString(port["ownership"]) == "managed" ? "本应用管理" : "外部宿主 / 共享服务"));
         }
         text.AppendLine();
-        text.AppendLine("官方 Codex 作为独立宿主接入，安全修复不会重启它。");
+        text.AppendLine("Codex 作为独立宿主接入；修复链路必要时会重启它，可能中断当前工作。");
         text.AppendLine("关闭此窗口不影响链路；退出管理应用后后台继续运行。");
-        text.AppendLine("配置来源：BridgeConfig.ets + hdc-relay.local.psd1");
+        text.AppendLine("配置来源：BridgeConfig.ets + hdc-relay.local.psd1 + voice-tunnel.local.psd1");
         using (var owner = new Form { TopMost=true, ShowInTaskbar=false, Opacity=0, StartPosition=FormStartPosition.CenterScreen, Size=new Size(1,1) }) {
             owner.Show();
             MessageBox.Show(owner, text.ToString(), "Codex 手机链路 · 统一状态", MessageBoxButtons.OK, MessageBoxIcon.Information);
@@ -186,6 +349,7 @@ internal sealed class UnifiedTrayContext : ApplicationContext
             case "watch-desktop-live": return "桌面连接监控";
             case "watch-bridge-proxy": return "公网恢复监控";
             case "watch-hdc-connection": return "手机调试监控";
+            case "watch-voice-tunnel": return "语音隧道恢复监控";
             default: return role;
         }
     }

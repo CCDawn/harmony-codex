@@ -36,9 +36,10 @@ async function flushMicrotasks(rounds = 12) {
   }
 }
 
-function makeRenderer({ start, stop, events } = {}) {
+function makeRenderer({ start, stop, flush, events } = {}) {
   const handlers = new Map();
   return {
+    handlers,
     startCalls: 0,
     stopCalls: 0,
     releaseCalls: 0,
@@ -62,7 +63,7 @@ function makeRenderer({ start, stop, events } = {}) {
     },
     flush() {
       this.flushCalls += 1;
-      return Promise.resolve();
+      return flush ? flush(this) : Promise.resolve();
     },
     setDefaultOutputDevice(deviceType) {
       this.defaultOutputDevice = deviceType;
@@ -72,7 +73,7 @@ function makeRenderer({ start, stop, events } = {}) {
   };
 }
 
-function loadService({ createAudioRenderer, createAudioCapturer, statuses = [] }) {
+function loadService({ createAudioRenderer, createAudioCapturer, webSocketApi = {}, statuses = [], speaking = [] }) {
   const sourcePath = process.env.VOICE_SERVICE_SOURCE || DEFAULT_SOURCE;
   const source = fs.readFileSync(sourcePath, 'utf8')
     .replace(/^import\s+.*?;\s*$/gm, '')
@@ -92,7 +93,9 @@ function loadService({ createAudioRenderer, createAudioCapturer, statuses = [] }
   };
   const context = vm.createContext({
     audio,
-    webSocket: {},
+    webSocket: webSocketApi,
+    CredentialRuntime: { getRuntimeTotpSecret() { return ''; } },
+    TotpGenerator: { async currentCode() { return ''; } },
     setTimeout,
     clearTimeout,
     Uint8Array,
@@ -107,10 +110,52 @@ function loadService({ createAudioRenderer, createAudioCapturer, statuses = [] }
   context.VoiceCallService.setCallbacks({
     onStatus(status, detail) { statuses.push({ status, detail }); },
     onTranscript() {},
-    onSpeaking() {},
+    onSpeaking(value) { speaking.push(value); },
     onClosed() {}
   });
   return { service: context.VoiceCallService, statuses };
+}
+
+test('actual websocket start frame opts into playback control version one', async () => {
+  const handlers = new Map();
+  const frames = [];
+  const client = {
+    on(event, handler) { handlers.set(event, handler); },
+    off(event) { handlers.delete(event); },
+    connect(_address, _options, callback) {
+      callback(undefined);
+      handlers.get('open')();
+    },
+    async send(payload) { frames.push(JSON.parse(payload)); return true; },
+    async close() {}
+  };
+  const { service } = loadService({ webSocketApi: { createWebSocket() { return client; } } });
+  try {
+    await service.connectOnce('ws://voice-test.invalid/voice', '', service.generation);
+    const start = frames.find(frame => frame.type === 'start');
+    assert.ok(start, 'the real connection open handler must send a start frame');
+    assert.equal(start.playbackControlVersion, 1);
+    assert.equal(Number.isInteger(start.playbackControlVersion), true);
+  } finally { await service.stop(); }
+});
+
+for (const negotiation of [{}, { playbackControlVersion: 1, bargeInAvailable: true }, { playbackControlVersion: 1, bargeInAvailable: false }]) {
+  test(`ready remains compatible with negotiation ${JSON.stringify(negotiation)}`, async () => {
+    let starts = 0;
+    const capturer = { on() {}, off() {}, async start() { starts++; }, async stop() {}, async release() {} };
+    const { service } = loadService({ createAudioCapturer: async () => capturer });
+    const identity = { profileId: 'profile', roomId: 'room', callId: 'call' };
+    service.expectedProfileId = identity.profileId;
+    service.expectedRoomId = identity.roomId;
+    service.setStatus('connecting', 'test call');
+    service.handleServerEvent(JSON.stringify({ type: 'ready', ...identity, ...negotiation }));
+    await flushMicrotasks();
+    assert.equal(service.phaseValue(), 'active');
+    assert.equal(service.capturer, capturer);
+    assert.equal(starts, 1);
+    assert.equal(service.playbackSuppressed(), false);
+    await service.stop();
+  });
 }
 
 test('duplex call selects communication capture and playback with accessory-aware speaker default', async () => {
@@ -191,8 +236,10 @@ test('renderer startup failure is reported once for the current call', async () 
   service.queuePlayback(new ArrayBuffer(160));
   await flushMicrotasks();
 
-  const failures = statuses.filter((entry) => entry.status === 'error' && entry.detail.includes('illegal state'));
+  const failures = statuses.filter((entry) => entry.status === 'error');
   assert.equal(failures.length, 1, 'a failed renderer must not emit one error per audio chunk');
+  assert.equal(failures[0].detail, '扬声器启动失败，请重试');
+  assert.equal(failures[0].detail.includes('illegal state'), false, 'platform details stay out of the UI');
   await service.stop();
 });
 
@@ -258,4 +305,267 @@ test('teardown waits for stop before release and releases a renderer that never 
 
   assert.equal(renderer.releaseCalls, 1, 'teardown must release even a renderer that never started');
   assert.deepEqual(events, ['stop', 'release']);
+});
+
+test('interrupt rejects incoming PCM and silences renderer callbacks until serialized flushes finish', async () => {
+  const gates = [deferred(), deferred()];
+  const speaking = [];
+  const renderer = makeRenderer({ flush: current => gates[current.flushCalls - 1].promise });
+  const { service } = loadService({ createAudioRenderer: async () => renderer, speaking });
+  service.setStatus('active', 'test call');
+  await service.ensureRenderer();
+  const networkGeneration = service.generation;
+  service.queuePlayback(new Uint8Array(480).fill(1).buffer);
+  service.interrupt();
+  assert.equal(speaking.at(-1), false);
+  service.queuePlayback(new Uint8Array(480).fill(2).buffer);
+  const output = new Uint8Array(480).fill(9);
+  renderer.handlers.get('writeData')(output.buffer);
+  assert.ok(output.every(value => value === 0), 'flush must not refill the old renderer with upstream PCM');
+  assert.equal(service.voiceAudioDownlinkWriteConsumeBytes, 0);
+  service.interrupt();
+  await flushMicrotasks();
+  assert.equal(renderer.flushCalls, 1, 'flush calls must not overlap');
+  gates[0].resolve();
+  await flushMicrotasks();
+  assert.equal(renderer.flushCalls, 2);
+  service.queuePlayback(new Uint8Array(480).fill(3).buffer);
+  assert.equal(service.voiceAudioDownlinkQueuedBytes, 0);
+  gates[1].resolve();
+  await flushMicrotasks();
+  service.queuePlayback(new Uint8Array(480).fill(4).buffer);
+  renderer.handlers.get('writeData')(output.buffer);
+  assert.ok(output.every(value => value === 4));
+  assert.equal(service.voiceAudioDownlinkDroppedBytes, 1440);
+  assert.equal(service.generation, networkGeneration);
+  await service.stop();
+});
+
+for (const pendingStage of ['create', 'start']) {
+  test(`interrupt during pending renderer ${pendingStage} flushes before playback resumes`, async () => {
+    const stageGate = deferred();
+    const flushGate = deferred();
+    const renderer = makeRenderer({
+      start: () => pendingStage === 'start' ? stageGate.promise : Promise.resolve(),
+      flush: () => flushGate.promise
+    });
+    const { service } = loadService({
+      createAudioRenderer: () => pendingStage === 'create' ? stageGate.promise : Promise.resolve(renderer)
+    });
+    service.setStatus('active', 'test call');
+    service.queuePlayback(new Uint8Array(480).fill(1).buffer);
+    await flushMicrotasks();
+    service.interrupt();
+    stageGate.resolve(pendingStage === 'create' ? renderer : undefined);
+    await flushMicrotasks();
+    assert.equal(renderer.flushCalls, 1, 'unpublished startup renderer must still be flushed');
+    service.queuePlayback(new Uint8Array(480).fill(2).buffer);
+    const output = new Uint8Array(480).fill(9);
+    renderer.handlers.get('writeData')(output.buffer);
+    assert.ok(output.every(value => value === 0));
+    flushGate.resolve();
+    await flushMicrotasks();
+    service.queuePlayback(new Uint8Array(480).fill(3).buffer);
+    renderer.handlers.get('writeData')(output.buffer);
+    assert.ok(output.every(value => value === 3));
+    await service.stop();
+  });
+}
+
+test('flush failure isolates and rebuilds only the output while preserving microphone and websocket', async () => {
+  const releaseGate = deferred();
+  const statuses = [];
+  const oldRenderer = makeRenderer({ flush: () => Promise.reject(new Error('platform flush failed')), stop: () => releaseGate.promise });
+  const newRenderer = makeRenderer();
+  let createCalls = 0;
+  const { service } = loadService({ statuses, createAudioRenderer: async () => ++createCalls === 1 ? oldRenderer : newRenderer });
+  service.setStatus('active', 'test call');
+  await service.ensureRenderer();
+  const lateWrite = oldRenderer.handlers.get('writeData');
+  const capturer = { stopCalls: 0, releaseCalls: 0, off() {}, async stop() { this.stopCalls++; }, async release() { this.releaseCalls++; } };
+  const ws = { async send() {}, async close() { throw new Error('must not close during output recovery'); }, off() {} };
+  service.capturer = capturer;
+  service.ws = ws;
+  const generation = service.generation;
+  service.interrupt();
+  await flushMicrotasks();
+  assert.equal(service.renderer, null, 'remove failed renderer before waiting for its release');
+  const output = new Uint8Array(480).fill(9);
+  lateWrite(output.buffer);
+  assert.ok(output.every(value => value === 0));
+  releaseGate.resolve();
+  await flushMicrotasks();
+  assert.equal(service.renderer, newRenderer);
+  assert.equal(oldRenderer.releaseCalls, 1);
+  assert.equal(service.capturer, capturer);
+  assert.equal(service.ws, ws);
+  assert.equal(service.generation, generation);
+  assert.equal(capturer.stopCalls, 0);
+  assert.equal(service.phaseValue(), 'active');
+  assert.ok(statuses.some(entry => entry.detail.includes('恢复')));
+  service.queuePlayback(new Uint8Array(480).fill(7).buffer);
+  lateWrite(output.buffer);
+  assert.ok(output.every(value => value === 0), 'late callback cannot consume new output PCM');
+  newRenderer.handlers.get('writeData')(output.buffer);
+  assert.ok(output.every(value => value === 7));
+  service.ws = null;
+  await service.stop();
+});
+
+test('explicit suppression tokens compose with interrupt flush and cannot be ended by a stale token', async () => {
+  const gate = deferred();
+  const renderer = makeRenderer({ flush: () => gate.promise });
+  const { service } = loadService({ createAudioRenderer: async () => renderer });
+  service.setStatus('active', 'test call');
+  await service.ensureRenderer();
+  const first = service.beginPlaybackSuppression();
+  const second = service.beginPlaybackSuppression();
+  service.endPlaybackSuppression(first);
+  service.queuePlayback(new ArrayBuffer(480));
+  assert.equal(service.voiceAudioDownlinkQueuedBytes, 0);
+  service.interrupt();
+  service.endPlaybackSuppression(second);
+  service.queuePlayback(new ArrayBuffer(480));
+  assert.equal(service.voiceAudioDownlinkQueuedBytes, 0, 'ending protocol suppression cannot end flush suppression');
+  gate.resolve();
+  await flushMicrotasks();
+  const next = service.beginPlaybackSuppression();
+  service.endPlaybackSuppression(first);
+  service.queuePlayback(new ArrayBuffer(480));
+  assert.equal(service.voiceAudioDownlinkQueuedBytes, 0);
+  service.endPlaybackSuppression(next);
+  service.queuePlayback(new ArrayBuffer(480));
+  assert.equal(service.voiceAudioDownlinkQueuedBytes, 480);
+  await service.stop();
+});
+
+test('old flush completion cannot lift a new call suppression barrier', async () => {
+  const oldGate = deferred();
+  const newGate = deferred();
+  const oldRenderer = makeRenderer({ flush: () => oldGate.promise });
+  const newRenderer = makeRenderer({ flush: () => newGate.promise });
+  let creates = 0;
+  const { service } = loadService({ createAudioRenderer: async () => ++creates === 1 ? oldRenderer : newRenderer });
+  service.setStatus('active', 'old call');
+  await service.ensureRenderer();
+  service.interrupt();
+  await service.stop();
+  service.generation += 1;
+  service.stopping = false;
+  service.rendererFailedGeneration = -1;
+  service.setStatus('active', 'new call');
+  await service.ensureRenderer();
+  service.interrupt();
+  oldGate.resolve();
+  await flushMicrotasks();
+  service.queuePlayback(new Uint8Array(480).fill(1).buffer);
+  assert.equal(service.voiceAudioDownlinkQueuedBytes, 0);
+  assert.equal(service.renderer, newRenderer);
+  newGate.resolve();
+  await flushMicrotasks();
+  service.queuePlayback(new Uint8Array(480).fill(2).buffer);
+  const output = new ArrayBuffer(480);
+  newRenderer.handlers.get('writeData')(output);
+  assert.ok(new Uint8Array(output).every(value => value === 2));
+  await service.stop();
+});
+
+test('synchronous flush error and failed output rebuild keep the call connected and report recovery failure', async () => {
+  const renderer = makeRenderer({ flush: () => { throw new Error('sync platform failure'); } });
+  const statuses = [];
+  let creates = 0;
+  const { service } = loadService({ statuses, createAudioRenderer: async () => {
+    if (++creates === 1) return renderer;
+    throw new Error('output unavailable');
+  } });
+  service.setStatus('active', 'call');
+  await service.ensureRenderer();
+  const capturer = { off() {}, async stop() {}, async release() {} };
+  const ws = { async send() {}, async close() { throw new Error('must keep connection'); }, off() {} };
+  service.capturer = capturer;
+  service.ws = ws;
+  const generation = service.generation;
+  service.interrupt();
+  await flushMicrotasks();
+  assert.equal(service.phaseValue(), 'active');
+  assert.equal(service.generation, generation);
+  assert.equal(service.capturer, capturer);
+  assert.equal(service.ws, ws);
+  assert.equal(service.renderer, null);
+  assert.ok(statuses.some(entry => entry.detail === '扬声器恢复失败，请重新接通'));
+  assert.ok(statuses.every(entry => !entry.detail.includes('platform')));
+  service.queuePlayback(new ArrayBuffer(480));
+  await flushMicrotasks();
+  assert.equal(creates, 2, 'do not retry failed output creation for every PCM chunk');
+  service.ws = null;
+  await service.stop();
+});
+
+test('server resumed cannot bypass a pending local interrupt flush', async () => {
+  const gate = deferred();
+  const renderer = makeRenderer({ flush: () => gate.promise });
+  const speaking = [];
+  const { service } = loadService({ createAudioRenderer: async () => renderer, speaking });
+  service.setStatus('active', 'call');
+  service.ready = true;
+  const identity = { profileId: 'profile', roomId: 'room', callId: 'call' };
+  service.boundTranscriptIdentity = identity;
+  await service.ensureRenderer();
+  const event = (state, revision) => service.handleServerEvent(JSON.stringify({ type: 'playback', state, revision, ...identity }));
+  event('blocked', 0);
+  service.interrupt();
+  event('resumed', 1);
+  service.queuePlayback(new Uint8Array(480).fill(1).buffer);
+  service.handleServerEvent(JSON.stringify({ type: 'speaking', state: 'start' }));
+  assert.equal(speaking.at(-1), false);
+  const output = new Uint8Array(480).fill(9);
+  renderer.handlers.get('writeData')(output.buffer);
+  assert.ok(output.every(value => value === 0));
+  gate.resolve();
+  await flushMicrotasks();
+  service.queuePlayback(new Uint8Array(480).fill(2).buffer);
+  renderer.handlers.get('writeData')(output.buffer);
+  assert.ok(output.every(value => value === 2));
+  await service.stop();
+});
+
+test('automatic server blocked flushes platform PCM without echo and resumed waits for all flushes', async () => {
+  const gates = [deferred(), deferred()];
+  const renderer = makeRenderer({ flush: current => gates[current.flushCalls - 1].promise });
+  const { service } = loadService({ createAudioRenderer: async () => renderer });
+  service.setStatus('active', 'call');
+  service.ready = true;
+  const identity = { profileId: 'profile', roomId: 'room', callId: 'call' };
+  service.boundTranscriptIdentity = identity;
+  let sentFrames = 0;
+  service.ws = { async send() { sentFrames++; } };
+  await service.ensureRenderer();
+  const event = (state, revision) => service.handleServerEvent(JSON.stringify({ type: 'playback', state, revision, source: 'user_speech', ...identity }));
+  service.queuePlayback(new Uint8Array(480).fill(1).buffer);
+  event('blocked', 0);
+  assert.equal(renderer.flushCalls, 1, 'automatic speech detection clears platform PCM without a manual interrupt');
+  event('blocked', 0);
+  assert.equal(renderer.flushCalls, 1, 'duplicate revision must not trigger another flush');
+  event('resumed', 1);
+  event('blocked', 2);
+  event('resumed', 3);
+  service.queuePlayback(new Uint8Array(480).fill(2).buffer);
+  const output = new Uint8Array(480).fill(9);
+  renderer.handlers.get('writeData')(output.buffer);
+  assert.ok(output.every(value => value === 0));
+  assert.equal(renderer.flushCalls, 1, 'consecutive automatic blocks serialize platform operations');
+  gates[0].resolve();
+  await flushMicrotasks();
+  assert.equal(renderer.flushCalls, 2);
+  service.queuePlayback(new Uint8Array(480).fill(3).buffer);
+  assert.equal(service.voiceAudioDownlinkQueuedBytes, 0);
+  gates[1].resolve();
+  await flushMicrotasks();
+  assert.equal(sentFrames, 0, 'server control cannot send an interrupt echo');
+  service.queuePlayback(new Uint8Array(480).fill(4).buffer);
+  renderer.handlers.get('writeData')(output.buffer);
+  assert.ok(output.every(value => value === 4));
+  assert.equal(service.voiceAudioDownlinkDroppedBytes, 1440);
+  service.ws = null;
+  await service.stop();
 });

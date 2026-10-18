@@ -141,6 +141,7 @@ function Write-FinalStartupSummary {
   Write-StartupStatusLine -Label 'HDC 本地代理' -Name 'HdcProxy'
   Write-StartupStatusLine -Label 'HDC 自动恢复' -Name 'HdcWatchdog'
   Write-StartupStatusLine -Label 'HDC 目标' -Name 'HdcTarget'
+  Write-StartupStatusLine -Label '语音隧道任务' -Name 'VoiceTunnel'
 
   $hardNames = switch ($RuntimeMode) {
     'app-server-primary' { @('LocalBridge', 'AppServerRuntime', 'SessionApi') }
@@ -155,6 +156,8 @@ function Write-FinalStartupSummary {
     }
   }
   $hdcState = [string](Get-StartupStatus -Name 'HdcTarget').State
+  $voiceFailed = [string](Get-StartupStatus -Name 'VoiceTunnel').State -eq 'failed'
+  $script:StartupExitCode = if ($hardFailed -or $voiceFailed) { 2 } else { 0 }
   if ($hardFailed) {
     $unavailableMessage = if ($RuntimeMode -eq 'app-server-primary') {
       '整体状态：不可用，需要先修复 bridge / App Server 主链路。'
@@ -164,6 +167,8 @@ function Write-FinalStartupSummary {
       '整体状态：不可用，需要先修复 bridge / Codex 桌面实时通道。'
     }
     Write-Host "    $unavailableMessage" -ForegroundColor Red
+  } elseif ($voiceFailed) {
+    Write-Host '    整体状态：会话通道就绪，语音隧道任务异常，请查看统一状态。' -ForegroundColor Yellow
   } elseif ($hdcState -eq 'ok' -or $hdcState -eq 'skipped') {
     $readyMessage = if ($RuntimeMode -eq 'app-server-primary') {
       '整体状态：正常。App Server 主链路可用；桌面 CDP 仅作为回退能力。'
@@ -1511,6 +1516,13 @@ Ensure-HdcRelay
 Show-RelayState
 Ensure-CodexDesktopLive
 Ensure-DesktopLiveWatchdog
+. (Join-Path $repoRoot 'tools\windows\mobile-voice-tunnel.ps1')
+try {
+  Ensure-MobileVoiceTunnel $repoRoot
+  Set-StartupStatus -Name 'VoiceTunnel' -State 'ok' -Message '任务检查完成；实际转发与通话请查看统一状态'
+} catch {
+  Set-StartupStatus -Name 'VoiceTunnel' -State 'failed' -Message '语音隧道配置、绑定或任务恢复失败；其他通道继续检测'
+}
 Test-BridgeApi
 
 Write-FinalStartupSummary
@@ -1520,4 +1532,4 @@ Write-Host "手机端 bridge: $BridgeUrl" -ForegroundColor Green
 Write-Host "本地 bridge: $BridgeUrl" -ForegroundColor Green
 Write-Host "日志目录: $logRoot" -ForegroundColor DarkGray
 Write-Host "强制重建整条链路可追加参数: -ForceRestart" -ForegroundColor DarkGray
-exit 0
+exit $script:StartupExitCode

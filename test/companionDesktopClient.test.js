@@ -2,6 +2,22 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { CompanionDesktopClient, historyEntries } from '../src/companionDesktopClient.js';
 
+async function runCompanionInvokeBody(expression, { api, AbortSignal }) {
+  const paramsMarker = 'const params=';
+  const paramsStart = expression.indexOf(paramsMarker) + paramsMarker.length;
+  const paramsEnd = expression.indexOf(';\n', paramsStart);
+  const catchStart = expression.lastIndexOf('}catch(error){');
+  assert.ok(paramsStart >= paramsMarker.length && paramsEnd > paramsStart && catchStart > paramsEnd,
+    'expected the standard Companion invoke wrapper');
+  const params = JSON.parse(expression.slice(paramsStart, paramsEnd));
+  const body = expression.slice(paramsEnd + 2, catchStart);
+  try {
+    return await new Function('params', 'api', 'AbortSignal', `return (async()=>{${body}})()`)(params, api, AbortSignal);
+  } catch (error) {
+    return { __companionError: true, status: Number(error?.status) || 0, name: String(error?.name || 'Error') };
+  }
+}
+
 test('older messages follow prev_cursor and keep the verified room identity', async () => {
   const expressions=[];
   const c=new CompanionDesktopClient({ensureConnected:async()=>{},evaluate:async expression=>{
@@ -74,6 +90,51 @@ test('a desktop account or selected assistant change cannot silently retarget a 
   assert.equal(c.callId,null);
 });
 
+test('message and member reads overlap, but entries wait for verified authors', async () => {
+  const metadata = Promise.withResolvers();
+  let messagesRead = false;
+  let returned = false;
+  const c = new CompanionDesktopClient({ ensureConnected: async () => {}, evaluate: async expression => {
+    if (expression.includes('const room = await api.safeGet')) return metadata.promise;
+    messagesRead = true;
+    return { items: [
+      { id: 'self-message', account_user_id: 'self', content: { text: 'question' } },
+      { id: 'bot-message', role: 'user', account_user_id: 'bot', content: { text: 'reply' } }
+    ] };
+  }, close() {} });
+  c.profile = { id: 'assistant', roomId: 'room' };
+  const pending = c.messages().then(page => { returned = true; return page; });
+  try {
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(messagesRead, true, 'history read should start before member read finishes');
+    assert.equal(returned, false, 'unverified authors must not be shown');
+  } finally {
+    metadata.resolve({ authors: [
+      { accountUserId: 'self', role: 'user' }, { accountUserId: 'bot', role: 'assistant' }
+    ] });
+    await pending;
+  }
+  assert.deepEqual((await pending).entries.map(e => e.role), ['user', 'assistant']);
+});
+
+test('a failed member read prevents returning concurrently fetched messages', async () => {
+  const metadata = Promise.withResolvers();
+  let messagesRead = false;
+  const c = new CompanionDesktopClient({ ensureConnected: async () => {}, evaluate: async expression => {
+    if (expression.includes('const room = await api.safeGet')) return metadata.promise;
+    messagesRead = true;
+    return { items: [{ id: 'message', account_user_id: 'unknown', content: { text: 'unverified' } }] };
+  }, close() {} });
+  c.profile = { id: 'assistant', roomId: 'room' };
+  const pending = c.messages();
+  const rejected = assert.rejects(pending, /member read failed/);
+  await new Promise(resolve => setImmediate(resolve));
+  metadata.reject(new Error('member read failed'));
+  await rejected;
+  assert.equal(messagesRead, true);
+  assert.equal(c.roomMetadata, null);
+});
+
 test('attach and stop require an owned call, and creation is not silently retried', async () => {
   const expressions=[];
   const c = new CompanionDesktopClient({ensureConnected:async()=>{},evaluate:async expression=>{
@@ -92,4 +153,85 @@ test('attach and stop require an owned call, and creation is not silently retrie
   assert.equal(c.callId,null);
   assert.equal(expressions.filter(e=>e.includes('const response = await api.postResponse')).length,1);
   assert.ok(expressions.at(-1).includes('rtc_test'));
+});
+
+test('Companion API failures keep only safe HTTP status, error code, and stage', async () => {
+  const c = new CompanionDesktopClient({ ensureConnected: async () => {}, evaluate: async () => ({
+    __companionError: true,
+    status: 502,
+    name: 'FetchError',
+    message: 'private response body and bearer token'
+  }), close() {} });
+  await assert.rejects(c.invoke('return null;', {}, 30000, 'create'), error => {
+    assert.equal(error.message, 'Companion HTTP 502');
+    assert.equal(error.status, 502);
+    assert.equal(error.errorCode, 'http_error');
+    assert.equal(error.stage, 'create');
+    assert.doesNotMatch(JSON.stringify(error), /private response|bearer token/);
+    return true;
+  });
+});
+
+test('CDP timeout and connection failures are distinguished without preserving their raw messages', async () => {
+  const timeout = new CompanionDesktopClient({ ensureConnected: async () => {}, evaluate: async () => {
+    throw new Error('Codex 桌面 CDP 请求超时：Runtime.evaluate includes no private data');
+  }, close() {} });
+  await assert.rejects(timeout.invoke('return null;', {}, 30000, 'discover'), error => {
+    assert.equal(error.errorCode, 'timeout');
+    assert.equal(error.stage, 'discover');
+    assert.doesNotMatch(JSON.stringify(error), /Runtime\.evaluate/);
+    return true;
+  });
+
+  const disconnected = new CompanionDesktopClient({ ensureConnected: async () => {
+    throw new Error('Codex 桌面 CDP 连接已关闭: secret=hidden');
+  }, evaluate: async () => null, close() {} });
+  await assert.rejects(disconnected.invoke('return null;', {}, 30000, 'attach'), error => {
+    assert.equal(error.errorCode, 'cdp_connection');
+    assert.equal(error.stage, 'attach');
+    assert.doesNotMatch(JSON.stringify(error), /secret=hidden/);
+    return true;
+  });
+});
+
+test('voice call creation uses a cancellable 40s API signal and a 45s CDP wait, preserving HTTP 503', async () => {
+  const controller = new AbortController();
+  const timeoutCalls = [];
+  const evaluateTimeouts = [];
+  let requestSignal = null;
+  let observedAbort = false;
+  const api = {
+    async postResponse(_path, request) {
+      requestSignal = request.signal;
+      request.signal.addEventListener('abort', () => { observedAbort = true; });
+      throw Object.assign(new Error('private HTTP 503 response body'), { status: 503 });
+    }
+  };
+  const AbortSignalShim = {
+    timeout(ms) { timeoutCalls.push(ms); return controller.signal; }
+  };
+  const c = new CompanionDesktopClient({ ensureConnected: async () => {}, evaluate: async (expression, timeoutMs) => {
+    evaluateTimeouts.push(timeoutMs);
+    if (expression.includes("const result = await api.safeGet('/tbo/primary'")) {
+      return { id: 'assistant', name: 'Bear', roomId: 'room' };
+    }
+    assert.ok(expression.includes("const response = await api.postResponse('/tbo/{tbo_id}/voice/calls'"));
+    return runCompanionInvokeBody(expression, { api, AbortSignal: AbortSignalShim });
+  }, close() {} });
+
+  await assert.rejects(c.start({ sdp: 'v=0\r\n' }), error => {
+    assert.equal(error.message, 'Companion HTTP 503');
+    assert.equal(error.status, 503);
+    assert.equal(error.errorCode, 'http_error');
+    assert.equal(error.stage, 'create');
+    return true;
+  });
+
+  assert.deepEqual(timeoutCalls, [40000]);
+  assert.deepEqual(evaluateTimeouts, [30000, 45000], 'profile discovery stays at 30s and create gets 45s');
+  assert.strictEqual(requestSignal, controller.signal);
+  assert.ok(requestSignal instanceof AbortSignal, 'the request receives a real cancellable AbortSignal');
+  controller.abort();
+  assert.equal(observedAbort, true, 'the API request is wired to cancellation');
+  assert.equal(c.callId, null);
 });

@@ -31,6 +31,24 @@ export function reduceVoiceTranscriptEntries(
       final: event.final,
       itemId: event.itemId
     };
+    if (event.phoneTranscript !== undefined) {
+      created.phoneTranscript = event.phoneTranscript;
+    }
+    if (event.callId !== undefined) {
+      created.callId = event.callId;
+    }
+    if (event.localStorageStatus !== undefined) {
+      created.localStorageStatus = event.localStorageStatus;
+    }
+    if (event.localBridgeOrigin !== undefined) {
+      created.localBridgeOrigin = event.localBridgeOrigin;
+    }
+    if (event.localAssistantId !== undefined) {
+      created.localAssistantId = event.localAssistantId;
+    }
+    if (event.localRoomId !== undefined) {
+      created.localRoomId = event.localRoomId;
+    }
     return entries.concat(created);
   }
 
@@ -45,6 +63,24 @@ export function reduceVoiceTranscriptEntries(
     final: current.final || event.final,
     itemId: current.itemId
   };
+  if (current.phoneTranscript !== undefined || event.phoneTranscript !== undefined) {
+    updated.phoneTranscript = current.phoneTranscript ?? event.phoneTranscript;
+  }
+  if (current.callId !== undefined || event.callId !== undefined) {
+    updated.callId = current.callId ?? event.callId;
+  }
+  if (current.localStorageStatus !== undefined || event.localStorageStatus !== undefined) {
+    updated.localStorageStatus = current.localStorageStatus ?? event.localStorageStatus;
+  }
+  if (current.localBridgeOrigin !== undefined || event.localBridgeOrigin !== undefined) {
+    updated.localBridgeOrigin = current.localBridgeOrigin ?? event.localBridgeOrigin;
+  }
+  if (current.localAssistantId !== undefined || event.localAssistantId !== undefined) {
+    updated.localAssistantId = current.localAssistantId ?? event.localAssistantId;
+  }
+  if (current.localRoomId !== undefined || event.localRoomId !== undefined) {
+    updated.localRoomId = current.localRoomId ?? event.localRoomId;
+  }
   return entries.map((entry: VoiceTranscriptEntry, index: number) => index === targetIndex ? updated : entry);
 }
 

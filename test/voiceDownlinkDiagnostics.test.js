@@ -164,9 +164,29 @@ test('queue overflow counts discarded PCM while retaining the configured queue l
   }
 
   assert.equal(service.voiceAudioDownlinkReceivedBytes, 401 * 4800);
+  assert.equal(service.voiceAudioDownlinkDroppedBytes, 391 * 4800);
+  assert.equal(service.voiceAudioDownlinkQueueHighWaterMs, 1000);
+  assert.equal(service.playbackQueueCurrentMs(), 1000);
+  service.teardownAudio();
+});
+
+test('byte limit drops the oldest cursor samples and keeps the newest oversized PCM tail', () => {
+  const { service } = loadService();
+  const old = new Uint8Array(48000).fill(1);
+  service.queuePlayback(old.buffer);
+  service.handleWriteData(new ArrayBuffer(4800));
+  service.queuePlayback(new Uint8Array(9600).fill(2).buffer);
+  assert.equal(service.voiceAudioDownlinkQueuedBytes, 48000);
+  assert.equal(service.playCursorOffset, 9600, 'discard oldest remaining cursor before newer queued PCM');
   assert.equal(service.voiceAudioDownlinkDroppedBytes, 4800);
-  assert.equal(service.voiceAudioDownlinkQueueHighWaterMs, 40_000);
-  assert.equal(service.playbackQueueCurrentMs(), 40_000);
+  service.queuePlayback(new Uint8Array(60001).fill(3).buffer);
+  assert.equal(service.voiceAudioDownlinkQueuedBytes, 48000);
+  assert.equal(service.voiceAudioDownlinkDroppedBytes, 64801);
+  const output = new ArrayBuffer(48000);
+  service.handleWriteData(output);
+  assert.ok(new Uint8Array(output).every(value => value === 3));
+  assert.equal(service.voiceAudioDownlinkWriteConsumeBytes, 52800);
+  assert.equal(service.playbackQueueCurrentMs(), 0);
   service.teardownAudio();
 });
 
@@ -192,4 +212,88 @@ test('transcript health contains only role, character count, final flag, and epo
     epochMs: 1_800_000_123_456
   });
   assert.equal(logs[0].includes('private spoken content'), false);
+});
+
+const PLAYBACK_IDENTITY = { profileId: 'profile-one', roomId: 'room-one', callId: 'call-one' };
+
+function playbackEvent(service, state, revision, fields = {}) {
+  service.handleServerEvent(JSON.stringify({ type: 'playback', state, revision, ...PLAYBACK_IDENTITY, ...fields }));
+}
+
+test('playback control requires ready, exact identity and a safe monotonic revision', () => {
+  const { service } = loadService();
+  service.boundTranscriptIdentity = PLAYBACK_IDENTITY;
+  playbackEvent(service, 'blocked', 0);
+  assert.equal(service.playbackSuppressed(), false, 'pre-ready control is ignored');
+  service.ready = true;
+  for (const fields of [
+    { profileId: 'other' }, { roomId: 'other' }, { callId: 'other' }, { callId: '' },
+    { profileId: undefined }, { source: 'unknown' }
+  ]) {
+    playbackEvent(service, 'blocked', 0, fields);
+    assert.equal(service.playbackSuppressed(), false);
+  }
+  for (const revision of [-1, 0.5, Number.MAX_SAFE_INTEGER + 1, '0', null, undefined]) {
+    playbackEvent(service, 'blocked', revision);
+    assert.equal(service.playbackSuppressed(), false);
+  }
+  playbackEvent(service, 'unknown', 100);
+  playbackEvent(service, 'blocked', 0, { source: 'user_speech' });
+  assert.equal(service.playbackSuppressed(), true, 'invalid messages must not advance revision');
+  playbackEvent(service, 'resumed', 0);
+  assert.equal(service.playbackSuppressed(), true, 'same revision is ignored');
+  playbackEvent(service, 'resumed', 2, { source: 'assistant_turn' });
+  assert.equal(service.playbackSuppressed(), false);
+  playbackEvent(service, 'blocked', 1);
+  playbackEvent(service, 'blocked', 2);
+  assert.equal(service.playbackSuppressed(), false, 'older and duplicate messages cannot re-block');
+  service.teardownAudio();
+});
+
+test('server blocked drops old PCM, suppresses speaking and composes with an external token', () => {
+  const { service } = loadService();
+  const speaking = [];
+  service.callbacks.onSpeaking = value => speaking.push(value);
+  service.ready = true;
+  service.boundTranscriptIdentity = PLAYBACK_IDENTITY;
+  service.queuePlayback(new Uint8Array(480).fill(1).buffer);
+  playbackEvent(service, 'blocked', 0);
+  assert.equal(speaking.at(-1), false);
+  service.queuePlayback(new Uint8Array(480).fill(2).buffer);
+  assert.equal(service.voiceAudioDownlinkDroppedBytes, 960);
+  const output = new Uint8Array(480).fill(9);
+  service.handleWriteData(output.buffer);
+  assert.ok(output.every(value => value === 0));
+  service.handleServerEvent(JSON.stringify({ type: 'speaking', state: 'start' }));
+  assert.equal(speaking.at(-1), false);
+  const external = service.beginPlaybackSuppression();
+  playbackEvent(service, 'blocked', 1);
+  playbackEvent(service, 'resumed', 2);
+  assert.equal(service.playbackSuppressed(), true, 'server resumed only releases its own token');
+  service.endPlaybackSuppression(external);
+  assert.equal(service.playbackSuppressed(), false, 'repeated blocked must not leak tokens');
+  service.queuePlayback(new Uint8Array(480).fill(3).buffer);
+  service.handleWriteData(output.buffer);
+  assert.ok(output.every(value => value === 3));
+  service.handleServerEvent(JSON.stringify({ type: 'speaking', state: 'start' }));
+  assert.equal(speaking.at(-1), true);
+  service.teardownAudio();
+});
+
+test('new call resets server revision and an old call cannot release its suppression', () => {
+  const { service } = loadService();
+  service.ready = true;
+  service.boundTranscriptIdentity = PLAYBACK_IDENTITY;
+  playbackEvent(service, 'blocked', 50);
+  const oldToken = service.serverPlaybackSuppressionToken;
+  service.teardownAudio();
+  service.boundTranscriptIdentity = { ...PLAYBACK_IDENTITY, callId: 'call-two' };
+  playbackEvent(service, 'blocked', 0, { callId: 'call-two' });
+  assert.equal(service.playbackSuppressed(), true, 'new call revision zero is valid');
+  playbackEvent(service, 'resumed', 51);
+  service.endPlaybackSuppression(oldToken);
+  assert.equal(service.playbackSuppressed(), true, 'old identity and token cannot resume a new call');
+  playbackEvent(service, 'resumed', 1, { callId: 'call-two' });
+  assert.equal(service.playbackSuppressed(), false);
+  service.teardownAudio();
 });

@@ -1,4 +1,4 @@
-# Shared lifecycle primitives. No credentials or raw command lines in the catalog.
+﻿# Shared lifecycle primitives. No credentials or raw command lines in the catalog.
 function Start-MobileLinkDetached {
   param([string]$HostPath,[string]$ScriptPath,[string[]]$Arguments,[string]$LogPath,[string]$WorkingDirectory)
   if (-not ('MobileLinkNativeProcess' -as [type])) {
@@ -54,7 +54,18 @@ function Enter-MobileLinkCycle {
   try { $owns=$gate.WaitOne(0) } catch [Threading.AbandonedMutexException] { $owns=$true }
   if (-not $owns) { $gate.Dispose(); return $null }
   if (Test-MobileLinkPaused $Repo) { $gate.ReleaseMutex(); $gate.Dispose(); return $null }
+  # One recovery owner when guardian mode is enabled. Bootstrap entrypoints
+  # start services directly and do not depend on these watcher cycles.
+  if (Test-MobileLinkGuardianEnabled $Repo) { $gate.ReleaseMutex(); $gate.Dispose(); return $null }
   return $gate
+}
+
+function Test-MobileLinkGuardianEnabled {
+  param([string]$Repo)
+  $path=Join-Path $Repo 'logs\state\mobile-link-guardian-config.json'
+  if (-not (Test-Path -LiteralPath $path)) { return $false }
+  try { return (Get-Content -Raw -LiteralPath $path | ConvertFrom-Json).enabled -eq $true }
+  catch { return $true } # Invalid persisted ownership must not arm legacy recovery.
 }
 
 function Exit-MobileLinkCycle {
@@ -68,7 +79,7 @@ function Get-MobileLinkRole {
   $name = [string]$Process.Name
   if ($name -notmatch '^(pwsh|powershell|node|python|pythonw|cmd)\.exe$') { return '' }
   if ($name -match '^(pwsh|powershell)\.exe$') {
-    foreach ($role in @('watch-local-bridge','watch-desktop-live','watch-bridge-proxy','watch-hdc-connection','start-hdc-relay')) {
+    foreach ($role in @('watch-local-bridge','watch-desktop-live','watch-bridge-proxy','watch-hdc-connection','watch-voice-tunnel','start-hdc-relay')) {
       if ($command -match ([regex]::Escape($role) + '\.ps1(?:[''"]|\s|$)')) { return $role }
     }
     if ($command -match 'node\s+src[\\/]server\.js' -and $command -match 'CODEX_BRIDGE_WORKSPACE') { return 'bridge-host' }
@@ -133,7 +144,9 @@ function Set-MobileLinkDesiredState {
   $temp = $path + '.' + $PID + '.tmp'
   @{ version=1; desiredState=$State; updatedAt=[datetime]::UtcNow.ToString('o') } |
     ConvertTo-Json | Set-Content -LiteralPath $temp -Encoding utf8
-  [IO.File]::Move($temp, $path, $true)
+  # .NET Framework (Windows PowerShell 5.1) has no overwrite Move overload.
+  if ([IO.File]::Exists($path)) { [IO.File]::Replace($temp, $path, [NullString]::Value) }
+  else { [IO.File]::Move($temp, $path) }
 }
 
 function Stop-MobileLinkOwnedProcesses {
@@ -150,7 +163,14 @@ function Stop-MobileLinkOwnedProcesses {
   foreach ($expected in $ordered) {
     $current = Get-CimInstance Win32_Process -Filter "ProcessId=$($expected.ProcessId)" -ErrorAction SilentlyContinue
     if (Test-MobileLinkSameProcess $expected $current) {
-      Stop-Process -Id ([int]$current.ProcessId) -Force -ErrorAction Stop
+      try {
+        Stop-Process -Id ([int]$current.ProcessId) -Force -ErrorAction Stop
+      } catch {
+        # A launch wrapper can exit as soon as its bridge child is stopped.
+        # Preserve real stop failures, but allow an already-exited owner.
+        $afterStop = Get-CimInstance Win32_Process -Filter "ProcessId=$($expected.ProcessId)" -ErrorAction SilentlyContinue
+        if (Test-MobileLinkSameProcess $expected $afterStop) { throw }
+      }
       $stopped += [int]$current.ProcessId
     }
   }

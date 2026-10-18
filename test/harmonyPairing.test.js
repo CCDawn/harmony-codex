@@ -251,20 +251,21 @@ test('index pairs through scan kit with manual fallback and runtime credential s
   assert.match(unpairBody, /this\.bridgeToken = DEFAULT_BRIDGE_TOKEN/);
 });
 
-test('connection panel exposes scan pairing, manual fallback, and unpair entries', () => {
+test('independent pairing page wires secure pairing and draft actions', () => {
   const indexText = read(indexPath);
   const panelBody = extractMethodBody(indexText, 'ConnectionPanel');
-
-  assert.match(panelBody, /'扫码配对'/);
-  assert.match(panelBody, /'解除配对'/);
-  assert.match(panelBody, /'使用配对码配对'/);
-  assert.match(panelBody, /this\.pairingManualCode/);
-  assert.match(panelBody, /this\.pairingStatusText/);
-  assert.match(panelBody, /this\.pairingGuideVisible/);
+  const panel = read(path.resolve('HarmonyCodexRemote/entry/src/main/ets/components/PairingPanel.ets'));
+  assert.match(panelBody, /PairingPanel\(/);
   assert.match(panelBody, /this\.startScanPairing\(\)/);
-  assert.match(panelBody, /this\.unpairBridgeCredential\('panel'\)/);
+  assert.match(panelBody, /this\.confirmUnpair\(\)/);
   assert.match(panelBody, /this\.pairWithManualCode\(\)/);
-  assert.match(panelBody, /本机不支持系统扫码/);
+  assert.match(panelBody, /this\.savePairingDraft\(\)/);
+  assert.match(panelBody, /this\.pairingDraftUrl = value/);
+  assert.doesNotMatch(panelBody, /this\.bridgeUrl = value|this\.bridgeToken = value/);
+  assert.match(panel, /'扫码配对'/);
+  assert.match(panel, /'解除配对'/);
+  assert.match(panel, /'使用配对码配对'/);
+  assert.match(panel, /本机不支持系统扫码/);
 });
 
 test('standby form ability loads the device credential before bridge refresh', () => {

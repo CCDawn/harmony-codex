@@ -30,10 +30,11 @@ test('night theme is the persisted default and preserves all three appearance mo
 test('home action menu switches night, light, and system themes without restart', () => {
   const index = read(indexPath);
 
-  assert.match(index, /HomeActionMenuItem\('theme', '主题'/);
-  assert.match(index, /ThemeModeButton\('dark', '夜晚'\)/);
-  assert.match(index, /ThemeModeButton\('light', '浅色'\)/);
-  assert.match(index, /ThemeModeButton\('system', '跟随系统'\)/);
+  const settings = read(path.resolve('HarmonyCodexRemote/entry/src/main/ets/components/SettingsPanel.ets'));
+  assert.match(index, /SettingsPanel\(/);
+  assert.match(settings, /ThemeOption\('dark', '夜晚'\)/);
+  assert.match(settings, /ThemeOption\('light', '浅色'\)/);
+  assert.match(settings, /ThemeOption\('system', '跟随系统'\)/);
   assert.match(index, /context\.setColorMode\(colorMode\)/);
   assert.match(index, /COLOR_MODE_DARK/);
   assert.match(index, /COLOR_MODE_LIGHT/);

@@ -18,6 +18,7 @@ const SESSION_ACTIVITY_RUNNING_TTL_MS = 15 * 1000;
 const SESSION_DETAIL_FULL_READ_LIMIT_BYTES = 32 * 1024 * 1024;
 const SESSION_DETAIL_TAIL_BYTES = 8 * 1024 * 1024;
 const RECENT_ASSISTANT_PROGRESS_WINDOW_MS = 10 * 60 * 1000;
+const MOBILE_IMAGE_SOURCE_TEXT = Symbol('mobileImageSourceText');
 
 export class CodexSessionStore {
   constructor(options = {}) {
@@ -1773,6 +1774,7 @@ function dedupeAdjacentMessages(entries) {
       previous.timestamp = merged.timestamp;
       previous.type = merged.type;
       previous.text = merged.text;
+      if (merged[MOBILE_IMAGE_SOURCE_TEXT]) previous[MOBILE_IMAGE_SOURCE_TEXT] = merged[MOBILE_IMAGE_SOURCE_TEXT];
       if (Number.isFinite(Number(entry.syncEndOffset))) {
         previous.syncEndOffset = entry.syncEndOffset;
       }
@@ -1969,8 +1971,8 @@ function isDuplicateVisibleMessage(left, right) {
   if (left.role === 'tool') {
     return false;
   }
-  const leftText = normalizeMessageForDedupe(left.text);
-  const rightText = normalizeMessageForDedupe(right.text);
+  const leftText = normalizeMessageForDedupe(left[MOBILE_IMAGE_SOURCE_TEXT] ?? left.text);
+  const rightText = normalizeMessageForDedupe(right[MOBILE_IMAGE_SOURCE_TEXT] ?? right.text);
   if (leftText.length === 0 || rightText.length === 0) {
     return false;
   }
@@ -1986,13 +1988,15 @@ function isDuplicateVisibleMessage(left, right) {
 function mergeVisibleMessages(left, right) {
   const leftTextLength = String(left.text ?? '').length;
   const rightTextLength = String(right.text ?? '').length;
-  const richer = rightTextLength > leftTextLength
+  const projected = left[MOBILE_IMAGE_SOURCE_TEXT] ? left : (right[MOBILE_IMAGE_SOURCE_TEXT] ? right : null);
+  const richer = projected || (rightTextLength > leftTextLength
     ? right
-    : (rightTextLength === leftTextLength && visibleMessageSourceRank(right) > visibleMessageSourceRank(left) ? right : left);
+    : (rightTextLength === leftTextLength && visibleMessageSourceRank(right) > visibleMessageSourceRank(left) ? right : left));
   return {
     timestamp: right.timestamp || left.timestamp,
     type: richer.type || right.type || left.type,
-    text: richer.text
+    text: richer.text,
+    ...(richer[MOBILE_IMAGE_SOURCE_TEXT] ? { [MOBILE_IMAGE_SOURCE_TEXT]: richer[MOBILE_IMAGE_SOURCE_TEXT] } : {})
   };
 }
 
@@ -2083,7 +2087,8 @@ function summarizeRecord(record, options = {}) {
   if (type === 'response_item') {
     const itemType = payload.type;
     if (itemType === 'message') {
-      const text = extractMessageContent(payload.content, options);
+      const projection = {};
+      const text = extractMessageContent(payload.content, { ...options, mobileImageProjection: projection }, payload.role);
       if (isInternalSessionText(text)) {
         return null;
       }
@@ -2096,7 +2101,10 @@ function summarizeRecord(record, options = {}) {
         timestamp,
         type,
         role,
-        text: truncate(visibleText, MAX_VISIBLE_MESSAGE_LENGTH)
+        text: truncate(visibleText, MAX_VISIBLE_MESSAGE_LENGTH),
+        ...(projection.sourceText ? {
+          [MOBILE_IMAGE_SOURCE_TEXT]: truncate(sanitizeVisibleSessionText(projection.sourceText, { stripLeadingSkillToken: true }), MAX_VISIBLE_MESSAGE_LENGTH)
+        } : {})
       };
     }
     if (itemType === 'function_call') {
@@ -2204,28 +2212,75 @@ function extractTextElements(payload) {
   return '';
 }
 
-function extractMessageContent(content, options = {}) {
+function extractMessageContent(content, options = {}, role = '') {
   if (typeof content === 'string') {
     return materializeMarkdownImagesForMobile(content, options.mobileImagesDir);
   }
   if (!Array.isArray(content)) {
     return '';
   }
-  const imageMarkdown = [];
   const text = content.map((item) => {
     if (typeof item === 'string') {
       return item;
     }
-    if (isImageContentItem(item)) {
-      const markdown = materializeImageItemForMobile(item, options.mobileImagesDir);
-      if (markdown.length > 0) {
-        imageMarkdown.push(markdown);
-      }
-      return '';
-    }
+    if (isImageContentItem(item)) return '';
     return String(item.text ?? item.content ?? '');
   }).filter(Boolean).join('\n');
-  return [materializeMarkdownImagesForMobile(text, options.mobileImagesDir), ...imageMarkdown].filter(Boolean).join('\n');
+  const references = new Map();
+  if (role === 'user') {
+    for (const match of text.matchAll(/!\[手机端图片\]\(([^)\r\n]+)\)/g)) {
+      const key = mobileImagePathKey(match[1]);
+      if (key) references.set(key, match[1]);
+    }
+  }
+  const projectedPaths = new Map();
+  const imageMarkdown = [];
+  content.forEach((item, index) => {
+    if (!isImageContentItem(item)) return;
+    const key = linkedMobileImagePathKey(content, index);
+    let markdown;
+    if (key && references.has(key)) {
+      // Codex records a localImage both in the original phone markdown and in
+      // this path-wrapped input_image. Reuse that attachment without decoding
+      // its potentially large data URL again. Missing originals use the bytes.
+      const localPath = materializeLocalImageForMobile(references.get(key), options.mobileImagesDir);
+      if (!localPath) markdown = materializeImageItemForMobile(item, options.mobileImagesDir);
+      const projectedPath = localPath || markdown.match(/\((.+)\)$/)?.[1];
+      if (projectedPath) {
+        projectedPaths.set(key, projectedPath);
+        return;
+      }
+    }
+    markdown ??= materializeImageItemForMobile(item, options.mobileImagesDir);
+    if (markdown) imageMarkdown.push(markdown);
+  });
+  if (projectedPaths.size > 0 && options.mobileImageProjection) {
+    // Keep the original identity for event_msg/response_item merging even when
+    // a missing upload had to be replaced by a newly materialized image path.
+    options.mobileImageProjection.sourceText = text;
+  }
+  return [materializeMarkdownImagesForMobile(text, options.mobileImagesDir, projectedPaths), ...imageMarkdown].filter(Boolean).join('\n');
+}
+
+function mobileImagePathKey(value) {
+  const filePath = normalizeLocalImagePath(String(value ?? '').trim().replace(/^<(.+)>$/, '$1'));
+  if (!filePath || !path.isAbsolute(filePath)) return '';
+  const resolvedPath = path.resolve(filePath);
+  return process.platform === 'win32' ? resolvedPath.toLowerCase() : resolvedPath;
+}
+
+function linkedMobileImagePathKey(content, index) {
+  const opening = content[index - 1];
+  const closing = content[index + 1];
+  if (content[index]?.type !== 'input_image' || opening?.type !== 'input_text'
+    || closing?.type !== 'input_text' || String(closing.text ?? '').trim() !== '</image>') return '';
+  const wrapper = String(opening.text ?? '').trim().match(/^<image name=\[Image #\d+\] path=(.+)>$/);
+  if (!wrapper) return '';
+  let imagePath = wrapper[1];
+  if (imagePath.startsWith('"')) {
+    try { imagePath = JSON.parse(imagePath); } catch { return ''; }
+  }
+  return typeof imagePath === 'string' ? mobileImagePathKey(imagePath) : '';
 }
 
 function isImageContentItem(item) {
@@ -2409,9 +2464,11 @@ function materializeLocalImageForMobile(imagePath, mobileImagesDir = '') {
   }
 }
 
-function materializeMarkdownImagesForMobile(text, mobileImagesDir = '') {
+function materializeMarkdownImagesForMobile(text, mobileImagesDir = '', projectedPaths = new Map()) {
   return String(text ?? '').replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (match, label, target) => {
     const trimmedTarget = String(target ?? '').trim();
+    const projectedPath = label === '手机端图片' ? projectedPaths.get(mobileImagePathKey(trimmedTarget)) : '';
+    if (projectedPath) return `![${label}](${projectedPath})`;
     const dataMarkdown = materializeImageDataUrlForMobile(trimmedTarget, mobileImagesDir);
     if (dataMarkdown.length > 0) {
       const dataPath = dataMarkdown.match(/\((.+)\)$/)?.[1] ?? '';

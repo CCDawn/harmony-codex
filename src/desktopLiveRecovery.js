@@ -8,6 +8,10 @@ export class DesktopLiveRecovery {
     this.hardScriptPath = options.hardScriptPath ?? path.join(this.repoRoot, 'scripts', 'restart-codex-desktop-live.ps1');
     this.bridgeUrl = options.bridgeUrl ?? process.env.CODEX_DESKTOP_RECOVERY_BRIDGE_URL ?? 'http://127.0.0.1:8787';
     this.bridgeToken = options.bridgeToken ?? process.env.CODEX_BRIDGE_TOKEN ?? '';
+    // The recovery scripts are UTF-8. Windows PowerShell 5 treats BOM-less
+    // scripts as the system code page, corrupting Chinese string literals.
+    this.powershell = options.powershell ?? process.env.CODEX_BRIDGE_POWERSHELL_PATH ?? 'pwsh.exe';
+    this.runProcess = options.runProcess ?? spawnWithTimeout;
     this.timeoutMs = Number.parseInt(options.timeoutMs ?? process.env.CODEX_DESKTOP_RECOVERY_TIMEOUT_MS ?? '90000', 10);
     this.hardTimeoutMs = Number.parseInt(options.hardTimeoutMs ?? process.env.CODEX_DESKTOP_HARD_RECOVERY_TIMEOUT_MS ?? '150000', 10);
     this.enabled = options.enabled ?? process.env.CODEX_DESKTOP_AUTO_RECOVER !== '0';
@@ -81,7 +85,7 @@ export class DesktopLiveRecovery {
       args.push('-RefusePlainCodex');
     }
 
-    const result = await spawnWithTimeout('powershell.exe', args, {
+    const result = await this.runProcess(this.powershell, args, {
       cwd: this.repoRoot,
       timeoutMs: hard ? this.hardTimeoutMs : this.timeoutMs
     });

@@ -1,9 +1,13 @@
 import { CompanionDesktopClient } from './companionDesktopClient.js';
-import { sendJson } from './json.js';
+import { createHash } from 'node:crypto';
+import { readJsonBody, sendJson } from './json.js';
 
 const COMPANION_PATHS = new Set(['/companion/profile', '/companion/messages']);
 const MAX_ID_LENGTH = 512;
 const MAX_CURSOR_LENGTH = 4096;
+const MAX_TEXT_LENGTH = 20000;
+const MAX_SEND_REQUESTS = 4096;
+const REQUEST_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 function httpError(statusCode, message) {
   const error = new Error(message);
@@ -98,12 +102,15 @@ function singleQueryValue(url, key, required = false) {
 }
 
 /**
- * Read-only Companion conversation access. Every operation owns a short-lived
+ * Companion conversation access. Every operation owns a short-lived
  * desktop client; voice-call ownership remains exclusively in voice sessions.
  */
 export class CompanionConversationService {
   constructor({ clientFactory = () => new CompanionDesktopClient() } = {}) {
     this.clientFactory = clientFactory;
+    // Keep completed/uncertain IDs for this service's lifetime. Evicting them
+    // would turn a delayed duplicate HTTP request into another upstream write.
+    this.sendRequests = new Map();
   }
 
   async getProfile() {
@@ -135,6 +142,7 @@ export class CompanionConversationService {
       }
       return {
         entries: page.entries,
+        calls: Array.isArray(page.calls) ? page.calls : [],
         nextCursor: typeof page.nextCursor === 'string' ? page.nextCursor : null
       };
     } finally {
@@ -142,9 +150,66 @@ export class CompanionConversationService {
     }
   }
 
+  async sendText({ profileId, roomId, text, requestId } = {}) {
+    const requestedProfileId = requiredId(profileId, 'profileId');
+    const requestedRoomId = requiredId(roomId, 'roomId');
+    if (typeof text !== 'string' || !text.trim() || text.length > MAX_TEXT_LENGTH
+        || typeof requestId !== 'string' || !REQUEST_ID_PATTERN.test(requestId)) {
+      throw httpError(400, 'Invalid Companion text request');
+    }
+    const stableRequestId = requestId.toLowerCase();
+    const fingerprint = createHash('sha256')
+      .update(JSON.stringify([requestedProfileId, requestedRoomId, text])).digest('hex');
+    const previous = this.sendRequests.get(stableRequestId);
+    if (previous) {
+      if (previous.fingerprint !== fingerprint) {
+        throw httpError(409, 'The Companion request ID is already bound to another message');
+      }
+      return previous.promise;
+    }
+    // Fail closed instead of forgetting uncertain IDs when the bounded ledger
+    // fills. A retained UUID can also be sent as the official idempotency token
+    // after restart; the server's deduplication retention is not established.
+    if (this.sendRequests.size >= MAX_SEND_REQUESTS) {
+      throw httpError(503, 'Companion send request capacity reached');
+    }
+    const promise = this.submitText({ profileId: requestedProfileId, roomId: requestedRoomId,
+      text, requestId: stableRequestId });
+    this.sendRequests.set(stableRequestId, { fingerprint, promise });
+    return promise;
+  }
+
+  async submitText(input) {
+    const client = this.clientFactory();
+    try {
+      const profile = await client.discover();
+      if (profile?.id !== input.profileId || profile?.roomId !== input.roomId) {
+        throw httpError(409, 'The personal assistant changed; refresh the conversation');
+      }
+      let receipt;
+      try {
+        receipt = await client.sendText(input);
+      } catch (error) {
+        const status = Number(error?.statusCode ?? error?.status);
+        if (Number.isInteger(status) && status >= 400 && status < 500 && status !== 408) {
+          throw httpError(status, 'Companion text request rejected');
+        }
+        // A timeout, lost CDP result or server failure can follow acceptance.
+        // Keep the same request ID and never automatically replay this POST.
+        return { requestId: input.requestId, state: 'uncertain', itemId: null };
+      }
+      const itemId = receipt?.requestId === input.requestId && receipt?.state === 'submitted'
+        && typeof receipt?.itemId === 'string' && receipt.itemId.startsWith('room:')
+        && receipt.itemId.length > 5 && receipt.itemId.length <= 517 ? receipt.itemId : null;
+      return { requestId: input.requestId, state: itemId ? 'submitted' : 'uncertain', itemId };
+    } finally {
+      await closeClient(client);
+    }
+  }
+
 }
 
-/** Handle the read-only Companion endpoints; return false for other paths. */
+/** Handle Companion endpoints; return false for other paths. */
 export async function handleCompanionRoute({ request, response, url, service } = {}) {
   let parsedUrl;
   try {
@@ -159,7 +224,8 @@ export async function handleCompanionRoute({ request, response, url, service } =
   if (!COMPANION_PATHS.has(parsedUrl.pathname)) {
     return false;
   }
-  if (request?.method !== 'GET') {
+  const isSend = parsedUrl.pathname === '/companion/messages' && request?.method === 'POST';
+  if (request?.method !== 'GET' && !isSend) {
     sendJson(response, 405, { error: requestErrorPayload(405) });
     return true;
   }
@@ -169,6 +235,15 @@ export async function handleCompanionRoute({ request, response, url, service } =
   }
 
   try {
+    if (isSend) {
+      const body = await readJsonBody(request, 128 * 1024);
+      if (!body || typeof body !== 'object' || Array.isArray(body)) {
+        throw httpError(400, 'A Companion text request object is required');
+      }
+      const { profileId, roomId, text, requestId } = body;
+      sendJson(response, 200, await service.sendText({ profileId, roomId, text, requestId }));
+      return true;
+    }
     if (parsedUrl.pathname === '/companion/profile') {
       sendJson(response, 200, await service.getProfile());
       return true;
@@ -182,7 +257,13 @@ export async function handleCompanionRoute({ request, response, url, service } =
     return true;
   } catch (error) {
     const statusCode = statusCodeFor(error);
-    sendJson(response, statusCode, { error: requestErrorPayload(statusCode) });
+    // Add only fixed classifications: the guardian must distinguish a desktop
+    // adapter mismatch from a transport fault without publishing raw exceptions.
+    const failureClass = ['api_compatibility', 'account'].includes(error?.failureClass) ? error.failureClass
+      : [401, 403].includes(Number(error?.status)) ? 'auth'
+        : Number(error?.status) >= 500 ? 'upstream' : null;
+    sendJson(response, statusCode, { error: requestErrorPayload(statusCode),
+      ...(failureClass ? { failureClass } : {}) });
     return true;
   }
 }

@@ -6,6 +6,7 @@ import test from 'node:test';
 import { once } from 'node:events';
 import { createApp } from '../src/app.js';
 import { DiagnosticLogger } from '../src/diagnosticLogger.js';
+import { DurableOutbox } from '../src/durableOutbox.js';
 
 function fingerprint() {
   return {
@@ -17,7 +18,7 @@ function fingerprint() {
   };
 }
 
-async function createFixture({ outboxPath, runs = [], onSend = null, threadServiceOverrides = {} }) {
+async function createFixture({ outboxPath, runs = [], onSend = null, threadServiceOverrides = {}, outboxReconciler }) {
   const threadService = {
     async listProjects() {
       return [{ id: 'probe', name: 'Probe', root: 'C:\\work' }];
@@ -70,6 +71,7 @@ async function createFixture({ outboxPath, runs = [], onSend = null, threadServi
     repoRoot: path.dirname(outboxPath),
     outboxPath,
     outboxEnabled: true,
+    outboxReconciler,
     outboxBlockedDelayMs: 250,
     appServerRuntimeMode: 'app-server-primary',
     threadService,
@@ -226,6 +228,79 @@ test('outbox API edits, reorders, and cancels queued thread messages', async () 
     fixture.server.close();
   }
 });
+
+test('queued message text remains complete in send and polling responses before official delivery', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-outbox-visible-message-'));
+  const fixture = await createFixture({
+    outboxPath: path.join(root, 'outbox.json'),
+    runs: [{ id: 'busy-run', threadId: 'thread-a', codexSessionId: 'thread-a',
+      status: 'running', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), events: [] }]
+  });
+  const text = '这条消息在等待官方确认时也必须完整可见。'.repeat(20);
+  try {
+    const response = await send(fixture.baseUrl, 'visible-queued', text);
+    const accepted = await response.json();
+    assert.equal(response.status, 202, JSON.stringify(accepted));
+    assert.equal(accepted.outbox.status, 'queued');
+    assert.equal(accepted.run.prompt, text, 'the phone replaces its optimistic bubble with this run');
+    const polled = await (await fetch(`${fixture.baseUrl}/api/codex/runs/${accepted.run.id}`)).json();
+    assert.equal(polled.run.prompt, text, 'polling must not erase or shorten the pending user message');
+    assert.equal(polled.run.submissionId, 'visible-queued');
+  } finally {
+    fixture.server.close();
+  }
+});
+
+for (const scenario of ['existing_thread', 'new_thread', 'steered_thread']) {
+test(`confirmed ${scenario} delivery returns a stable receipt run without claiming model completion or resending`, async t => {
+  const kind = scenario === 'steered_thread' ? 'existing_thread' : scenario;
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-outbox-receipt-api-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const outboxPath = path.join(root, 'outbox.json');
+  const text = '重启后已确认送达的消息仍然可见';
+  const first = new DurableOutbox({ filePath: outboxPath, schedule: false,
+    dispatch: async () => ({ run: { id: 'old-memory-task', status: 'running' }, deliveryPending: true }) });
+  const queued = await first.enqueue({ kind, threadId: kind === 'existing_thread' ? 'thread-a' : '',
+    projectId: 'probe', submissionId: 'restored-receipt', text });
+  await first.dispatchReady();
+  first.close();
+  let redispatches = 0;
+  const fixture = await createFixture({ outboxPath,
+    onSend: async () => { redispatches++; throw new Error('must not send again'); },
+    outboxReconciler: async () => ({ status: 'submitted', result: scenario === 'steered_thread' ? {
+      run: { id: 'old-memory-task', codexSessionId: 'thread-a', status: 'running', prompt: '前一条消息', events: [] },
+      deliveryPending: false
+    } : {
+      id: 'session-receipt:thread-a:observed', threadId: 'thread-a',
+      submissionId: 'restored-receipt', observedAt: new Date().toISOString(), deliveryPending: false
+    } })
+  });
+  try {
+    await fixture.outbox.initialize();
+    for (const response of [
+      await fetch(`${fixture.baseUrl}/api/codex/runs/${queued.id}`),
+      kind === 'existing_thread' ? await send(fixture.baseUrl, 'restored-receipt', text)
+        : await fetch(`${fixture.baseUrl}/api/codex/threads`, { method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ projectId: 'probe', submissionId: 'restored-receipt', prompt: text }) })
+    ]) {
+      const body = await response.json();
+      assert.equal(body.outbox.status, 'submitted');
+      assert.ok(body.run, 'phone run envelope must remain present after receipt-only recovery');
+      assert.equal(body.run.id, queued.id);
+      assert.equal(body.run.prompt, text);
+      assert.equal(body.run.codexSessionId, 'thread-a', 'receipt keeps the official session created before restart');
+      assert.equal(body.run.status, 'submitted', 'delivery confirmation is not model completion');
+      assert.equal(body.run.runtime.kind, 'durable_outbox');
+      assert.equal(body.run.runtime.state, 'submitted');
+      assert.equal(body.run.interruptReady, false);
+    }
+    assert.equal(redispatches, 0);
+  } finally {
+    fixture.server.close();
+  }
+});
+}
 
 test('outbox never steers a message into a turn whose interrupt is still pending', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-outbox-interrupt-barrier-'));

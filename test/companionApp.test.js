@@ -8,17 +8,19 @@ import { createApp } from '../src/app.js';
 import { DiagnosticLogger } from '../src/diagnosticLogger.js';
 import { MockCodexAdapter } from '../src/mockCodexAdapter.js';
 
-test('Companion routes use the bridge authentication gate and cannot send messages', async () => {
+test('Companion routes use the bridge authentication gate', async () => {
   const root=await fs.mkdtemp(path.join(os.tmpdir(),'companion-app-test-'));
   const oldToken=process.env.CODEX_BRIDGE_TOKEN;
   const oldOtp=process.env.CODEX_BRIDGE_TOTP_SECRET;
   process.env.CODEX_BRIDGE_TOKEN='companion-test-token';
   delete process.env.CODEX_BRIDGE_TOTP_SECRET;
   let profileReads=0;
+  let textWrites=0;
   const config={projects:[],outboxEnabled:false,voiceEnabled:false,desktopLiveDiagnostics:false,
     logger:new DiagnosticLogger({root}),deviceRegistryPath:path.join(root,'devices.json'),
     companionService:{async getProfile(){profileReads++;return {profile:{id:'p',roomId:'r',name:'Bear',avatarUrl:null}};},
-      async getMessages(){return {entries:[],nextCursor:null};}}};
+      async getMessages(){return {entries:[],nextCursor:null};},
+      async sendText(input){textWrites++;return {requestId:input.requestId,state:'submitted',itemId:'room:message-1'};}}};
   const {server}=createApp({config,adapter:new MockCodexAdapter()});
   server.listen(0,'127.0.0.1');
   await once(server,'listening');
@@ -32,7 +34,13 @@ test('Companion routes use the bridge authentication gate and cannot send messag
     assert.equal((await response.json()).profile.name,'Bear');
     assert.equal(profileReads,1);
     assert.equal((await fetch(`${base}/companion/messages?profileId=p&roomId=r`,{headers})).status,200);
-    assert.equal((await fetch(`${base}/companion/messages`,{method:'POST',headers,body:'{}'})).status,405);
+    assert.equal((await fetch(`${base}/companion/messages`,{method:'POST',body:'{}'})).status,401);
+    assert.equal(textWrites,0);
+    const sent=await fetch(`${base}/companion/messages`,{method:'POST',headers:{...headers,'Content-Type':'application/json'},body:JSON.stringify({profileId:'p',roomId:'r',text:'fixture',requestId:'51aac16a-b795-4a2e-9126-fec228765985'})});
+    assert.equal(sent.status,200);
+    assert.equal((await sent.json()).itemId,'room:message-1');
+    assert.equal(textWrites,1);
+    assert.equal((await fetch(`${base}/companion/profile`,{method:'POST',headers,body:'{}'})).status,405);
   } finally {
     await new Promise(resolve=>server.close(resolve));
     if(oldToken===undefined)delete process.env.CODEX_BRIDGE_TOKEN;else process.env.CODEX_BRIDGE_TOKEN=oldToken;

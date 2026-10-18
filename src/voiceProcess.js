@@ -4,6 +4,7 @@ import { spawn } from 'node:child_process';
 const LOG_LINE_CLAMP = 400;
 const SPAWN_TIMEOUT_MS = 10_000;
 const RECONNECT_DELAY_CAP_MS = 30_000;
+const STABLE_PROCESS_MS = 30_000;
 
 // 轻量引号感知命令拆分：只处理空格 + 双引号，配合 spawn({ shell: false }) 使用，
 // 避免 shell 注入面。voiceCommand 形如 `"C:\repo\.venv\Scripts\python.exe" "C:\repo\voice\voice_server.py" --port 8790`。
@@ -52,6 +53,7 @@ export function createVoiceProcessSupervisor({ config, logger }) {
   let restarts = 0;
   let reconnectAttempts = 0;
   let reconnectTimer = null;
+  let stableTimer = null;
   const outputBuffers = new Map();
 
   function logEvent(level, event, data = {}) {
@@ -94,7 +96,6 @@ export function createVoiceProcessSupervisor({ config, logger }) {
       stdio: ['ignore', 'pipe', 'pipe']
     });
     child = spawned;
-    reconnectAttempts = 0;
     logEvent('info', 'voice.server.starting', { pid: spawned.pid ?? null });
 
     spawned.stdout?.on('data', (chunk) => drainOutput('stdout', chunk));
@@ -108,6 +109,15 @@ export function createVoiceProcessSupervisor({ config, logger }) {
       }, SPAWN_TIMEOUT_MS);
       spawned.once('spawn', () => {
         clearTimeout(timer);
+        // A successful spawn alone says nothing about service health. Only
+        // reset the crash streak after this process has stayed alive for a while.
+        if (child === spawned && !closing) {
+          stableTimer = setTimeout(() => {
+            stableTimer = null;
+            if (child === spawned) reconnectAttempts = 0;
+          }, STABLE_PROCESS_MS);
+          stableTimer.unref();
+        }
         resolve({ pid: spawned.pid });
       });
       spawned.once('error', (error) => {
@@ -141,6 +151,8 @@ export function createVoiceProcessSupervisor({ config, logger }) {
       return;
     }
     spawned.__voiceExitHandled = true;
+    clearTimeout(stableTimer);
+    stableTimer = null;
     child = null;
     lastExitCode = code;
     flushOutput('stdout');
@@ -188,6 +200,8 @@ export function createVoiceProcessSupervisor({ config, logger }) {
 
   function close() {
     closing = true;
+    clearTimeout(stableTimer);
+    stableTimer = null;
     if (reconnectTimer !== null) {
       clearTimeout(reconnectTimer);
       reconnectTimer = null;

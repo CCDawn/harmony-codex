@@ -4922,6 +4922,7 @@ struct Index {
         );
         if (this.isSubmittedOutboxReceipt(receivedTask) && (this.readSessionNavigation().revision !== navigation.revision
           || this.selectedSession?.id !== targetSessionId)) {
+          this.completeOptimisticSessionSend(submissionId);
           sent = true;
           this.log('info', 'session.receipt.send.stale_ignored', `taskId=${receivedTask.id}`);
           return;
@@ -5035,6 +5036,7 @@ struct Index {
         );
         if (this.isSubmittedOutboxReceipt(receivedTask) && (this.readSessionNavigation().revision !== navigationRevision
           || !this.isNewSessionDraft)) {
+          this.completeOptimisticSessionSend(submissionId);
           sent = true;
           this.log('info', 'session.receipt.new.stale_ignored', `taskId=${receivedTask.id}`);
           return;
@@ -9433,7 +9435,8 @@ struct Index {
       }
     } catch (error) {
       const detail = this.errorText(error as Error);
-      const certain = /HTTP (400|401|403|404|409|413|422)(?:[：:\s]|$)/.test(detail);
+      const rejectedStatus = /HTTP (4\d{2})(?:[：:\s]|$)/.exec(detail);
+      const certain = rejectedStatus !== null && rejectedStatus[1] !== '408';
       CompanionTextService.markFailure(partition, requestId, certain
         ? detail : '提交结果不确定，请先核对官方记录，避免重复发送', certain);
     }

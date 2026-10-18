@@ -54,3 +54,15 @@ test('official calls cross client and service boundaries without becoming chat m
   assert.equal(page.calls[0].callId, 'rtc_a');
   assert.equal(page.calls[0].transcriptStatus, 'unavailable');
 });
+
+test('official call summaries remain call metadata rather than duplicate authored utterances', async () => {
+  const client = new CompanionDesktopClient({ ensureConnected: async () => {},
+    evaluate: async () => ({ items: [{ ...message, content: { ...message.content, text: 'Official call summary' } }] }),
+    close() {} });
+  client.profile = { id: 'assistant', roomId: 'room' };
+  client.roomMetadata = { authors };
+  const page = await client.messages();
+  assert.deepEqual(page.entries, []);
+  assert.equal(page.calls.length, 1);
+  assert.equal(page.calls[0].summary, 'Official call summary');
+});

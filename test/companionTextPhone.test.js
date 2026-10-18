@@ -235,7 +235,8 @@ test('disk failure prevents the POST, exposes failure and recovers text only int
 });
 
 test('transport timeout is uncertain and never retried; explicit rejection is recoverable failure', async t => {
-  for (const [error, state] of [['network timeout', 'uncertain'], ['桥接返回异常 HTTP 409：identity changed', 'failed']]) {
+  for (const [error, state] of [['network timeout', 'uncertain'], ['HTTP 408: timeout', 'uncertain'],
+    ['桥接返回异常 HTTP 409：identity changed', 'failed'], ['HTTP 429: rate limited', 'failed']]) {
     let calls = 0;
     const { page } = pageHarness(t, async () => { calls += 1; throw Error(error); });
     await page.sendCompanionText();

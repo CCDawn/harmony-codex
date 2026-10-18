@@ -134,7 +134,8 @@ return await api.safeGet('/messaging/rooms/{room_id}/messages', {
     const items = Array.isArray(response?.items) ? response.items : [];
     const oldest = items.slice().sort((a, b) => String(a.created_at ?? '').localeCompare(String(b.created_at ?? '')))[0];
     return {
-      entries: historyEntries(response?.items, metadata.authors),
+      entries: historyEntries(items.filter(message => !Array.isArray(message?.content?.attachments)
+        || !message.content.attachments.some(attachment => attachment?.type === 'call')), metadata.authors),
       calls: companionCallRecords(response?.items, metadata.authors),
       // This server can return null cursors on a full page. Its supported
       // `before=<oldest message id>` also retrieves non-overlapping older pages.

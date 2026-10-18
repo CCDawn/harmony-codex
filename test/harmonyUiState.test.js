@@ -213,6 +213,22 @@ test('both send paths and polling use the dedicated delivery-receipt branch', ()
   assert.doesNotMatch(body, /handleTaskTerminalForSession|unmarkSessionRunning|markSessionRunningLocallyCleared|publishTaskCompletion|startPolling/);
 });
 
+test('late submitted receipts retire their optimistic attempt without overwriting the current page', () => {
+  for (const name of ['sendMessageToSelectedSession', 'sendNewSessionMessage']) {
+    const branch = methodBody(name).match(/if \(this\.isSubmittedOutboxReceipt\(receivedTask\)[\s\S]*?return;\s*\}/)?.[0];
+    assert.ok(branch);
+    const state = { selectedSession: { id: 'other' }, currentTask: { id: 'newer-task' }, isNewSessionDraft: false,
+      pending: ['submitted-attempt', 'other-attempt'], readSessionNavigation: () => ({ revision: 2 }),
+      isSubmittedOutboxReceipt: () => true, log() {},
+      completeOptimisticSessionSend(id) { this.pending = this.pending.filter(value => value !== id); } };
+    new Function('receivedTask', 'navigation', 'navigationRevision', 'targetSessionId', 'submissionId', branch)
+      .call(state, { id: 'receipt' }, { revision: 1 }, 1, 'thread', 'submitted-attempt');
+    assert.deepEqual(state.pending, ['other-attempt']);
+    assert.equal(state.currentTask.id, 'newer-task');
+    assert.equal(state.selectedSession.id, 'other');
+  }
+});
+
 test('a receipt bubble is not consumed by an old user message or a later assistant-only tail window', async () => {
   const { state, receipt } = submittedReceiptHarness({ async getSessionHistoryPage() {
     return { id: 'thread', activityStatus: 'running', entries: [

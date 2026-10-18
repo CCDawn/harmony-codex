@@ -94,16 +94,32 @@ function Invoke-DesktopSafeRecovery {
     return [pscustomobject]@{state='failed';message='桌面安全恢复未完成；已保留 Codex，请查看日志'}
   }
 }
+function Get-DesktopLauncherArguments {
+  param([string[]]$Arguments)
+  if (Get-Variable GuardianRepair -ValueOnly -ErrorAction SilentlyContinue) {
+    # Carry the persisted intent through the detached launcher's slow discovery.
+    # Hashes also cancel an older request after Stop/Start or Disable/Enable.
+    $configPath=Join-Path $repo 'logs\state\mobile-link-guardian-config.json'
+    $controlPath=Get-MobileLinkStatePath $repo
+    $configVersion=(Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash
+    $controlVersion=if (Test-Path -LiteralPath $controlPath) { (Get-FileHash -LiteralPath $controlPath -Algorithm SHA256).Hash } else { 'missing' }
+    $Arguments+=@('-GuardianRepair','-GuardianConfigVersion',$configVersion,'-GuardianControlVersion',$controlVersion)
+  }
+  $Arguments
+}
 function Invoke-DesktopRepair {
   $safe=Invoke-DesktopSafeRecovery
   if ($safe.state -in @('not-needed','recovered','pending')) { return $safe }
   if ((Get-Variable GuardianRepair -ValueOnly -ErrorAction SilentlyContinue) -and -not (Test-GuardianRepairAllowed)) { return [pscustomobject]@{state='cancelled';message='自动恢复已取消'} }
   Write-LinkEvent 'desktop-restart-requested'
-  $launcher=Start-MobileLinkDetached -HostPath (Get-Process -Id $PID).Path -ScriptPath (Join-Path $repo 'scripts\restart-codex-desktop-live.ps1') -Arguments @('-BridgeUrl',$bridgeUrl) -LogPath (Join-Path $repo 'logs\startup\desktop-repair.log') -WorkingDirectory $repo
+  $arguments=@('-BridgeUrl',$bridgeUrl)
+  if (Get-Variable GuardianRepair -ValueOnly -ErrorAction SilentlyContinue) { $arguments=Get-DesktopLauncherArguments $arguments }
+  $launcher=Start-MobileLinkDetached -HostPath (Get-Process -Id $PID).Path -ScriptPath (Join-Path $repo 'scripts\restart-codex-desktop-live.ps1') -Arguments $arguments -LogPath (Join-Path $repo 'logs\startup\desktop-repair.log') -WorkingDirectory $repo
   try {
     if (-not $launcher.WaitForExit(120000) -or $launcher.ExitCode -eq 10) {
       return [pscustomobject]@{state='pending';message='桌面重启恢复仍在进行，请稍后刷新状态，无需重复操作'}
     }
+    if ($launcher.ExitCode -eq 12) { return [pscustomobject]@{state='cancelled';message='自动恢复已取消'} }
     $updated=Get-LinkValue (Get-LinkApi '/desktop/live/status') 'desktop'
     if ($launcher.ExitCode -eq 0 -and [bool](Get-LinkValue $updated 'desktopLive' $false)) {
       return [pscustomobject]@{state='restarted';message='已重启 Codex 并重新连接桌面接口，正在验证会话读取'}
@@ -115,7 +131,9 @@ function Start-MissingDesktop {
   if ((Get-Variable GuardianRepair -ValueOnly -ErrorAction SilentlyContinue) -and -not (Test-GuardianRepairAllowed)) { return [pscustomobject]@{state='cancelled';message='自动恢复已取消'} }
   # StartOnly refuses an existing desktop and never stops its processes, even
   # if the status snapshot became stale while the launcher was starting.
-  $launcher=Start-MobileLinkDetached -HostPath (Get-Process -Id $PID).Path -ScriptPath (Join-Path $repo 'scripts\restart-codex-desktop-live.ps1') -Arguments @('-BridgeUrl',$bridgeUrl,'-StartOnly','-RefusePlainCodex') -LogPath (Join-Path $repo 'logs\startup\desktop-start.log') -WorkingDirectory $repo
+  $arguments=@('-BridgeUrl',$bridgeUrl,'-StartOnly','-RefusePlainCodex')
+  if (Get-Variable GuardianRepair -ValueOnly -ErrorAction SilentlyContinue) { $arguments=Get-DesktopLauncherArguments $arguments }
+  $launcher=Start-MobileLinkDetached -HostPath (Get-Process -Id $PID).Path -ScriptPath (Join-Path $repo 'scripts\restart-codex-desktop-live.ps1') -Arguments $arguments -LogPath (Join-Path $repo 'logs\startup\desktop-start.log') -WorkingDirectory $repo
   try {
     if (-not $launcher.WaitForExit(90000)) {
       return [pscustomobject]@{state='pending';message='Codex 桌面仍在启动，请稍后查看状态；无需重复点击启动'}
@@ -123,6 +141,7 @@ function Start-MissingDesktop {
     if ($launcher.ExitCode -eq 10) {
       return [pscustomobject]@{state='pending';message='已有 Codex 启动操作正在进行，请稍后查看状态'}
     }
+    if ($launcher.ExitCode -eq 12) { return [pscustomobject]@{state='cancelled';message='自动恢复已取消'} }
     $updated=Get-LinkValue (Get-LinkApi '/desktop/live/status') 'desktop'
     if ([bool](Get-LinkValue $updated 'desktopLive' $false)) {
       return [pscustomobject]@{state='recovered';message='已启动 Codex 并连接桌面通道'}

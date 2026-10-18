@@ -86,21 +86,30 @@ export async function inspectMobileLink({ baseUrl, headers = {}, getHeaders = ()
   if (!collectSignals) return { checks, restartRequired };
   const faults = [];
   const add = (id, kind, repairable, component) => faults.push({ id, kind, repairable, component });
+  const httpFailureClass = result => result.failureClass
+    || ([401, 403].includes(result.httpStatus) ? 'auth'
+      : [404, 405].includes(result.httpStatus) ? 'api_compatibility'
+        : result.httpStatus === 429 || result.httpStatus >= 500 ? 'upstream' : null);
+  const desktopFault = httpFailureClass(desktop)
+    || (desktop.ok && desktop.body?.desktop?.desktopLive === false ? 'local_service' : 'unknown');
   const classify = (result, id, component) => {
     if (result.failureClass) return add(id, result.failureClass, false, component);
-    if ([401, 403].includes(result.httpStatus)) return add(id, 'auth', false, component);
+    if (!live && desktopFault === 'auth') return add(id, 'auth', false, component);
+    const explicitFailure = httpFailureClass(result);
+    if (explicitFailure && !(explicitFailure === 'upstream' && !live && desktopFault === 'local_service')) {
+      return add(id, explicitFailure, false, component);
+    }
     if (!live) {
-      if (desktop.failureClass) return add(id, desktop.failureClass, false, component);
-      if ([401, 403].includes(desktop.httpStatus)) return add(id, 'auth', false, component);
-      return add(id, 'local_service', true, 'desktop');
+      return add(id, desktopFault, desktopFault === 'local_service', 'desktop');
     }
     if (result.httpStatus >= 500) return add(id, 'upstream', false, component);
     return add(id, 'unknown', false, component);
   };
   if (!healthy) {
-    if ([401, 403].includes(health.httpStatus)) add('bridge', 'auth', false, 'bridge');
+    const healthFailure = httpFailureClass(health);
+    if (healthFailure) add('bridge', healthFailure, false, 'bridge');
     else if (health.ok) add('bridge', 'unknown', false, 'bridge');
-    else add('bridge', 'transport', true, 'bridge');
+    else add('bridge', health.httpStatus === 0 ? 'transport' : 'unknown', health.httpStatus === 0, 'bridge');
   } else {
     if (!live) classify(desktop, 'desktop', 'desktop');
     if (!readable) classify(sessions, 'sessions', 'sessions');
@@ -114,6 +123,11 @@ export async function inspectMobileLink({ baseUrl, headers = {}, getHeaders = ()
 export async function inspectGuardianExtras({ baseUrl, publicBaseUrl = '', getHeaders = () => ({}),
   fetchImpl = fetch, localReady = false, timeoutMs = 6000, probeVoice = probeVoiceUpgrade } = {}) {
   const checks = [], faults = [];
+  const voiceFault = (id, status, component, repairKind) => ({ id, component,
+    kind: [401, 403].includes(status) ? 'auth' : [404, 405].includes(status) ? 'api_compatibility'
+      : [0, 502, 503, 504].includes(status) ? repairKind
+        : status === 429 || status >= 500 ? 'upstream' : 'unknown',
+    repairable: [0, 502, 503, 504].includes(status) });
   let publicReady = false;
   async function read(base, route) {
     try {
@@ -144,14 +158,12 @@ export async function inspectGuardianExtras({ baseUrl, publicBaseUrl = '', getHe
       const result = await probeVoice(baseUrl, await getHeaders(), timeoutMs);
       checks.push({ id: 'voice_transport', title: '语音通道', state: result.ok ? 'ready' : 'error',
         message: result.ok ? '语音通道握手通过；未发起通话，实际声音尚未验证' : '语音通道握手失败，尚未发起通话' });
-      if (!result.ok) faults.push({ id: 'voice_transport', kind: [401, 403].includes(result.status) ? 'auth' : 'local_service',
-        repairable: ![401, 403].includes(result.status), component: 'voice' });
+      if (!result.ok) faults.push(voiceFault('voice_transport', result.status, 'voice', 'local_service'));
       if (result.ok && publicReady) {
         const publicVoice = await probeVoice(publicBaseUrl, await getHeaders(), timeoutMs);
         checks.push({ id: 'voice_public', title: '公网语音通道', state: publicVoice.ok ? 'ready' : 'error',
           message: publicVoice.ok ? '公网语音握手通过；未发送声音，通话体验尚未验证' : '本机语音正常，公网语音握手未通过' });
-        if (!publicVoice.ok) faults.push({ id: 'voice_public', kind: [401, 403].includes(publicVoice.status) ? 'auth' : 'transport',
-          repairable: ![401, 403].includes(publicVoice.status), component: 'public' });
+        if (!publicVoice.ok) faults.push(voiceFault('voice_public', publicVoice.status, 'public', 'transport'));
       }
     } else {
       checks.push({ id: 'voice_transport', title: '语音通道', state: 'unverified',

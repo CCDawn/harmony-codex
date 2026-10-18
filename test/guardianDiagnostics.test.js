@@ -1,8 +1,33 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { inspectMobileLink, inspectGuardianExtras } from '../tools/windows/mobile-link-diagnostics.mjs';
+import { decideGuardian } from '../tools/windows/mobile-link-guardian-policy.mjs';
 
 const baseUrl = 'http://127.0.0.1:1234';
+for (const status of [404, 429, 200]) {
+  test(`voice handshake HTTP ${status} without an upgrade cannot restart services`, async () => {
+    const result = await inspectGuardianExtras({ baseUrl, localReady: true,
+      fetchImpl: mockFetch({ '/voice/status': { voice: { enabled: true } } }),
+      probeVoice: async () => ({ ok: false, status }) });
+    assert.equal(result.faults.length, 1);
+    assert.equal(result.faults[0].repairable, false);
+  });
+}
+for (const desktop of [{ httpStatus: 404 }, { httpStatus: 429 }, { httpStatus: 503 }, {}, new Error('offline')]) {
+  test(`unconfirmed desktop failure ${desktop.httpStatus || desktop.message || 'invalid body'} never authorizes restarts`, async () => {
+    const diagnostics = await inspectMobileLink({ baseUrl, collectSignals: true,
+      fetchImpl: mockFetch({ '/desktop/live/status': desktop }) });
+    assert.ok(diagnostics.guardianSignals.faults.length > 0);
+    assert.ok(diagnostics.guardianSignals.faults.every(f => !f.repairable));
+    let state = {};
+    for (let tick = 0; tick < 5; tick++) {
+      const result = decideGuardian({ config: { enabled: true, allowForceRestart: true }, state, diagnostics });
+      assert.equal(result.action, null);
+      assert.equal(result.status.phase, 'needs_attention');
+      state = result.state;
+    }
+  });
+}
 function mockFetch(overrides = {}, calls = []) {
   const bodies = { '/health': {ok:true,runtime:{mode:'desktop'}},
     '/desktop/live/status':{desktop:{desktopLive:true}}, '/codex/sessions?limit=1':{sessions:[]},

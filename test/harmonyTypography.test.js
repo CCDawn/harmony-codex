@@ -44,11 +44,12 @@ test('font scale offers four persisted app-wide modes', () => {
   assert.match(typography, /return 130/);
   assert.match(index, /PersistentStorage\.persistProp\(FONT_SCALE_STORAGE_KEY, DEFAULT_FONT_SCALE_MODE\)/);
   assert.match(index, /@StorageLink\('codexRemoteFontScaleMode'\) fontScaleMode: string = DEFAULT_FONT_SCALE_MODE/);
-  assert.match(index, /HomeActionMenuItem\(\s*'font_size'/);
-  assert.match(index, /FontScaleButton\('small', '小'\)/);
-  assert.match(index, /FontScaleButton\('standard', '标准'\)/);
-  assert.match(index, /FontScaleButton\('large', '大'\)/);
-  assert.match(index, /FontScaleButton\('extra_large', '特大'\)/);
+  const settings = read(path.resolve('HarmonyCodexRemote/entry/src/main/ets/components/SettingsPanel.ets'));
+  assert.match(index, /SettingsPanel\(/);
+  assert.match(settings, /FontOption\('small', '小字体'\)/);
+  assert.match(settings, /FontOption\('standard', '标准字体'\)/);
+  assert.match(settings, /FontOption\('large', '大字体'\)/);
+  assert.match(settings, /FontOption\('extra_large', '特大字体'\)/);
 });
 
 test('text sizes and line heights use the global scale while icons stay fixed', () => {
@@ -91,8 +92,8 @@ test('assistant messages stay borderless but gain a readable inset and visual an
   const assistantBody = body.slice(assistantStart);
 
   assert.match(assistantBody, /\.width\(6\)[\s\S]*\.backgroundColor\(this\.theme\(\)\.accent\)/);
-  assert.match(assistantBody, /\.width\('88%'\)/);
-  assert.match(assistantBody, /\.padding\(\{ left: 12, right: 0, top: 2, bottom: 4 \}\)/);
+  assert.match(assistantBody, /\.width\('100%'\)/);
+  assert.match(assistantBody, /\.padding\(\{ left: 0, right: 0, top: 8, bottom: 12 \}\)/);
   assert.doesNotMatch(assistantBody, /\.backgroundColor\([^)]*\)[\s\S]{0,100}\.border\(/);
 });
 
@@ -120,9 +121,9 @@ test('user bubbles shrink for short prompts and remain capped for long prompts',
   assert.match(textWidthBody, /Math\.max\(112, Math\.min\(620, 32 \+ longestLineLength \* 13\)\)/);
   assert.match(widthBody, /this\.userTextBubbleWidth\(this\.sessionEntryVisibleText\(entry\)\)/);
   assert.match(entryBody, /\.width\(this\.userSessionEntryWidth\(entry\)\)/);
-  assert.match(entryBody, /\.constraintSize\(\{ maxWidth: '82%' \}\)/);
-  assert.match(optimisticBody, /\.width\(this\.userTextBubbleWidth\(message\.text\)\)/);
-  assert.match(optimisticBody, /\.constraintSize\(\{ maxWidth: '82%' \}\)/);
+  assert.match(entryBody, /\.constraintSize\(\{ maxWidth: '88%' \}\)/);
+  assert.match(optimisticBody, /\.width\(message\.files\.length > 0 \|\| message\.images\.length > 0 \? '78%' : this\.userTextBubbleWidth\(message\.text\)\)/);
+  assert.match(optimisticBody, /\.constraintSize\(\{ maxWidth: '88%' \}\)/);
 });
 
 test('header shows effective model and reasoning without duplicate automatic labels', () => {

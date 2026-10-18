@@ -31,11 +31,18 @@ import av
 from aiortc import RTCPeerConnection, RTCSessionDescription
 from aiortc.mediastreams import MediaStreamError, MediaStreamTrack
 
+try:
+    from .media_diagnostics import MediaDiagnostics, install_dtls_signals
+except ImportError:
+    from media_diagnostics import MediaDiagnostics, install_dtls_signals
+
 WORK = Path(__file__).resolve().parent
 LOG_PATH = WORK / "voice-server.log"
 SCRATCH = WORK / "voice-scratch"
 ALLOWED_VOICES = {"juniper", "maple", "spruce", "ember", "vale", "breeze", "arbor", "sol", "cove"}
-IDLE_TIMEOUT_S = 90.0        # no client binary audio for this long -> closed "idle"
+IDLE_TIMEOUT_S = 90.0        # no inbound audio OR acknowledged transport probe
+CLIENT_PING_INTERVAL_S = 20.0
+HEALTH_INTERVAL_S = 5.0
 SPEAKING_IDLE_S = 0.600      # outbound audio idle -> speaking stop
 SDP_GATHER_WAIT_S = 3.0      # ICE candidate gathering wait (proven m1 value)
 MEDIA_READY_TIMEOUT_S = 15.0
@@ -44,7 +51,7 @@ IN_FRAME_BYTES = IN_FRAME_SAMPLES * 4
 IN_BACKLOG_BYTES = 48000 * 4 * 2  # cap microphone jitter to two seconds
 OUT_CHUNK_BYTES = 4800       # 100ms of 24k mono s16le
 OUT_PACE_S = OUT_CHUNK_BYTES / 48000.0
-OUT_BACKLOG_CAP = 480000     # 10s of 24k audio; beyond this drop oldest
+OUT_BACKLOG_CAP = 48000      # 1s of 24k audio; beyond this drop oldest
 CODEX_EXE_MIN_BYTES = 1 << 20  # 自动更新器会留 <1MB 的 codex.exe 残骸，选型时跳过
 
 # ---- 下行重复异常音频检测 ----
@@ -422,6 +429,7 @@ class Session:
         self.speaking = False
         self.last_out_sent = 0.0        # monotonic ts of last audible outbound chunk
         self.last_client_audio = time.monotonic()
+        self.last_client_pong = 0.0
         self.audio_bytes_in = 0
         self.audio_bytes_out = 0
         self.max_input_rms = 0.0
@@ -438,6 +446,11 @@ class Session:
         self.transcript_items = {}
         self.zombie = ZombieDetector()  # 下行僵尸音频检测（只观测，不吞帧）
         self._tasks = []
+        self.media_diagnostics = MediaDiagnostics(log)
+        self.data_channel = None
+        self.local_media_release = False
+        self.playback_control_enabled = False
+        self.output_lock = asyncio.Lock()
 
     # ---- device I/O helpers ----
     async def send_json(self, obj):
@@ -500,6 +513,15 @@ class Session:
         # offer an OpenAI-style control datachannel (session events may flow here)
         try:
             dc = pc.createDataChannel(getattr(self, "data_channel_label", "odata"), ordered=True)
+            self.data_channel = dc
+
+            @dc.on("open")
+            def _on_dc_open():
+                self.log_media_state()
+
+            @dc.on("close")
+            def _on_dc_close():
+                self.log_media_state()
 
             @dc.on("message")
             def _on_dc(msg):
@@ -517,6 +539,8 @@ class Session:
                 while True:
                     try:
                         for f in out_resampler.resample(await remote.recv()):
+                            if not self.should_buffer_output():
+                                continue  # keep draining remote media while suppressed
                             self.out_buf += bytes(f.planes[0])[:f.samples * 2]
                             if len(self.out_buf) > OUT_BACKLOG_CAP:
                                 drop = len(self.out_buf) - OUT_BACKLOG_CAP // 2
@@ -532,10 +556,20 @@ class Session:
         @pc.on("connectionstatechange")
         def on_cs():
             log("pc-state", pc.connectionState)
+            self.log_media_state()
             if pc.connectionState == "connected":
                 self.media_connected.set()
             elif pc.connectionState in ("failed", "closed") and not self.stopped:
                 self.sync_error(f"WebRTC connection {pc.connectionState}")
+
+        @pc.on("iceconnectionstatechange")
+        def on_ice_state():
+            self.log_media_state()
+
+        for sender in pc.getSenders():
+            @sender.transport.on("statechange")
+            def on_dtls_state():
+                self.log_media_state()
 
         offer = await pc.createOffer()
         await pc.setLocalDescription(offer)
@@ -556,6 +590,11 @@ class Session:
         except Exception:
             event_type = "unparsed"
         log("datachannel", str(event_type))
+
+    def log_media_state(self):
+        self.media_diagnostics.state(self.pc, channel=self.data_channel,
+                                     local_release=self.local_media_release,
+                                     requested_stop=self.requested_stop)
 
     async def after_remote_description(self):
         pass
@@ -705,6 +744,7 @@ class Session:
                 self.audio_bytes_in += len(raw)
                 self.max_input_rms = max(self.max_input_rms, pcm16_rms(raw))
                 if self.track and not self.track.halt:
+                    await self.on_microphone_audio(raw)
                     await self.track.push(bytes(raw))
                 continue
             try:
@@ -719,45 +759,66 @@ class Session:
                 await self.finish("requested")
                 return
             elif mtype == "interrupt":
-                self.gen += 1
-                dropped = len(self.out_buf)
-                self.out_buf.clear()
-                self.zombie.reset()  # 旧下行被丢弃，检测窗口同步作废重来
-                log("client-interrupt", f"gen={self.gen} dropped={dropped}B")
-                if self.speaking:
-                    self.speaking = False
-                    await self.send_json({"type": "speaking", "state": "stop"})
-                # v1: server-side response is NOT cancelled; only local pending
-                # outbound audio is dropped. Backend keeps listening via webrtc.
+                await self.on_client_interrupt()
             elif mtype == "start":
                 await self.send_json({"type": "error", "message": "session already started"})
             else:
                 log("client-unknown-frame", str(msg)[:120])
 
     # ---- outbound audio pacer (24k mono -> device, ~1x realtime) ----
+    async def on_microphone_audio(self, raw):
+        pass
+
+    def should_buffer_output(self):
+        return True
+
+    def should_send_output(self):
+        return True
+
+    def discard_pending_output(self):
+        self.gen += 1
+        dropped = len(self.out_buf)
+        self.out_buf.clear()
+        self.zombie.reset()
+        self.speaking = False
+        return dropped
+
+    async def on_client_interrupt(self):
+        dropped = self.discard_pending_output()
+        async with self.output_lock:
+            log("client-interrupt", f"gen={self.gen} dropped={dropped}B")
+            await self.send_json({"type": "speaking", "state": "stop"})
+        # Legacy clients discard pending output without assuming a cancel RPC.
+
     async def outbound_pump(self):
         next_send_at = None
         try:
             while not self.stopped:
-                if len(self.out_buf) < OUT_CHUNK_BYTES:
+                if not self.should_send_output() or len(self.out_buf) < OUT_CHUNK_BYTES:
                     self.out_evt.clear()
                     try:
                         await asyncio.wait_for(self.out_evt.wait(), 0.5)
                     except asyncio.TimeoutError:
                         continue
                     continue
-                chunk = bytes(self.out_buf[:OUT_CHUNK_BYTES])
-                del self.out_buf[:OUT_CHUNK_BYTES]
-                chunk_rms = pcm16_rms(chunk)
-                self.max_output_rms = max(self.max_output_rms, chunk_rms)
-                audible = chunk_rms >= ZOMBIE_RMS_FLOOR
-                if audible and not self.speaking:
-                    self.speaking = True
-                    await self.send_json({"type": "speaking", "state": "start"})
-                try:
-                    await self.ws.send(chunk)
-                except Exception:
-                    return
+                async with self.output_lock:
+                    if not self.should_send_output() or len(self.out_buf) < OUT_CHUNK_BYTES:
+                        continue
+                    generation = self.gen
+                    chunk = bytes(self.out_buf[:OUT_CHUNK_BYTES])
+                    del self.out_buf[:OUT_CHUNK_BYTES]
+                    chunk_rms = pcm16_rms(chunk)
+                    self.max_output_rms = max(self.max_output_rms, chunk_rms)
+                    audible = chunk_rms >= ZOMBIE_RMS_FLOOR
+                    if audible and not self.speaking:
+                        self.speaking = True
+                        await self.send_json({"type": "speaking", "state": "start"})
+                    if generation != self.gen or not self.should_send_output():
+                        continue
+                    try:
+                        await self.ws.send(chunk)
+                    except Exception:
+                        return
                 self.audio_bytes_out += len(chunk)
                 if audible:
                     self.last_out_sent = time.monotonic()
@@ -783,10 +844,35 @@ class Session:
         except asyncio.CancelledError:
             pass
 
-    async def idle_watch(self):
+    async def client_transport_watch(self):
+        """Probe the phone independently of microphone capture (including mute).
+
+        The bridge and relay forward raw WebSocket frames, so a matching Pong
+        proves a round trip to the phone. Sending a Ping alone proves nothing.
+        Slow control frames must not disconnect a phone still uploading PCM.
+        """
         try:
             while not self.stopped:
-                await asyncio.sleep(5)
+                pong = await self.ws.ping()
+                try:
+                    await asyncio.wait_for(pong, IDLE_TIMEOUT_S)
+                except asyncio.TimeoutError:
+                    pass  # idle_watch also checks independently arriving PCM
+                else:
+                    self.last_client_pong = time.monotonic()
+                await asyncio.sleep(CLIENT_PING_INTERVAL_S)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # recv_loop handles closed sockets; an unanswered probe never
+            # advances the activity clock and will still expire in idle_watch.
+            log("client-transport-probe-ended")
+
+    async def idle_watch(self):
+        transport_watch = asyncio.create_task(self.client_transport_watch())
+        try:
+            while not self.stopped:
+                await asyncio.sleep(HEALTH_INTERVAL_S)
                 # Numeric health evidence only; never record microphone samples
                 # or transcript text while diagnosing a silent call.
                 track = self.track
@@ -800,12 +886,14 @@ class Session:
                     "queued_bytes": len(track.pcm) if track else 0,
                     "dropped_bytes": track.dropped_bytes if track else 0,
                     "input_age_s": round(time.monotonic() - self.last_client_audio, 1),
+                    "client_activity_age_s": round(time.monotonic() - max(
+                        self.last_client_audio, self.last_client_pong), 1),
                     "peer": self.pc.connectionState if self.pc else "none",
                 }))
                 self.max_input_rms = self.max_output_rms = 0.0
                 if track:
                     track.max_sent_rms = 0.0
-                if time.monotonic() - self.last_client_audio >= IDLE_TIMEOUT_S:
+                if time.monotonic() - max(self.last_client_audio, self.last_client_pong) >= IDLE_TIMEOUT_S:
                     log("session-idle-timeout")
                     await self.finish("idle")
                     try:
@@ -815,6 +903,9 @@ class Session:
                     return
         except asyncio.CancelledError:
             pass
+        finally:
+            transport_watch.cancel()
+            await asyncio.gather(transport_watch, return_exceptions=True)
 
     # ---- teardown ----
     async def finish(self, reason):
@@ -837,6 +928,8 @@ class Session:
         if self.track:
             self.track.halt_stream()
         if self.pc:
+            self.local_media_release = True
+            self.log_media_state()
             try:
                 await self.pc.close()
             except Exception:
@@ -869,19 +962,22 @@ async def handler(ws):
                                       "message": "expected start frame first"}))
             return
         async with _session_lock:
-            if _active is not None and not _active.close_sent and not _active.stopped:
+            if _active is not None and (getattr(_active, "cleanup_pending", False)
+                                       or (not _active.close_sent and not _active.stopped)):
                 log("ws-busy", str(peer))
                 await ws.send(json.dumps({"type": "busy"}))
                 await ws.close()
                 return
             from companion_session import CompanionSession
             sess = CompanionSession(ws)
+            version = first.get("playbackControlVersion")
+            sess.playback_control_enabled = type(version) is int and version == 1
             _active = sess
         try:
             await sess.run()
         finally:
             async with _session_lock:
-                if _active is sess:
+                if _active is sess and not getattr(sess, "cleanup_pending", False):
                     _active = None
     except Exception as e:
         log("ws-handler-error", f"{type(e).__name__}: {e}")
@@ -896,13 +992,13 @@ async def main():
     args = parser.parse_args()
     _log_fh = open(LOG_PATH, "a", encoding="utf-8")
     SCRATCH.mkdir(exist_ok=True)
-    log("server-boot", f"port={args.port}")
+    log("server-boot", f"port={args.port} liveness=audio-or-pong diagnostics=media-v1 barge-in=2")
+    uninstall_dtls_signals = install_dtls_signals(log)
 
     import websockets.asyncio.server as wss
 
-    # Some mobile transports delay control-frame Pong while PCM is still flowing.
-    # Keep protocol Pings for NAT, but let the 90s inbound-audio watchdog own
-    # liveness rather than closing an actively sending phone after 20s.
+    # Keep handshake/startup NAT traffic. Once ready, idle_watch owns liveness
+    # using acknowledged Pings OR arriving PCM; muted calls need no mic upload.
     async with wss.serve(handler, "127.0.0.1", args.port, max_size=1 << 20,
                          ping_interval=20, ping_timeout=None):
         print(f"VOICE-SERVER listening 127.0.0.1:{args.port}", flush=True)
@@ -911,6 +1007,7 @@ async def main():
         finally:
             log("server-shutdown")
             APP.kill()
+            uninstall_dtls_signals()
 
 
 if __name__ == "__main__":

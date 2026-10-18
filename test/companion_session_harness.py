@@ -116,7 +116,7 @@ class CompanionSessionHarness(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(answer, "v=0\r\nanswer")
         self.assertEqual(session._rpc.await_args_list, [
-            mock.call("start", {"sdp": "v=0\r\noffer"}),
+            mock.call("start", {"sdp": "v=0\r\noffer"}, timeout_s=CS.RPC_START_TIMEOUT_S),
             mock.call("attach", {}),
         ])
         self.assertEqual(session.call_id, "rtc_owned-1")
@@ -193,6 +193,28 @@ class CompanionSessionHarness(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("请帮我", log_details)
         self.assertNotIn("must-not-be-forwarded", log_details)
 
+    async def test_transcript_captures_owned_call_identity_before_async_delivery(self):
+        session = CS.CompanionSession(ws=object())
+        session.profile_id = 'profile-a'
+        session.room_id = 'room-a'
+        session.call_id = 'rtc_a'
+        session.send_json = mock.AsyncMock()
+        session.on_data_channel_message(json.dumps({
+            'type': 'turn.done',
+            'turn': {'id': 'turn-a', 'role': 'assistant', 'transcript': '已完成'},
+        }))
+        # Cleanup can run before the websocket coroutine. Identity must not
+        # disappear or be taken from a subsequent call at delivery time.
+        session.call_id = None
+        session.room_id = 'room-b'
+        await asyncio.sleep(0)
+        event = session.send_json.await_args.args[0]
+        self.assertEqual(event['profileId'], 'profile-a')
+        self.assertEqual(event['roomId'], 'room-a')
+        self.assertEqual(event['callId'], 'rtc_a')
+        self.assertEqual(event['role'], 'assistant')
+        self.assertNotIn('synced', event)
+
     async def test_handler_routes_legacy_start_options_only_to_companion(self):
         class FakeWebSocket:
             remote_address = ("127.0.0.1", 4567)
@@ -245,6 +267,32 @@ class CompanionSessionHarness(unittest.IsolatedAsyncioTestCase):
         session._rpc.assert_not_awaited()
         session._stop_helper.assert_awaited_once_with()
 
+    async def test_media_is_released_before_waiting_for_upstream_stop(self):
+        session = CS.CompanionSession(ws=object())
+        session._owns_call = True
+        session.call_id = "rtc_owned-media"
+        session.track = mock.Mock()
+        session.pc = mock.Mock(close=mock.AsyncMock())
+        async def stop(*args, **kwargs):
+            session.track.halt_stream.assert_called_once_with()
+            session.pc.close.assert_awaited_once_with()
+            return {"ok": True}
+        session._rpc = mock.AsyncMock(side_effect=stop)
+        session._stop_helper = mock.AsyncMock()
+        await session.cleanup()
+
+    async def test_failed_stop_preserves_ownership_for_reconciliation(self):
+        session = CS.CompanionSession(ws=object())
+        session._owns_call = True
+        session.call_id = "rtc_owned-pending"
+        session._rpc = mock.AsyncMock(side_effect=CS.CompanionSessionError("Companion request timed out"))
+        session._stop_helper = mock.AsyncMock()
+        await session.cleanup()
+        self.assertTrue(session._owns_call)
+        self.assertEqual(session.call_id, "rtc_owned-pending")
+        self.assertGreaterEqual(CS.RPC_STOP_TIMEOUT_S, 30)
+        session._stop_helper.assert_awaited_once_with()
+
     async def test_cleanup_stops_only_a_call_owned_by_this_session(self):
         session = CS.CompanionSession(ws=object())
         session._owns_call = True
@@ -259,6 +307,14 @@ class CompanionSessionHarness(unittest.IsolatedAsyncioTestCase):
 
     async def test_run_uses_companion_path_without_app_server_or_thread_start(self):
         session = CS.CompanionSession(ws=object())
+        sent = []
+        ready_sent = asyncio.Event()
+
+        async def capture_event(event):
+            sent.append(event)
+            if event.get("type") == "ready":
+                ready_sent.set()
+
         session._start_helper = mock.AsyncMock()
 
         async def discover():
@@ -268,13 +324,17 @@ class CompanionSessionHarness(unittest.IsolatedAsyncioTestCase):
 
         session._discover_profile = mock.AsyncMock(side_effect=discover)
         session.setup_webrtc = mock.AsyncMock()
-        session.wait_media_connected = mock.AsyncMock()
-        session.send_json = mock.AsyncMock()
+
+        async def wait_for_media():
+            self.assertEqual(sent[-1], {"type": "progress", "stage": "media"})
+
+        session.wait_media_connected = mock.AsyncMock(side_effect=wait_for_media)
+        session.send_json = mock.AsyncMock(side_effect=capture_event)
         session.outbound_pump = mock.AsyncMock()
         session.speaker_watch = mock.AsyncMock()
         session.idle_watch = mock.AsyncMock()
         session._history_poller = mock.AsyncMock()
-        session.recv_loop = mock.AsyncMock()
+        session.recv_loop = mock.AsyncMock(side_effect=ready_sent.wait)
         session._stop_helper = mock.AsyncMock()
         previous_app = VS.APP
         VS.APP = None
@@ -284,12 +344,99 @@ class CompanionSessionHarness(unittest.IsolatedAsyncioTestCase):
             VS.APP = previous_app
 
         session.setup_webrtc.assert_awaited_once_with(None)
-        ready = next(call.args[0] for call in session.send_json.await_args_list
-                     if call.args[0].get("type") == "ready")
-        self.assertEqual(ready, {"type": "ready", "profileName": "熊大", "roomId": "room-1"})
+        self.assertEqual(sent[:2], [
+            {"type": "progress", "stage": "assistant"},
+            {"type": "progress", "stage": "media"},
+        ])
+        self.assertEqual([event.get("type") for event in sent], [
+            "progress", "progress", "ready",
+        ])
+        ready = next(event for event in sent if event.get("type") == "ready")
+        self.assertEqual(ready, {"type": "ready", "profileName": "熊大", "roomId": "room-1", "profileId": "profile-1"})
         self.assertTrue(session._discover_profile.awaited)
         self.assertTrue(session.recv_loop.awaited)
         session._stop_helper.assert_awaited_once_with()
+
+    async def test_rpc_preserves_only_strict_http_status_and_operation(self):
+        for raw, expected in [("Companion HTTP 502", 502), ("private token and SDP", None),
+                              ("Companion HTTP 502 private", None)]:
+            session = CS.CompanionSession(ws=object())
+            session.helper = FakeHelperProcess(lambda request: {})
+            session._read_rpc_response = mock.AsyncMock(return_value={"id": 1, "error": raw})
+            with self.assertRaises(CS.CompanionSessionError) as caught:
+                await session._rpc("start")
+            self.assertEqual(caught.exception.http_status, expected)
+            self.assertEqual(caught.exception.operation, "start")
+            self.assertNotIn("private", str(caught.exception))
+
+    async def test_run_reports_upstream_status_without_private_message(self):
+        session = CS.CompanionSession(ws=object())
+        session.recv_loop = mock.AsyncMock(side_effect=asyncio.Event().wait)
+        session._start_helper = mock.AsyncMock(side_effect=CS.CompanionSessionError(
+            "private", http_status=502, operation="start"))
+        session.send_json = mock.AsyncMock()
+        session.emit_closed = mock.AsyncMock()
+        session.cleanup = mock.AsyncMock()
+        await session.run()
+        event = session.send_json.await_args_list[-1].args[0]
+        self.assertEqual(event["httpStatus"], 502)
+        self.assertNotIn("private", str(event))
+
+    async def test_run_reports_safe_assistant_failure_without_ready(self):
+        session = CS.CompanionSession(ws=object())
+        session.recv_loop = mock.AsyncMock(side_effect=asyncio.Event().wait)
+        sent = []
+        session._start_helper = mock.AsyncMock(
+            side_effect=RuntimeError("private token and SDP must not escape"))
+        session.send_json = mock.AsyncMock(side_effect=lambda event: sent.append(event))
+        session.emit_closed = mock.AsyncMock()
+        session.cleanup = mock.AsyncMock()
+
+        await session.run()
+
+        self.assertEqual(sent[0], {"type": "progress", "stage": "assistant"})
+        self.assertEqual(sent[-1], {
+            "type": "error",
+            "failureStage": "assistant",
+            "message": "个人助手准备失败",
+        })
+        self.assertFalse(any(event.get("type") == "ready" for event in sent))
+        self.assertNotIn("private token", str(sent))
+        session.emit_closed.assert_awaited_once_with("error")
+
+    async def test_run_reports_safe_media_failure_without_ready(self):
+        session = CS.CompanionSession(ws=object())
+        session.recv_loop = mock.AsyncMock(side_effect=asyncio.Event().wait)
+        sent = []
+        session._start_helper = mock.AsyncMock()
+
+        async def discover():
+            session.profile_id = "profile-1"
+            session.profile_name = "熊大"
+            session.room_id = "room-1"
+
+        session._discover_profile = mock.AsyncMock(side_effect=discover)
+        session.setup_webrtc = mock.AsyncMock()
+        session.wait_media_connected = mock.AsyncMock(
+            side_effect=TimeoutError("private remote address and SDP must not escape"))
+        session.send_json = mock.AsyncMock(side_effect=lambda event: sent.append(event))
+        session.emit_closed = mock.AsyncMock()
+        session.cleanup = mock.AsyncMock()
+
+        await session.run()
+
+        self.assertEqual(sent[:2], [
+            {"type": "progress", "stage": "assistant"},
+            {"type": "progress", "stage": "media"},
+        ])
+        self.assertEqual(sent[-1], {
+            "type": "error",
+            "failureStage": "media",
+            "message": "语音媒体连接失败",
+        })
+        self.assertFalse(any(event.get("type") == "ready" for event in sent))
+        self.assertNotIn("private remote address", str(sent))
+        session.emit_closed.assert_awaited_once_with("error")
 
 
 if __name__ == "__main__":

@@ -78,3 +78,4 @@ if ($ForceRestart) {
 }
 
 & $script @args
+exit $LASTEXITCODE

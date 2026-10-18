@@ -7,7 +7,8 @@ param(
   [string]$CodexAppPath = '',
   [switch]$KeepExistingCodex,
   [switch]$UsePackagedActivation,
-  [switch]$RefusePlainCodex
+  [switch]$RefusePlainCodex,
+  [switch]$StartOnly
 )
 
 Set-StrictMode -Version Latest
@@ -412,9 +413,15 @@ if ($RefusePlainCodex -and (Test-PlainCodexShellRunning)) {
   Write-Host '检测到普通 Codex 正在运行，已停止自动拉起。'
   exit 11
 }
+if ($StartOnly -and @(Get-CodexDesktopProcesses).Count -gt 0) {
+  Write-Host 'Codex 已在运行，本次仅启动请求不操作现有桌面。'
+  exit 11
+}
 if (-not $KeepExistingCodex) {
-  Stop-DesktopLiveHost
-  Stop-CodexDesktopShell
+  if (-not $StartOnly) {
+    Stop-DesktopLiveHost
+    Stop-CodexDesktopShell
+  }
 } else {
   Write-Host "保留现有 Codex 进程；如果单实例拦截启动参数，CDP 可能不会出现。" -ForegroundColor Yellow
 }
@@ -441,12 +448,14 @@ if ($KeepExistingCodex -and (Test-CdpReady -Port $selectedCdpPort)) {
 } elseif ($KeepExistingCodex) {
   throw "保留现有 Codex 时 CDP 端口未在线: 127.0.0.1:$selectedCdpPort。为避免启动第二个 Codex 桌面壳或触发 Electron 协议弹窗，已停止注入。请手动重启带 CDP 的 Codex，或不使用 -KeepExistingCodex。"
 } elseif ($UsePackagedActivation -and -not [string]::IsNullOrWhiteSpace($appUserModelId)) {
+  if ($StartOnly -and @(Get-CodexDesktopProcesses).Count -gt 0) { exit 11 }
   $activatedProcessId = Start-PackagedCodex -AppUserModelId $appUserModelId -Arguments $argumentString
   Write-Host "已通过 Windows AppUserModelId 激活 Codex PID=$activatedProcessId" -ForegroundColor DarkGray
 } else {
   if (-not (Test-Path -LiteralPath $codexDesktopExe)) {
     throw "Codex 桌面可执行文件不存在: $codexDesktopExe"
   }
+  if ($StartOnly -and @(Get-CodexDesktopProcesses).Count -gt 0) { exit 11 }
   Start-Process -FilePath $codexDesktopExe -ArgumentList $arguments -WorkingDirectory $codexAppDir
   Write-Host "已直接启动 Codex Electron 桌面壳并保留 CDP 参数: $codexDesktopExe" -ForegroundColor DarkGray
 }

@@ -72,6 +72,266 @@ function methodBody(name) {
   assert.fail(`unterminated method ${name}`);
 }
 
+function submittedReceiptHarness(client) {
+  const timers = [];
+  const run = (name, args, async = false) => new Function('BridgeClient', 'setTimeout', 'clearInterval', `${stripTypeScriptTypes(`${async ? 'async ' : ''}function run(${args}) {${methodBody(name)}}`)}; return run;`)(client,
+    (callback, delay) => { timers.push({ callback, delay }); return timers.length; }, () => {});
+  const receipt = { id: 'outbox-one', status: 'submitted', prompt: 'visible message', codexSessionId: 'thread', createdAt: '2026-10-15T00:48:09Z', events: [], runtime: { kind: 'durable_outbox', state: 'submitted' } };
+  const state = {
+    currentTask: receipt, selectedSession: { id: 'thread', entries: [] }, isNewSessionDraft: false,
+    pendingSessionSendsByTaskId: { [receipt.id]: { retryFailedMessageId: '' } },
+    activeSessionTaskId: receipt.id, activeSessionTaskTitle: 'T', newSessionTaskId: '',
+    sessionNavigationState: { revision: 1, mode: 'session', sessionId: 'thread' },
+    runningSessionIds: ['thread', 'other'], pollStops: 0,
+    pollTimer: -1,
+    readSessionNavigation() { return this.sessionNavigationState; },
+    taskSessionId: task => task.codexSessionId || task.createdCodexSessionId || '',
+    normalizedBridgeUrl: () => '', bridgeToken: '', log() {},
+    clearPendingSessionSend(id) { delete this.pendingSessionSendsByTaskId[id]; },
+    stopPolling() { this.pollStops++; this.pollTimer = -1; }, removeFailedSessionMessage() {},
+    mergeSessionDetailPreservingHistory: (old, detail) => ({ ...detail, entries: [...old.entries, ...detail.entries] }),
+    applySessionActivitySnapshot(detail) { assert.equal(detail.activityStatus, 'running'); },
+    serverUserHistoryCoversTaskMessage(task) { return this.selectedSession.entries.some(e => e.text === task.prompt); },
+    normalizedFailedMessageText: text => text.trim(),
+    sessionEntryImagePaths: () => [],
+    scrollSessionToBottomIfFollowing() {},
+    markSessionRunningLocallyCleared() { assert.fail('delivery must not clear official running state'); },
+    handleTaskTerminalForSession() { assert.fail('delivery is not a model terminal'); },
+    publishTaskCompletionNotificationForTask() { assert.fail('delivery must not notify completion'); }
+  };
+  state.isSubmittedOutboxReceipt = run('isSubmittedOutboxReceipt', 'task');
+  state.clearSubmittedOutboxReceiptIfVisible = run('clearSubmittedOutboxReceiptIfVisible', 'task');
+  state.submittedReceiptHasVisibleUserEntry = run('submittedReceiptHasVisibleUserEntry', 'task');
+  state.errorText = error => { throw error; };
+  state.settleSubmittedOutboxReceipt = run('settleSubmittedOutboxReceipt', 'task', true);
+  state.scheduleSubmittedReceiptHistoryRetry = run('scheduleSubmittedReceiptHistoryRetry', 'task, navigationRevision');
+  return { state, receipt, run, timers };
+}
+
+test('submitted delivery stops only its task poll and preserves the bubble until official history is visible', async () => {
+  let visible = false;
+  const { state, receipt } = submittedReceiptHarness({ async getSessionHistoryPage() {
+    return { id: 'thread', activityStatus: 'running', entries: visible ? [{ role: 'user', text: 'visible message', timestamp: '2026-10-15T00:48:46Z' }] : [] };
+  } });
+  await state.settleSubmittedOutboxReceipt(receipt);
+  assert.equal(state.pollStops, 1);
+  assert.equal(state.currentTask, receipt);
+  assert.deepEqual(state.pendingSessionSendsByTaskId, {});
+  assert.deepEqual(state.runningSessionIds, ['thread', 'other']);
+  visible = true;
+  await state.settleSubmittedOutboxReceipt(receipt);
+  assert.equal(state.currentTask, null);
+  assert.equal(state.activeSessionTaskId, '');
+  assert.equal(state.selectedSession.entries[0].text, receipt.prompt);
+  assert.deepEqual(state.runningSessionIds, ['thread', 'other']);
+});
+
+test('a late delivery-history response cannot overwrite another session or stop its active task', async () => {
+  let resolve;
+  const reply = new Promise(r => { resolve = r; });
+  const { state, receipt } = submittedReceiptHarness({ getSessionHistoryPage: () => reply });
+  const pending = state.settleSubmittedOutboxReceipt(receipt);
+  const other = { id: 'other-task', status: 'running', codexSessionId: 'other' };
+  state.currentTask = other;
+  state.selectedSession = { id: 'other', entries: [{ text: 'keep' }] };
+  state.sessionNavigationState = { revision: 2, mode: 'session', sessionId: 'other' };
+  resolve({ id: 'thread', activityStatus: 'running', entries: [{ text: receipt.prompt }] });
+  await pending;
+  assert.equal(state.currentTask, other);
+  assert.equal(state.selectedSession.id, 'other');
+  assert.equal(state.pollStops, 1);
+  await state.settleSubmittedOutboxReceipt(receipt);
+  assert.equal(state.pollStops, 1);
+});
+
+test('refresh consumes a submitted outbox receipt without model completion or further run polls', async () => {
+  const client = { async getSessionHistoryPage() { return { id: 'thread', activityStatus: 'running', entries: [] }; } };
+  const { state, receipt, run } = submittedReceiptHarness(client);
+  let runReads = 0;
+  client.getCodexRun = async () => { runReads++; return receipt; };
+  state.currentTask = { ...receipt, status: 'queued', runtime: { kind: 'durable_outbox', state: 'dispatching' } };
+  state.currentTaskEventCursor = () => 0;
+  state.taskUsesCodexRunApi = () => true;
+  state.handoffPendingSessionSend = () => {};
+  await run('refreshTask', '', true).call(state);
+  assert.equal(runReads, 1);
+  assert.equal(state.currentTask, receipt);
+  assert.equal(state.pollStops, 1);
+  assert.doesNotMatch(state.message, /已完成|已中断|失败/);
+});
+
+test('submitted receipt history failure keeps the user bubble without retrying delivery or task polling', async () => {
+  const { state, receipt } = submittedReceiptHarness({ async getSessionHistoryPage() { throw new Error('offline'); } });
+  state.errorText = error => error.message;
+  await state.settleSubmittedOutboxReceipt(receipt);
+  assert.equal(state.currentTask, receipt);
+  assert.equal(state.pollStops, 1);
+  assert.equal(state.selectedSession.entries.length, 0);
+  assert.equal(state.message, '消息已进入 Codex 官方会话，正在同步会话');
+});
+
+test('submitted new-session receipt opens only its verified official history without marking a model terminal', async () => {
+  const { state, receipt } = submittedReceiptHarness({ async getSessionHistoryPage() {
+    return { id: 'new-thread', activityStatus: 'running', entries: [{ role: 'user', text: 'visible message', timestamp: '2026-10-15T00:48:46Z' }] };
+  } });
+  receipt.codexSessionId = 'new-thread';
+  state.selectedSession = null;
+  state.isNewSessionDraft = true;
+  state.newSessionTaskId = receipt.id;
+  state.sessionNavigationState = { revision: 3, mode: 'new', sessionId: '' };
+  state.commitSessionNavigation = (mode, sessionId) => { state.sessionNavigationState = { revision: 4, mode, sessionId }; };
+  await state.settleSubmittedOutboxReceipt(receipt);
+  assert.equal(state.isNewSessionDraft, false);
+  assert.equal(state.selectedSession.id, 'new-thread');
+  assert.equal(state.currentTask, null);
+  assert.equal(state.newSessionTaskId, '');
+  assert.equal(state.pollStops, 1);
+  assert.deepEqual(state.runningSessionIds, ['thread', 'other']);
+});
+
+test('a late receipt for the same thread cannot overwrite history after navigation changes away and back', async () => {
+  let resolve;
+  const reply = new Promise(r => { resolve = r; });
+  const { state, receipt } = submittedReceiptHarness({ getSessionHistoryPage: () => reply });
+  const pending = state.settleSubmittedOutboxReceipt(receipt);
+  state.sessionNavigationState = { revision: 3, mode: 'session', sessionId: 'thread' };
+  state.selectedSession = { id: 'thread', entries: [{ text: 'keep newer history' }] };
+  resolve({ id: 'thread', activityStatus: 'running', entries: [{ text: receipt.prompt }] });
+  await pending;
+  assert.equal(state.selectedSession.entries[0].text, 'keep newer history');
+  assert.equal(state.currentTask, receipt);
+});
+
+test('both send paths and polling use the dedicated delivery-receipt branch', () => {
+  for (const name of ['sendMessageToSelectedSession', 'sendNewSessionMessage']) {
+    const body = methodBody(name);
+    assert.match(body, /isSubmittedOutboxReceipt\(this\.currentTask\)[\s\S]*settleSubmittedOutboxReceipt\(this\.currentTask\)/);
+    assert.match(body, /isSubmittedOutboxReceipt\(receivedTask\)[\s\S]*readSessionNavigation\(\)\.revision/);
+  }
+  assert.match(methodBody('loadSessionDetail'), /clearSubmittedOutboxReceiptIfVisible/);
+  const body = methodBody('settleSubmittedOutboxReceipt');
+  assert.doesNotMatch(body, /handleTaskTerminalForSession|unmarkSessionRunning|markSessionRunningLocallyCleared|publishTaskCompletion|startPolling/);
+});
+
+test('a receipt bubble is not consumed by an old user message or a later assistant-only tail window', async () => {
+  const { state, receipt } = submittedReceiptHarness({ async getSessionHistoryPage() {
+    return { id: 'thread', activityStatus: 'running', entries: [
+      { role: 'user', text: 'visible message', timestamp: '2026-10-15T00:48:08Z' },
+      { role: 'assistant', text: 'visible message', timestamp: '2026-10-15T00:49:46Z' }
+    ] };
+  } });
+  await state.settleSubmittedOutboxReceipt(receipt);
+  assert.equal(state.currentTask, receipt);
+  assert.equal(state.pollStops, 1);
+  assert.equal(state.selectedSession.entries.length, 2);
+});
+
+test('new-session receipt retries history after failure and stops after the official user message becomes visible', async () => {
+  let reads = 0;
+  const { state, receipt, run, timers } = submittedReceiptHarness({ async getSessionHistoryPage() {
+    reads++;
+    if (reads === 1) throw new Error('temporary history failure');
+    return { id: 'new-thread', activityStatus: 'running', entries: reads === 2 ? [] : [
+      { role: 'user', text: 'visible message', timestamp: '2026-10-15T00:48:46Z' }
+    ] };
+  } });
+  state.scheduleSubmittedReceiptHistoryRetry = run('scheduleSubmittedReceiptHistoryRetry', 'task, navigationRevision');
+  state.errorText = error => error.message;
+  receipt.codexSessionId = 'new-thread';
+  state.selectedSession = null;
+  state.isNewSessionDraft = true;
+  state.newSessionTaskId = receipt.id;
+  state.sessionNavigationState = { revision: 3, mode: 'new', sessionId: '' };
+  state.commitSessionNavigation = (mode, sessionId) => { state.sessionNavigationState = { revision: 4, mode, sessionId }; };
+  await state.settleSubmittedOutboxReceipt(receipt);
+  assert.equal(state.selectedSession, null);
+  assert.equal(timers.length, 1);
+  assert.equal(timers[0].delay, 5000);
+  await timers[0].callback();
+  assert.equal(state.selectedSession.id, 'new-thread');
+  assert.equal(state.isNewSessionDraft, false);
+  assert.equal(state.currentTask, receipt);
+  assert.equal(timers.length, 2);
+  await timers[1].callback();
+  assert.equal(state.currentTask, null);
+  assert.equal(reads, 3);
+  assert.equal(timers.length, 2);
+  assert.deepEqual(state.runningSessionIds, ['thread', 'other']);
+});
+
+test('receipt-history timer cannot fetch after navigation or active task changes', async () => {
+  for (const change of [s => { s.sessionNavigationState.revision++; }, s => { s.currentTask = { id: 'another-task', status: 'running' }; }]) {
+    let reads = 0;
+    const { state, receipt, run, timers } = submittedReceiptHarness({ async getSessionHistoryPage() { reads++; throw new Error('offline'); } });
+    state.scheduleSubmittedReceiptHistoryRetry = run('scheduleSubmittedReceiptHistoryRetry', 'task, navigationRevision');
+    state.errorText = error => error.message;
+    await state.settleSubmittedOutboxReceipt(receipt);
+    change(state);
+    state.pollTimer = 999;
+    await timers[0].callback();
+    assert.equal(reads, 1);
+    assert.equal(timers.length, 1);
+    assert.equal(state.pollTimer, 999);
+  }
+});
+
+test('confirmed image-only receipt settles only when its own image is visible in current user history', () => {
+  const { state, receipt, run } = submittedReceiptHarness({});
+  for (const [name, args] of [
+    ['sessionEntryImagePaths', 'text'], ['collectMarkdownImagePaths', 'text, paths'],
+    ['addImagePathCandidate', 'value, paths'], ['normalizedImagePathCandidate', 'value'],
+    ['isImagePathCandidate', 'value'], ['isMarkdownImageOnlyLine', 'text'], ['stripMobileImagePromptText', 'text']
+  ]) state[name] = run(name, args);
+  state.normalizedFailedMessageText = text => state.stripMobileImagePromptText(text).trim();
+  receipt.prompt = '我从手机端发送了一张图片，请查看并结合当前对话回复。\n![手机端图片](C:/probe/mobile-image.png)';
+  const good = { role: 'user', timestamp: '2026-10-15T00:48:46Z', text: receipt.prompt + '\n![桌面端图片](C:/probe/rendered.png)' };
+  for (const wrong of [
+    { ...good, role: 'assistant' }, { ...good, timestamp: '2026-10-15T00:48:08Z' },
+    { ...good, text: good.text.replace('mobile-image.png', 'other.png') },
+    { ...good, text: '' }
+  ]) {
+    state.selectedSession.entries = [wrong];
+    state.clearSubmittedOutboxReceiptIfVisible(receipt);
+    assert.equal(state.currentTask, receipt);
+  }
+  state.selectedSession.entries = [good];
+  state.clearSubmittedOutboxReceiptIfVisible(receipt);
+  assert.equal(state.currentTask, null);
+});
+
+test('dashboard cannot replace a confirmed guidance bubble with the earlier running prompt before history arrives', async () => {
+  let taskReads = 0;
+  const oldTask = { id: 'earlier-run', status: 'running', codexSessionId: 'thread', prompt: 'old prompt' };
+  let taskResponse = Promise.resolve(oldTask);
+  const { state, receipt, run } = submittedReceiptHarness({ async getTask() { taskReads++; return await taskResponse; } });
+  state.latestTaskSummaryForSession = () => oldTask;
+  state.isTaskRunningStatus = status => status === 'running';
+  state.taskUsesCodexRunApi = () => false;
+  state.handoffPendingSessionSend = () => {};
+  state.failedTaskHasCanonicalCompletion = () => false;
+  state.activeTaskTitleFromSummary = () => 'old';
+  state.syncSessionTaskMarkers = () => {};
+  state.startPolling = () => {};
+  state.adopt = run('adoptSelectedSessionTaskFromSummaries', 'tasks', true);
+  await state.adopt([oldTask]);
+  assert.equal(state.currentTask, receipt);
+  assert.equal(taskReads, 0);
+  state.selectedSession.entries = [{ role: 'user', text: receipt.prompt, timestamp: '2026-10-15T00:48:46Z' }];
+  state.clearSubmittedOutboxReceiptIfVisible(receipt);
+  await state.adopt([oldTask]);
+  assert.equal(state.currentTask, oldTask);
+  assert.equal(taskReads, 1);
+  let resolveTask;
+  taskResponse = new Promise(resolve => { resolveTask = resolve; });
+  state.currentTask = null;
+  state.selectedSession.entries = [];
+  const lateAdoption = state.adopt([oldTask]);
+  state.currentTask = receipt;
+  resolveTask(oldTask);
+  await lateAdoption;
+  assert.equal(state.currentTask, receipt, 'an adoption already in flight must also preserve the newer receipt');
+});
+
 test('new live snapshot commits the same navigation target used by subsequent sends', () => {
   const run = (name, args) => new Function(`${stripTypeScriptTypes(`function run(${args}) {${methodBody(name)}}`)}; return run;`)();
   const state = {
@@ -256,6 +516,84 @@ test('session sending is optimistic in the conversation and does not open a sepa
   assert.ok(newSendBody.indexOf('this.beginOptimisticSessionSend(') < newSendBody.indexOf("await this.guard('sendNewSessionMessage'"));
   assert.doesNotMatch(floatingBody, /isSendingSessionMessage/);
   assert.doesNotMatch(floatingTitleBody, /正在发送到 Codex/);
+  assert.match(panelBody, /if \(this\.hasNewSessionConversation\(\)\)/);
+  assert.ok(cardBody.indexOf("Text('发送中…')") > cardBody.indexOf('Text(message.text)'));
+  assert.match(cardBody, /ForEach\(message\.files/);
+});
+
+test('first message opens the conversation before any server task or history exists', () => {
+  const showConversation = new Function(methodBody('hasNewSessionConversation'));
+  const state = {
+    visibleOptimisticSessionMessages: () => [{ id: 'optimistic-first' }],
+    visibleNewSessionEntries: () => [],
+    visibleFailedSessionMessages: () => []
+  };
+  assert.equal(showConversation.call(state), true);
+  state.visibleOptimisticSessionMessages = () => [];
+  assert.equal(showConversation.call(state), false);
+  state.visibleFailedSessionMessages = () => [{ id: 'failed-first' }];
+  assert.equal(showConversation.call(state), true);
+});
+
+test('submitted user text stays visible while the desktop connection is unavailable', () => {
+  const run = new Function(`${stripTypeScriptTypes(`function run(task) {${methodBody('taskLiveEntries')}}`)}; return run;`)();
+  const state = { taskIsFailedMessageRetry: () => false, taskSessionId: () => 'session',
+    streamingAgentTextForTask: () => '', workingStatusTextForTask: () => 'connecting',
+    taskBlocksDesktopConversation: () => true };
+  const task = { status: 'queued', prompt: 'my message', createdAt: '2026-10-14T01:00:00Z',
+    activeCodexTurnId: 'turn-new', events: [] };
+  const entries = run.call(state, task);
+  assert.equal(entries[0].role, 'user');
+  assert.equal(entries[0].text, 'my message');
+  assert.equal(entries[0].turnId, 'turn-new');
+});
+
+test('old repeated text cannot replace the new live user message', () => {
+  const match = new Function(`${stripTypeScriptTypes(`function run(entries, candidate) {${methodBody('sessionEntriesContain')}}`)}; return run;`)();
+  const state = { normalizeComparableSessionText: text => text.replace(/\s+/g, '') };
+  const candidate = { role: 'user', type: 'live_user_message', text: '继续',
+    timestamp: '2026-10-14T01:00:00Z', turnId: 'new-turn' };
+  assert.equal(match.call(state, [{ ...candidate, type: 'response_item', timestamp: '2026-10-14T00:59:59Z' }], candidate), false);
+  assert.equal(match.call(state, [{ ...candidate, type: 'response_item', turnId: 'old-turn' }], candidate), false);
+  assert.equal(match.call(state, [{ ...candidate, type: 'response_item', timestamp: '2026-10-14T01:00:01Z' }], candidate), true);
+  assert.equal(match.call(state, [{ ...candidate, type: 'response_item', turnId: undefined }], candidate), true);
+});
+
+test('message footer distinguishes submission from a confirmed delivery', () => {
+  const label = new Function(`${stripTypeScriptTypes(`function run() {${methodBody('liveUserMessageStatus')}}`)}; return run;`)();
+  const task = { events: [], runtime: {} };
+  const state = { selectedVisibleTask: () => task, taskBlocksDesktopConversation: () => false };
+  assert.equal(label.call(state), '已提交 · 等待确认');
+  task.events.push({ type: 'codex.app_server.user_message.persisted' });
+  assert.equal(label.call(state), '已发送');
+  task.runtime.kind = 'durable_outbox';
+  assert.equal(label.call(state), '已排队');
+});
+
+test('optimistic send synchronously transfers text and attachments into the target conversation', async () => {
+  const service = await import(`data:text/javascript,${encodeURIComponent(stripTypeScriptTypes(optimisticMessageServiceSource()))}`);
+  const begin = new Function('appendOptimisticSessionMessage', `${stripTypeScriptTypes(
+    `function run(sessionId, isNewSession, projectId, submissionId, text, images, files, retryFailedMessageId) {${methodBody('beginOptimisticSessionSend')}}`
+  )}; return run;`)(service.appendOptimisticSessionMessage);
+  const state = { optimisticSessionMessages: [], sessionMessage: 'hello', pendingSessionImages: [],
+    pendingSessionFiles: [], log() {}, scrollSessionToBottom() {} };
+  const images = [{ id: 'image', uri: 'image://local', fileName: 'photo.png', mimeType: 'image/png' }];
+  const files = [{ id: 'file', fileName: 'report.pdf', uri: 'file://local', bytes: 8 }];
+  begin.call(state, '__new_session__', true, 'project', 'first', 'hello', images, files, '');
+  images.length = 0;
+  files.length = 0;
+  const visible = service.optimisticSessionMessagesForTarget(state.optimisticSessionMessages, '__new_session__');
+  assert.equal(visible[0].text, 'hello');
+  assert.equal(visible[0].images.length, 1);
+  assert.equal(visible[0].files[0].fileName, 'report.pdf');
+  assert.equal(state.sessionMessage, '');
+  assert.deepEqual(service.optimisticSessionMessagesForTarget(state.optimisticSessionMessages, 'other-session'), []);
+  // Retrying the same submission replaces it, while repeated text with a new
+  // submission identity remains a separate message.
+  begin.call(state, '__new_session__', true, 'project', 'first', 'hello', [], [], '');
+  assert.equal(state.optimisticSessionMessages.length, 1);
+  begin.call(state, '__new_session__', true, 'project', 'second', 'hello', [], [], '');
+  assert.equal(state.optimisticSessionMessages.length, 2);
 });
 
 test('terminal task refresh locally suppresses stale running activity', () => {
@@ -358,8 +696,8 @@ test('composer action menu pops upward without changing the composer width', () 
   assert.ok(popupIndex >= 0, 'missing composer action popup');
   assert.ok(plusIndex >= 0, 'missing plus button');
   assert.ok(popupIndex < plusIndex, 'popup should be rendered before the stable plus rail so the plus button remains on top');
-  assert.match(body, /Stack\(\{ alignContent: Alignment\.Bottom \}\)/);
-  assert.match(body, /\.width\(34\)/);
+  assert.match(body, /Stack\(\{ alignContent: Alignment\.BottomStart \}\)/);
+  assert.match(body, /\.width\('100%'\)/);
   assert.match(body, /\.translate\(\{ x: 0, y: -234 \}\)/);
   assert.match(body, /\.zIndex\(1\)/);
   assert.match(body, /\.zIndex\(2\)/);
@@ -379,12 +717,11 @@ test('session composer keeps an empty draft compact', () => {
   assert.match(sourceText, /\.expandSafeArea\(\[SafeAreaType\.SYSTEM\], \[SafeAreaEdge\.BOTTOM\]\)/);
   assert.match(sourceText, /\.ignoreLayoutSafeArea\(\[LayoutSafeAreaType\.SYSTEM\], \[LayoutSafeAreaEdge\.BOTTOM\]\)/);
   assert.match(panelBody, /\.padding\(\{ left: 12, right: 12, top: 12, bottom: 0 \}\)/);
-  assert.match(composerBody, /\.width\(32\)/);
-  assert.match(composerBody, /\.padding\(\{ left: 6, right: 6, top: 4, bottom: 1 \}\)/);
+  assert.match(composerBody, /\.width\(40\)/);
+  assert.match(composerBody, /\.padding\(\{ left: 10, right: 10, top: 8, bottom: 8 \}\)/);
   assert.match(composerBody, /\.translate\(\{ y: this\.sessionComposerBottomShift\(\) \}\)/);
-  assert.match(heightBody, /return 66/);
-  assert.match(heightBody, /return 72/);
-  assert.match(heightBody, /return 78/);
+  assert.match(heightBody, /Math\.min\(4/);
+  assert.match(heightBody, /scaledLineHeight\(24\)/);
   assert.doesNotMatch(heightBody, /return 9[0-9]|return 100/);
   assert.match(marginBody, /return 0/);
   assert.match(shiftBody, /this\.sessionComposerFocused \? 0 : 16/);
@@ -688,7 +1025,7 @@ test('session stream slims chrome, folds long entries, and renders agent collabo
   assert.match(cardBody, /this\.sessionEntryShowAssistantHeader\(entry\)/);
   assert.match(cardBody, /this\.isSessionLastAssistantEntry\(entry\) && this\.sessionEntryVisibleText\(entry\)\.length > 0/);
   assert.doesNotMatch(cardBody, /Text\('你'\)/);
-  assert.match(cardBody, /\.padding\(\{ left: 12, right: 0, top: 2, bottom: 4 \}\)/);
+  assert.match(cardBody, /\.padding\(\{ left: 0, right: 0, top: 8, bottom: 12 \}\)/);
   assert.match(toolBody, /\.height\(24\)/);
   assert.doesNotMatch(toolBody, /\.height\(34\)/);
 
@@ -929,7 +1266,7 @@ test('session sidebar separates desktop projects from projectless recent session
   assert.match(itemBody, /Text\(this\.sessionTimeLabel\(session\)\)[\s\S]*\.textAlign\(TextAlign\.End\)/);
   assert.match(itemBody, /\.width\(this\.sessionSidebarTimeWidth\(\)\)/);
   assert.doesNotMatch(itemBody, /Text\(this\.sessionTimeLabel\(session\)\)[\s\S]*?textOverflow/);
-  assert.match(timeWidthBody, /84 \* fontScalePercent\(this\.fontScaleMode\) \/ 100/);
+  assert.match(timeWidthBody, /64 \* fontScalePercent\(this\.fontScaleMode\) \/ 100/);
   assert.match(labelsBody, /session\.sidebarSection === 'recent'/);
   assert.match(recentBody, /session\.sidebarSection === 'recent'/);
 });
@@ -1028,7 +1365,7 @@ test('local terminal task state suppresses stale running summaries before adopti
 });
 
 test('phone desktop-live repair stays soft and failed-message retry does not restart Codex', () => {
-  const repairBody = methodBody('repairDesktopLiveFromPhone(source: string): Promise<boolean>');
+  const repairBody = methodBody('repairDesktopLiveFromPhone(source: string, desktopOnly: boolean = false): Promise<boolean>');
   const preflightBody = methodBody('ensureDesktopLiveReadyForSend(targetSessionId: string, source: string): Promise<boolean>');
   const clientText = fs.readFileSync(path.resolve('HarmonyCodexRemote/entry/src/main/ets/services/BridgeClient.ets'), 'utf8');
   const cardBody = methodBody('FailedSessionMessageCard(message: FailedSessionMessage)');
@@ -1072,13 +1409,15 @@ test('home plus menu owns account usage and desktop restart actions', () => {
   assert.match(sidebarBody, /this\.HomeActionMenu\('sidebar_header'\)/);
   assert.doesNotMatch(sidebarBody, /Row\(\) \{[\s\S]{0,80}this\.HomeActionMenu\('sidebar_header'\)/);
   assert.doesNotMatch(sidebarBody, /ui\.click\.desktop_repair/);
-  assert.match(menuBody, /账号用量/);
-  assert.match(menuBody, /前往总览/);
-  assert.match(menuBody, /前往任务/);
-  assert.match(menuBody, /Text\('设置'\)/);
-  assert.match(menuBody, /恢复链路/);
-  assert.match(menuBody, /检测 bridge、CDP 与无线 HDC/);
-  assert.match(menuBody, /重启 Codex/);
+  const settings = fs.readFileSync(path.resolve('HarmonyCodexRemote/entry/src/main/ets/components/SettingsPanel.ets'), 'utf8');
+  assert.match(menuBody, /'pairing', '配对'/);
+  assert.match(menuBody, /'settings', '设置'/);
+  assert.doesNotMatch(menuBody, /go_overview|go_tasks|hard_restart|outbox/);
+  assert.match(menuBody, /Scroll\(this\.homeMenuScroller\)/);
+  assert.match(menuBody, /maxHeight: this\.homeActionMenuMaxHeight/);
+  assert.match(settings, /账号用量/);
+  assert.match(settings, /恢复链路/);
+  assert.match(settings, /重启 Codex/);
   assert.match(menuBody, /source === 'sidebar_header' \? 60 : 42/);
   assert.match(toggleBody, /this\.shouldIgnoreHomeActionToggle\(source\)/);
   assert.match(toggleBody, /this\.homeActionMenuSource = this\.homeActionMenuVisible \? source : ''/);
@@ -1247,7 +1586,7 @@ test('monitoring falls back to a stable privacy-safe notification and an always-
   assert.doesNotMatch(abilityText, /LiveViewCapabilityService|LiveViewProbe|LIVE_VIEW_/);
   assert.doesNotMatch(indexText, /LiveViewCapabilityService|syncSnapshot\(context, snapshot\)/);
   assert.match(indexText, /AppNotificationService\.syncMonitorSnapshot\(snapshot\)/);
-  assert.match(indexText, /this\.HomeActionMenuItem\('desktop_monitor'/);
+  assert.match(fs.readFileSync(path.resolve('HarmonyCodexRemote/entry/src/main/ets/components/SettingsPanel.ets'), 'utf8'), /this\.Action\('desktop_monitor'/);
   assert.match(indexText, /DesktopMonitorPanel\(/);
   assert.match(indexText, /DesktopMonitorDisplayService\.enter/);
   assert.match(indexText, /DesktopMonitorDisplayService\.leave/);
@@ -1420,7 +1759,7 @@ test('mobile exposes the durable send queue editing contract', () => {
   assert.match(itemBody, /saveOutboxItem/);
   assert.match(itemBody, /moveOutboxItem/);
   assert.match(itemBody, /cancelOutboxItem/);
-  assert.match(source(), /this\.HomeActionMenuItem\('outbox'/);
+  assert.match(fs.readFileSync(path.resolve('HarmonyCodexRemote/entry/src/main/ets/components/SettingsPanel.ets'), 'utf8'), /this\.Action\('outbox'/);
 });
 
 test('desktop file links require confirmation before downloading and open with a URI grant', () => {
@@ -1483,8 +1822,8 @@ test('session sidebar distinguishes an authorization failure from a genuinely em
 
   assert.match(text, /@State sessionsLoadError: string = ''/);
   assert.match(sidebarBody, /this\.sessionsLoadError\.length > 0/);
-  assert.match(sidebarBody, /连接会话失败/);
-  assert.match(sidebarBody, /检查 Bridge 地址和访问凭证后下拉重试/);
+  assert.match(sidebarBody, /this\.sessionConnectionFailure\(\)\.title/);
+  assert.match(sidebarBody, /this\.sessionConnectionFailure\(\)\.message/);
   assert.match(refreshBody, /this\.sessionsLoadError = ''/);
   assert.match(refreshBody, /this\.sessionsLoadError = this\.errorText\(err\)/);
 });

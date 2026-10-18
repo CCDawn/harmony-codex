@@ -1,6 +1,7 @@
 import { AppThemeTokens, appThemeTokens } from '../theme/AppTheme';
 import { scaleFontSize } from '../theme/AppTypography';
-import { VoiceCallStatus, VoiceTranscriptEntry } from '../model/BridgeModels';
+import { VoiceCallStatus, VoiceCallStage, VoiceCallFailure, VoiceTranscriptEntry } from '../model/BridgeModels';
+import { VoiceTranscriptPresentation } from '../services/VoiceTranscriptPresentation';
 
 function voiceCallEmptyHintTitle(status: VoiceCallStatus, statusDetail: string, muted: boolean): string {
   if (status === 'active') {
@@ -12,7 +13,8 @@ function voiceCallEmptyHintTitle(status: VoiceCallStatus, statusDetail: string, 
   if (status === 'idle' && statusDetail.length > 0) {
     return '通话已结束';
   }
-  return '正在等待接通';
+  if (status === 'ready') { return '开始采集'; }
+  return statusDetail.length > 0 ? statusDetail : '正在连接通道';
 }
 
 /**
@@ -23,7 +25,14 @@ function voiceCallEmptyHintTitle(status: VoiceCallStatus, statusDetail: string, 
 export struct VoiceCallPanel {
   @Param @Require status: VoiceCallStatus;
   @Param statusDetail: string = '';
-  @Param assistantName: string = '熊大';
+  @Param assistantName: string = '个人助手';
+  @Param stage: VoiceCallStage = 'channel';
+  @Param stageStartedAt: number = 0;
+  @Param failure: VoiceCallFailure = '';
+  @Local clockNow: number = Date.now();
+  private clockTimer: number = -1;
+  private stageKeys: VoiceCallStage[] = ['channel', 'assistant', 'media', 'mic', 'listening'];
+  private stageNames: string[] = ['连接通道', '助手准备', '媒体就绪', '开始采集', '聆听'];
   @Param @Require transcripts: VoiceTranscriptEntry[];
   @Param speaking: boolean = false;
   @Param muted: boolean = false;
@@ -33,6 +42,32 @@ export struct VoiceCallPanel {
   @Event onComputer: () => void = () => {};
   @Event onInterrupt: () => void = () => {};
   @Event onToggleMute: () => void = () => {};
+  @Event onRetry: () => void = () => {};
+  @Event onRecovery: () => void = () => {};
+
+  aboutToAppear(): void {
+    this.syncClock();
+  }
+
+  @Monitor('status')
+  private onStatusChanged(): void { this.syncClock(); }
+
+  private syncClock(): void {
+    this.clockNow = Date.now();
+    if (this.status === 'connecting' || this.status === 'ready') {
+      if (this.clockTimer < 0) {
+        this.clockTimer = setInterval(() => { this.clockNow = Date.now(); }, 1000);
+      }
+    } else if (this.clockTimer >= 0) {
+      clearInterval(this.clockTimer);
+      this.clockTimer = -1;
+    }
+  }
+
+  aboutToDisappear(): void {
+    if (this.clockTimer >= 0) { clearInterval(this.clockTimer); this.clockTimer = -1; }
+  }
+
   private transcriptsScroller: Scroller = new Scroller();
 
   @Monitor('transcripts')
@@ -57,14 +92,17 @@ export struct VoiceCallPanel {
     Stack({ alignContent: Alignment.Center }) {
       Column({ space: 12 }) {
         this.HeaderBar()
+        if (this.status === 'connecting' || this.status === 'ready') {
+          this.StageCard()
+        }
         if (this.shouldShowBanner()) {
           this.StatusBanner()
         }
-        if (this.transcripts.length === 0) {
+        if (VoiceTranscriptPresentation.visible(this.transcripts).length === 0) {
           this.EmptyHint()
         } else {
           List({ space: 10, scroller: this.transcriptsScroller }) {
-            ForEach(this.transcripts, (entry: VoiceTranscriptEntry, index: number) => {
+            ForEach(VoiceTranscriptPresentation.visible(this.transcripts), (entry: VoiceTranscriptEntry, index: number) => {
               ListItem() {
                 this.TranscriptBubble(entry)
               }
@@ -134,12 +172,57 @@ export struct VoiceCallPanel {
   }
 
   @Builder
+  private StageCard() {
+    Column({ space: 10 }) {
+      Row() {
+        Text('连接阶段').fontSize(this.fs(12)).fontWeight(FontWeight.Medium)
+          .fontColor(this.theme().textPrimary).layoutWeight(1)
+        Text(`本阶段已等待 ${this.elapsedText()}`).fontSize(this.fs(10))
+          .fontColor(this.theme().textSecondary)
+      }.width('100%')
+      ForEach(this.stageKeys, (key: VoiceCallStage, index: number) => {
+        Row({ space: 10 }) {
+          Text(index < this.stageKeys.indexOf(this.stage) ? '✓' : `${index + 1}`)
+            .width(22).height(22).textAlign(TextAlign.Center).fontSize(this.fs(11))
+            .fontColor(key === this.stage ? this.theme().textOnAccent : this.theme().textSecondary)
+            .backgroundColor(key === this.stage ? this.theme().accent : this.theme().surfaceMuted)
+            .borderRadius(11)
+          Text(this.stageNames[index]).fontSize(this.fs(12)).layoutWeight(1)
+            .fontColor(key === this.stage ? this.theme().textPrimary : this.theme().textSecondary)
+          Text(key === this.stage ? '进行中' : (index < this.stageKeys.indexOf(this.stage) ? '已完成' : '等待'))
+            .fontSize(this.fs(10)).fontColor(this.theme().textTertiary)
+        }.width('100%')
+      }, (key: VoiceCallStage) => key)
+    }.width('100%').padding(14).backgroundColor(this.theme().surfaceMuted)
+      .border({ width: 1, color: this.theme().border }).borderRadius(12)
+  }
+
+  private elapsedText(): string {
+    const seconds = this.stageStartedAt > 0 ? Math.max(0, Math.floor((this.clockNow - this.stageStartedAt) / 1000)) : 0;
+    return `${Math.floor(seconds / 60).toString().padStart(2, '0')}:${(seconds % 60).toString().padStart(2, '0')}`;
+  }
+
+  @Builder
   private StatusBanner() {
     Row({ space: 8 }) {
-      Text(this.statusDetail)
+      Column({ space: 8 }) {
+        Text(this.statusDetail)
         .fontSize(this.fs(11))
         .fontColor(this.bannerTextColor())
-        .layoutWeight(1)
+        .width('100%')
+        if (this.status === 'error' || this.status === 'idle') {
+          Row({ space: 10 }) {
+            Button('重试').height(40).fontSize(this.fs(12))
+              .backgroundColor(this.theme().accent).fontColor(this.theme().textOnAccent)
+              .onClick(() => this.onRetry())
+            if (this.failure === 'auth' || this.failure === 'channel' || this.failure === 'assistant' || this.failure === 'mic') {
+              Button(this.failure === 'mic' ? '麦克风权限' : '检查配对').height(40).fontSize(this.fs(12))
+                .backgroundColor(this.theme().surfaceMuted).fontColor(this.theme().textSecondary)
+                .onClick(() => this.onRecovery())
+            }
+          }.width('100%')
+        }
+      }.layoutWeight(1)
     }
     .width('100%')
     .padding({ left: 12, right: 12, top: 9, bottom: 9 })
@@ -171,7 +254,7 @@ export struct VoiceCallPanel {
     if (entry.role === 'user') {
       Row() {
         Blank()
-        Text(entry.text)
+        Text(VoiceTranscriptPresentation.text(entry))
           .fontSize(this.fs(14))
           .fontColor(this.theme().textPrimary)
           .padding({ left: 12, right: 12, top: 9, bottom: 10 })
@@ -195,7 +278,7 @@ export struct VoiceCallPanel {
         }
         .width('100%')
 
-        Text(entry.text)
+        Text(VoiceTranscriptPresentation.text(entry))
           .fontSize(this.fs(14))
           .fontColor(this.theme().textPrimary)
           .padding({ left: 12, right: 12, top: 9, bottom: 10 })
@@ -261,7 +344,7 @@ export struct VoiceCallPanel {
   }
 
   private canMute(): boolean {
-    return this.status === 'connecting' || this.status === 'active' || this.status === 'ready';
+    return this.status === 'active';
   }
 
   private statusDotColor(): string {
@@ -282,10 +365,10 @@ export struct VoiceCallPanel {
 
   private statusText(): string {
     if (this.status === 'connecting') {
-      return '连接中';
+      return this.stageNames[this.stageKeys.indexOf(this.stage)];
     }
     if (this.status === 'ready') {
-      return '已就绪';
+      return '正在开启麦克风';
     }
     if (this.status === 'active') {
       if (this.speaking) {
@@ -304,7 +387,7 @@ export struct VoiceCallPanel {
 
   private shouldShowBanner(): boolean {
     return this.statusDetail.length > 0
-      && (this.status === 'connecting' || this.status === 'error' || this.status === 'idle');
+      && (this.status === 'error' || this.status === 'idle');
   }
 
   private bannerTextColor(): string {
@@ -337,8 +420,8 @@ export struct VoiceCallPanel {
       return `已接通，直接开口和${this.assistantName}对话\n说话内容会实时显示在这里`;
     }
     if (this.status === 'error' || (this.status === 'idle' && this.statusDetail.length > 0)) {
-      return '可挂断后从「熊大语音」菜单重新发起';
+      return '请查看上方原因，处理后点击重试';
     }
-    return `接通后直接开口和${this.assistantName}对话\n说话内容会实时显示在这里`;
+    return this.stage === 'mic' ? '媒体已就绪，正在启动麦克风' : '连接完成后即可说话，内容会实时显示在这里';
   }
 }

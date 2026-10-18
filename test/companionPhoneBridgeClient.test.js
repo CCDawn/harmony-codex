@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import vm from 'node:vm';
+import { stripTypeScriptTypes } from 'node:module';
 import test from 'node:test';
 
 const bridgeClient = fs.readFileSync(
@@ -34,4 +36,36 @@ test('Companion history read scopes by profile and room, supports before cursors
   assert.match(source, /final: entry\.final === true/);
   assert.match(source, /nextCursor:/);
   assert.doesNotMatch(source, /RequestMethod\.POST/);
+});
+
+test('Companion history preserves call-only records and normalizes an older response without calls to an empty list', async () => {
+  const method = methodSource('static async getCompanionMessages(', 'static async deleteSession(');
+  const rawResponse = { value: '' };
+  const context = vm.createContext({
+    http: { RequestMethod: { GET: 'GET' } },
+    JSON, Array, String, Number, Promise, encodeURIComponent
+  });
+  const executable = `class BridgeClient {
+    static async request() { return globalThis.rawResponse.value; }
+    ${method}
+  }
+  globalThis.BridgeClient = BridgeClient;`;
+  vm.runInContext(stripTypeScriptTypes(executable, { mode: 'strip' }), context);
+  context.rawResponse = rawResponse;
+
+  rawResponse.value = JSON.stringify({ entries: [], nextCursor: null, calls: [{
+    messageId: 'official-message-1', callId: 'official-call-1', createdAt: '',
+    endedAt: null, durationMs: null, outcome: 'completed', transcriptStatus: 'unavailable', summary: null
+  }] });
+  const callOnly = await context.BridgeClient.getCompanionMessages('https://bridge.example', 'assistant-a', 'room-a');
+  assert.equal(callOnly.entries.length, 0);
+  assert.equal(callOnly.calls.length, 1);
+  assert.equal(callOnly.calls[0].transcriptStatus, 'unavailable');
+  assert.equal(callOnly.calls[0].endedAt, null);
+  assert.equal(callOnly.calls[0].durationMs, null);
+  assert.equal(callOnly.calls[0].createdAt, '');
+
+  rawResponse.value = JSON.stringify({ entries: [], nextCursor: null });
+  const legacy = await context.BridgeClient.getCompanionMessages('https://bridge.example', 'assistant-a', 'room-a');
+  assert.deepEqual(JSON.parse(JSON.stringify(legacy.calls)), []);
 });

@@ -8,7 +8,8 @@ import { VoiceRouteConfig } from '../config/VoiceRouteConfig';
 import { TotpGenerator } from '../utils/TotpGenerator';
 import { VoiceTranscriptReducer } from './VoiceTranscriptReducer';
 import { VoiceBackgroundTaskService } from './VoiceBackgroundTaskService';
-import { VoiceCallStatus, VoiceTranscriptEntry } from '../model/BridgeModels';
+import { VoiceCallStatus, VoiceCallStage, VoiceCallFailure, VoiceTranscriptEntry } from '../model/BridgeModels';
+import { CompanionVoiceIdentity } from '../model/CompanionModels';
 
 /**
  * 语音通话链路：手机端 WebSocket ↔ 电脑端 Bridge `/voice`。
@@ -18,8 +19,10 @@ import { VoiceCallStatus, VoiceTranscriptEntry } from '../model/BridgeModels';
  */
 
 export interface VoiceCallCallbacks {
+  onProgress?: (stage: VoiceCallStage, startedAt: number, failure: VoiceCallFailure) => void;
+  onMutedChanged?: (muted: boolean) => void;
   onStatus: (status: VoiceCallStatus, detail: string) => void;
-  onTranscript: (entry: VoiceTranscriptEntry) => void;
+  onTranscript: (entry: VoiceTranscriptEntry, identity: CompanionVoiceIdentity | null) => void;
   onHistory: (entries: VoiceTranscriptEntry[]) => void;
   onAssistantName: (name: string) => void;
   onSpeaking: (speaking: boolean) => void;
@@ -31,14 +34,23 @@ interface VoiceServerEvent {
   itemId?: string;
   sessionId?: string;
   profileName?: string;
+  profileId?: string;
   roomId?: string;
+  callId?: string;
   role?: string;
   text?: string;
   final?: boolean;
   entries?: VoiceTranscriptEntry[];
   state?: string;
+  revision?: number;
+  source?: string;
+  playbackControlVersion?: number;
+  bargeInAvailable?: boolean;
   message?: string;
   reason?: string;
+  stage?: string;
+  failureStage?: string;
+  httpStatus?: number;
 }
 
 interface VoiceAudioHealthReport {
@@ -69,6 +81,7 @@ interface VoiceAudioHealthReport {
 
 class VoiceStartFrame {
   type: string = 'start';
+  playbackControlVersion: number = 1;
   voice: string | null = null;
   prompt: string | null = null;
 }
@@ -86,13 +99,15 @@ const VOICE_CONNECT_RETRY_LIMIT: number = 3;
 const VOICE_CONNECT_RETRY_DELAY_MS: number = 1500;
 // 16kHz * 16bit * 1ch = 3200 字节 ≈ 100ms 的 PCM 数据。
 const VOICE_MIC_BATCH_BYTES: number = 3200;
-// 下行播放队列上限（块数），防止渲染卡顿时无限堆积。
-const VOICE_PLAY_QUEUE_CHUNK_LIMIT: number = 400;
+// Cap queued PCM duration independently of the upstream frame size.
+const VOICE_PLAY_QUEUE_LIMIT_MS: number = 1000;
 // 下行 PCM16LE 24kHz 单声道：48,000 字节/秒。
 const VOICE_PLAYBACK_BYTES_PER_SECOND: number = 48000;
+const VOICE_PLAY_SAMPLE_BYTES: number = 2;
+const VOICE_PLAY_QUEUE_LIMIT_BYTES: number = VOICE_PLAYBACK_BYTES_PER_SECOND * VOICE_PLAY_QUEUE_LIMIT_MS / 1000;
 
 const NOOP_VOICE_STATUS: (status: VoiceCallStatus, detail: string) => void = () => {};
-const NOOP_VOICE_TRANSCRIPT: (entry: VoiceTranscriptEntry) => void = () => {};
+const NOOP_VOICE_TRANSCRIPT: (entry: VoiceTranscriptEntry, identity: CompanionVoiceIdentity | null) => void = () => {};
 const NOOP_VOICE_HISTORY: (entries: VoiceTranscriptEntry[]) => void = () => {};
 const NOOP_VOICE_ASSISTANT_NAME: (name: string) => void = () => {};
 const NOOP_VOICE_SPEAKING: (speaking: boolean) => void = () => {};
@@ -111,6 +126,16 @@ export class VoiceCallService {
   private static rendererActive: boolean = false;
   private static rendererStartingGeneration: number = -1;
   private static rendererFailedGeneration: number = -1;
+  private static rendererStartupPromise: Promise<void> | null = null;
+  // Output ownership differs from the WebSocket/capture call generation.
+  private static rendererRevision: number = 0;
+  private static playbackEpoch: number = 0;
+  private static playbackFlushing: boolean = false;
+  private static playbackFlushOwner: number = 0;
+  private static playbackSuppressionSequence: number = 0;
+  private static playbackSuppressionTokens: number[] = [];
+  private static serverPlaybackRevision: number = -1;
+  private static serverPlaybackSuppressionToken: number = 0;
   private static voiceAudioHealthTimer: number = 0;
   private static voiceAudioReadCallbacks: number = 0;
   private static voiceAudioInputBytes: number = 0;
@@ -137,7 +162,15 @@ export class VoiceCallService {
   private static voiceAudioPreviousSnapshot: ArrayBuffer | null = null;
   private static muted: boolean = false;
   private static phase: VoiceCallStatus = 'idle';
+  private static stage: VoiceCallStage = 'channel';
+  private static stageStartedAt: number = 0;
+  private static capturerStartingGeneration: number = -1;
   private static ready: boolean = false;
+  private static expectedProfileId: string = '';
+  private static expectedRoomId: string = '';
+  private static transcriptIdentityCandidate: CompanionVoiceIdentity | null = null;
+  private static boundTranscriptIdentity: CompanionVoiceIdentity | null = null;
+  private static pendingIdentityTranscripts: VoiceTranscriptEntry[] = [];
   private static stopping: boolean = false;
   private static abilityContext: common.UIAbilityContext | null = null;
   private static callbacks: VoiceCallCallbacks = {
@@ -151,18 +184,24 @@ export class VoiceCallService {
 
   static setCallbacks(callbacks: VoiceCallCallbacks): void {
     VoiceCallService.callbacks = callbacks;
+    callbacks.onMutedChanged?.(VoiceCallService.muted);
   }
 
   static phaseValue(): VoiceCallStatus {
     return VoiceCallService.phase;
   }
 
-  static async requestMicPermission(context: common.UIAbilityContext): Promise<boolean> {
+  static mutedValue(): boolean {
+    return VoiceCallService.muted;
+  }
+
+  static async requestMicPermission(context: common.UIAbilityContext, fromSettings: boolean = false): Promise<boolean> {
     try {
       const atManager = abilityAccessCtrl.createAtManager();
       const permissions: Array<Permissions> = ['ohos.permission.MICROPHONE'];
-      const result = await atManager.requestPermissionsFromUser(context, permissions);
-      const authResults = result.authResults;
+      const authResults = fromSettings
+        ? await atManager.requestPermissionOnSetting(context, permissions)
+        : (await atManager.requestPermissionsFromUser(context, permissions)).authResults;
       for (let index = 0; index < authResults.length; index += 1) {
         if (authResults[index] === 0) {
           VoiceCallService.abilityContext = context;
@@ -177,34 +216,44 @@ export class VoiceCallService {
     }
   }
 
-  static async connect(bridgeUrl: string, token: string): Promise<void> {
+  static async connect(bridgeUrl: string, token: string, profileId: string = '', roomId: string = ''): Promise<void> {
     if (VoiceCallService.phase === 'connecting' || VoiceCallService.phase === 'active' || VoiceCallService.phase === 'ready') {
       return;
     }
     VoiceCallService.generation += 1;
     const generation = VoiceCallService.generation;
     VoiceCallService.ready = false;
+    VoiceCallService.expectedProfileId = profileId.trim();
+    VoiceCallService.expectedRoomId = roomId.trim();
+    VoiceCallService.transcriptIdentityCandidate = null;
+    VoiceCallService.boundTranscriptIdentity = null;
+    VoiceCallService.pendingIdentityTranscripts = [];
     VoiceCallService.stopping = false;
-    VoiceCallService.muted = false;
     VoiceCallService.teardownAudio();
+    VoiceCallService.stageStartedAt = 0;
+    VoiceCallService.setProgress('channel');
     VoiceCallService.setStatus('connecting', '正在连接语音通道');
     const wsUrl = VoiceCallService.resolveVoiceWebSocketUrl(bridgeUrl, VoiceRouteConfig.voiceHttpsBaseUrl);
     if (wsUrl.length === 0) {
       VoiceCallService.abilityContext = null;
-      VoiceCallService.setStatus('error', '桥接地址无效，无法建立语音通道');
+      VoiceCallService.failCall('桥接地址无效，无法建立语音通道', 'channel');
       return;
     }
     const context = VoiceCallService.abilityContext;
     if (context === null) {
-      VoiceCallService.setStatus('error', '无法获取应用上下文，无法申请语音后台任务');
+      VoiceCallService.failCall('请允许麦克风权限后重试', 'mic');
       return;
     }
     try {
-      await VoiceBackgroundTaskService.start(context, generation);
+      await VoiceBackgroundTaskService.start(context, generation, (owner: number) => {
+        if (owner === VoiceCallService.generation && !VoiceCallService.stopping) {
+          VoiceCallService.failCall('系统已结束语音后台任务，通话已结束，请重新接通', 'mic');
+        }
+      });
     } catch (error) {
       await VoiceCallService.stopVoiceBackgroundTask(generation);
       if (VoiceCallService.generation === generation) {
-        VoiceCallService.setStatus('error', `无法启动语音后台任务：${VoiceCallService.errorText(error)}`);
+        VoiceCallService.failCall('无法启动语音后台任务，请重试', 'mic');
       }
       return;
     }
@@ -232,23 +281,57 @@ export class VoiceCallService {
     if (VoiceCallService.generation === generation) {
       VoiceCallService.teardownAudio();
       await VoiceCallService.stopVoiceBackgroundTask(generation);
-      VoiceCallService.setStatus('error', `语音通道连接失败：${lastError.length > 0 ? lastError : '未知错误'}`);
+      const authFailed = /401|403|unauthorized|forbidden/i.test(lastError);
+      VoiceCallService.failCall(authFailed ? '语音认证失败，请检查配对后重试' : '语音通道连接失败，请检查网络后重试', authFailed ? 'auth' : 'channel');
     }
   }
 
   static interrupt(): void {
-    VoiceCallService.clearPlaybackBuffers();
-    VoiceCallService.flushRendererQuietly();
+    VoiceCallService.playbackEpoch += 1;
+    VoiceCallService.clearPlaybackBuffers(true);
+    VoiceCallService.callbacks.onSpeaking(false);
+    VoiceCallService.requestPlaybackFlush();
     void VoiceCallService.sendText(JSON.stringify(new VoiceInterruptFrame()));
   }
 
+  // Protocol owners may compose an explicit upstream boundary with the local
+  // flush barrier. Tokens carry no inference about which answer a PCM frame owns.
+  static beginPlaybackSuppression(): number {
+    VoiceCallService.playbackSuppressionSequence += 1;
+    const token = VoiceCallService.playbackSuppressionSequence;
+    VoiceCallService.playbackSuppressionTokens.push(token);
+    VoiceCallService.clearPlaybackBuffers(true);
+    VoiceCallService.callbacks.onSpeaking(false);
+    return token;
+  }
+
+  static endPlaybackSuppression(token: number): void {
+    const index = VoiceCallService.playbackSuppressionTokens.indexOf(token);
+    if (index >= 0) {
+      VoiceCallService.playbackSuppressionTokens.splice(index, 1);
+    }
+  }
+
+  private static playbackSuppressed(): boolean {
+    return VoiceCallService.playbackFlushing || VoiceCallService.playbackSuppressionTokens.length > 0;
+  }
+
   static setMuted(muted: boolean): void {
+    // Discard partial capture on either transition; never replay pre-mute audio
+    // when the user enables the microphone again.
+    VoiceCallService.micQueue = [];
     VoiceCallService.muted = muted;
+    VoiceCallService.callbacks.onMutedChanged?.(muted);
+    if (VoiceCallService.phase === 'active') {
+      VoiceCallService.setStatus('active', muted ? '通话中（已静音）' : '通话中 · 正在聆听');
+    }
   }
 
   static async stop(): Promise<void> {
     const ownerGeneration = VoiceCallService.generation;
     if (VoiceCallService.phase === 'idle' && VoiceCallService.ws === null && VoiceCallService.capturer === null) {
+      VoiceCallService.teardownAudio();
+      VoiceCallService.flushPendingWithoutIdentity();
       VoiceCallService.abilityContext = null;
       await VoiceCallService.stopVoiceBackgroundTask(ownerGeneration);
       return;
@@ -270,6 +353,12 @@ export class VoiceCallService {
     }
     VoiceCallService.teardownAudio();
     VoiceCallService.ready = false;
+    VoiceCallService.flushPendingWithoutIdentity();
+    VoiceCallService.transcriptIdentityCandidate = null;
+    VoiceCallService.boundTranscriptIdentity = null;
+    VoiceCallService.pendingIdentityTranscripts = [];
+    VoiceCallService.expectedProfileId = '';
+    VoiceCallService.expectedRoomId = '';
     VoiceCallService.callbacks.onSpeaking(false);
     VoiceCallService.abilityContext = null;
     await VoiceCallService.stopVoiceBackgroundTask(ownerGeneration);
@@ -309,6 +398,8 @@ export class VoiceCallService {
           settled = true;
           resolve();
         }
+        VoiceCallService.setProgress('assistant');
+        VoiceCallService.setStatus('connecting', '正在准备个人助手');
         void VoiceCallService.sendText(JSON.stringify(new VoiceStartFrame()));
       });
       client.on('message', (err: BusinessError, value: string | ArrayBuffer) => {
@@ -391,13 +482,56 @@ export class VoiceCallService {
       return;
     }
     const type = event.type ?? '';
+    if (type === 'playback') {
+      VoiceCallService.handlePlaybackControl(event);
+      return;
+    }
+    if (type === 'progress') {
+      // Ignore unknown, regressive and late stages; server readiness still requires ready.
+      if (!VoiceCallService.ready && (event.stage === 'assistant' || event.stage === 'media')) {
+        if (VoiceCallService.stage !== 'media' || event.stage === 'media') {
+          VoiceCallService.setProgress(event.stage);
+          VoiceCallService.setStatus('connecting', event.stage === 'media' ? '正在等待媒体连接' : '正在准备个人助手');
+        }
+      }
+      return;
+    }
     if (type === 'ready') {
+      if (VoiceCallService.ready) {
+        return;
+      }
       const profileName = event.profileName?.trim() ?? '';
       if (profileName.length > 0) {
         VoiceCallService.callbacks.onAssistantName(profileName);
       }
+      const eventIdentity = VoiceCallService.identityFromEvent(event);
+      const identityMatchesExpected = eventIdentity !== null
+        && eventIdentity.profileId === VoiceCallService.expectedProfileId
+        && eventIdentity.roomId === VoiceCallService.expectedRoomId;
+      const identityMatchesCandidate = eventIdentity !== null
+        && (VoiceCallService.transcriptIdentityCandidate === null
+          || VoiceCallService.sameIdentity(eventIdentity, VoiceCallService.transcriptIdentityCandidate));
+      let identityWarning: string = '';
+      if (identityMatchesExpected && identityMatchesCandidate) {
+        VoiceCallService.boundTranscriptIdentity = eventIdentity;
+        VoiceCallService.pendingIdentityTranscripts.forEach((entry: VoiceTranscriptEntry) => {
+          VoiceCallService.callbacks.onTranscript(entry, eventIdentity);
+        });
+      } else if (VoiceCallService.pendingIdentityTranscripts.length > 0) {
+        VoiceCallService.pendingIdentityTranscripts.forEach((entry: VoiceTranscriptEntry) => {
+          VoiceCallService.callbacks.onTranscript(entry, null);
+        });
+      }
+      if (eventIdentity !== null && (!identityMatchesExpected || !identityMatchesCandidate)) {
+        identityWarning = '语音会话身份与当前个人助手不一致；转写未加入助手历史';
+      } else if (eventIdentity === null) {
+        identityWarning = '语音服务未提供可核验的助手会话身份；转写不会写入助手历史';
+      }
+      VoiceCallService.pendingIdentityTranscripts = [];
       VoiceCallService.ready = true;
-      VoiceCallService.setStatus('active', '已接通，正在开启麦克风');
+      VoiceCallService.setProgress('mic');
+      VoiceCallService.setStatus('ready', identityWarning.length > 0
+        ? identityWarning : '媒体已就绪，正在开启麦克风');
       void VoiceCallService.startCapturer();
       return;
     }
@@ -414,28 +548,73 @@ export class VoiceCallService {
         final: event.final === true,
         epochMs: Date.now()
       }));
-      VoiceCallService.callbacks.onTranscript({
+      const transcript: VoiceTranscriptEntry = {
         itemId: event.itemId,
         role: event.role ?? 'assistant',
         text: transcriptText,
         final: event.final === true
-      });
+      };
+      const identity = VoiceCallService.identityFromEvent(event);
+      if (identity === null) {
+        // Compatibility path: show the event in the call panel, but never
+        // attach the missing identity to the configured assistant ourselves.
+        VoiceCallService.callbacks.onTranscript(transcript, null);
+      } else if (identity.profileId !== VoiceCallService.expectedProfileId
+        || identity.roomId !== VoiceCallService.expectedRoomId) {
+        VoiceCallService.reportTranscriptIdentityProblem('收到其他助手或房间的语音转写；已丢弃以防串入当前会话');
+      } else if (VoiceCallService.boundTranscriptIdentity !== null) {
+        if (VoiceCallService.sameIdentity(identity, VoiceCallService.boundTranscriptIdentity)) {
+          VoiceCallService.callbacks.onTranscript(transcript, VoiceCallService.boundTranscriptIdentity);
+        } else {
+          VoiceCallService.reportTranscriptIdentityProblem('语音通话标识发生变化；该转写未加入当前助手历史');
+        }
+      } else if (!VoiceCallService.ready) {
+        if (VoiceCallService.transcriptIdentityCandidate === null) {
+          VoiceCallService.transcriptIdentityCandidate = identity;
+        }
+        if (VoiceCallService.sameIdentity(identity, VoiceCallService.transcriptIdentityCandidate)) {
+          VoiceCallService.pendingIdentityTranscripts.push(transcript);
+        } else {
+          VoiceCallService.reportTranscriptIdentityProblem('接通前收到不一致的语音通话标识；该转写已丢弃');
+        }
+      } else {
+        VoiceCallService.callbacks.onTranscript(transcript, null);
+        VoiceCallService.reportTranscriptIdentityProblem('通话未确认助手会话身份；转写不会写入助手历史');
+      }
       return;
     }
     if (type === 'speaking') {
-      VoiceCallService.callbacks.onSpeaking(event.state === 'start');
+      VoiceCallService.callbacks.onSpeaking(event.state === 'start' && !VoiceCallService.playbackSuppressed());
       return;
     }
     if (type === 'busy') {
-      VoiceCallService.setStatus(VoiceCallService.ready ? 'ready' : 'connecting', 'Codex 正忙，请稍后再试');
+      VoiceCallService.failCall('个人助手正忙，请稍后重试', 'assistant');
       return;
     }
     if (type === 'error') {
-      VoiceCallService.failCall(`语音服务错误：${event.message ?? '未知错误'}`);
+      const failure: VoiceCallFailure = event.failureStage === 'media' ? 'media' : 'assistant';
+      if (VoiceCallService.ready) {
+        VoiceCallService.failCall('语音服务异常，通话已结束，请重试', '');
+      } else {
+        let message = failure === 'media' ? '媒体连接失败，请重试' : '个人助手准备失败，请重试';
+        if (event.httpStatus === 502 || event.httpStatus === 503 || event.httpStatus === 504) {
+          message = 'Codex 语音服务暂时不可用，请稍后重试';
+        } else if (event.httpStatus === 401 || event.httpStatus === 403) {
+          message = 'Codex 语音访问被拒绝，请检查电脑端登录状态';
+        } else if (event.httpStatus === 429) {
+          message = 'Codex 语音请求受限，请稍后重试';
+        }
+        VoiceCallService.failCall(message, failure);
+      }
       return;
     }
     if (type === 'closed') {
-      VoiceCallService.endCall(`通话已结束：${event.reason ?? '服务端关闭'}`);
+      VoiceCallService.flushPendingWithoutIdentity();
+      if (event.reason === 'error') {
+        VoiceCallService.failCall('语音服务连接失败，请重试', 'assistant');
+      } else {
+        VoiceCallService.endCall('通话已结束');
+      }
     }
   }
 
@@ -444,11 +623,45 @@ export class VoiceCallService {
       return;
     }
     const reason = VoiceCallService.ready ? '网络连接中断，通话已结束' : '语音通道已断开';
-    VoiceCallService.endCall(reason);
+    VoiceCallService.failCall(reason, 'channel');
   }
 
-  private static failCall(reason: string): void {
+  private static handlePlaybackControl(event: VoiceServerEvent): void {
+    const boundIdentity = VoiceCallService.boundTranscriptIdentity;
+    const identity = VoiceCallService.identityFromEvent(event);
+    const revision = event.revision;
+    const state = event.state;
+    if (!VoiceCallService.ready || boundIdentity === null || identity === null
+      || !VoiceCallService.sameIdentity(identity, boundIdentity)
+      || typeof revision !== 'number' || !Number.isSafeInteger(revision) || revision < 0
+      || revision <= VoiceCallService.serverPlaybackRevision
+      || (state !== 'blocked' && state !== 'resumed')) {
+      return;
+    }
+    if (event.source !== undefined && event.source !== 'manual' && event.source !== 'user_speech'
+      && event.source !== 'user_turn' && event.source !== 'assistant_turn') {
+      return;
+    }
+    VoiceCallService.serverPlaybackRevision = revision;
+    if (state === 'blocked') {
+      if (VoiceCallService.serverPlaybackSuppressionToken === 0) {
+        VoiceCallService.serverPlaybackSuppressionToken = VoiceCallService.beginPlaybackSuppression();
+      }
+      // Clear the platform's buffered PCM too, without sending another interrupt
+      // upstream. A later resumed event releases only the server token; the flush
+      // barrier remains until its asynchronous work has completed.
+      VoiceCallService.playbackEpoch += 1;
+      VoiceCallService.requestPlaybackFlush();
+    } else {
+      VoiceCallService.endPlaybackSuppression(VoiceCallService.serverPlaybackSuppressionToken);
+      VoiceCallService.serverPlaybackSuppressionToken = 0;
+    }
+  }
+
+  private static failCall(reason: string, failure: VoiceCallFailure = 'channel'): void {
+    const failedStage = VoiceCallService.stage;
     VoiceCallService.endCall(reason);
+    VoiceCallService.setProgress(failedStage, failure);
     VoiceCallService.setStatus('error', reason);
   }
 
@@ -466,6 +679,11 @@ export class VoiceCallService {
     }
     VoiceCallService.teardownAudio();
     VoiceCallService.ready = false;
+    VoiceCallService.flushPendingWithoutIdentity();
+    VoiceCallService.transcriptIdentityCandidate = null;
+    VoiceCallService.boundTranscriptIdentity = null;
+    VoiceCallService.expectedProfileId = '';
+    VoiceCallService.expectedRoomId = '';
     VoiceCallService.callbacks.onSpeaking(false);
     VoiceCallService.phase = 'idle';
     VoiceCallService.abilityContext = null;
@@ -486,10 +704,12 @@ export class VoiceCallService {
   }
 
   private static async startCapturer(): Promise<void> {
-    if (VoiceCallService.capturer !== null) {
+    if (VoiceCallService.capturer !== null || VoiceCallService.capturerStartingGeneration === VoiceCallService.generation) {
       return;
     }
     const generation = VoiceCallService.generation;
+    VoiceCallService.capturerStartingGeneration = generation;
+    let pendingCapturer: audio.AudioCapturer | null = null;
     try {
       const options: audio.AudioCapturerOptions = {
         streamInfo: {
@@ -505,29 +725,37 @@ export class VoiceCallService {
         }
       };
       const capturer = await audio.createAudioCapturer(options);
-      if (VoiceCallService.generation !== generation) {
-        try {
-          await capturer.release();
-        } catch (_) {
-        }
-        return;
-      }
-      VoiceCallService.capturer = capturer;
+      pendingCapturer = capturer;
+      if (VoiceCallService.generation !== generation) { return; }
       VoiceCallService.micQueue = [];
+      capturer.on('audioInterrupt', (event: audio.InterruptEvent) => {
+        VoiceCallService.handleAudioInterrupt(event, generation);
+      });
       capturer.on('readData', (buffer: ArrayBuffer) => {
-        VoiceCallService.handleMicData(buffer);
+        if (VoiceCallService.generation === generation && VoiceCallService.phase === 'active') {
+          VoiceCallService.handleMicData(buffer);
+        }
       });
       await capturer.start();
-      if (VoiceCallService.generation !== generation) {
-        VoiceCallService.teardownAudio();
-        return;
-      }
+      if (VoiceCallService.generation !== generation) { return; }
+      VoiceCallService.capturer = capturer;
+      pendingCapturer = null;
       if (VoiceCallService.ready) {
+        VoiceCallService.setProgress('listening');
         VoiceCallService.setStatus('active', VoiceCallService.muted ? '通话中（已静音）' : '通话中 · 正在聆听');
       }
     } catch (error) {
       if (VoiceCallService.generation === generation) {
-        VoiceCallService.failCall(`麦克风启动失败：${VoiceCallService.errorText(error)}`);
+        VoiceCallService.failCall('麦克风启动失败，请检查权限后重试', 'mic');
+      }
+    } finally {
+      // Pending startup belongs to this generation, never to a newer call.
+      if (pendingCapturer !== null) {
+        try { await pendingCapturer.stop(); } catch (_) {}
+        try { await pendingCapturer.release(); } catch (_) {}
+      }
+      if (VoiceCallService.capturerStartingGeneration === generation) {
+        VoiceCallService.capturerStartingGeneration = -1;
       }
     }
   }
@@ -557,34 +785,39 @@ export class VoiceCallService {
     if (VoiceCallService.voiceAudioFirstBinaryEpochMs === 0) {
       VoiceCallService.voiceAudioFirstBinaryEpochMs = Date.now();
     }
-    VoiceCallService.playQueue.push(buffer);
-    VoiceCallService.voiceAudioDownlinkQueuedBytes += buffer.byteLength;
-    if (VoiceCallService.playQueue.length > VOICE_PLAY_QUEUE_CHUNK_LIMIT) {
-      const dropped = VoiceCallService.playQueue.splice(
-        0,
-        VoiceCallService.playQueue.length - VOICE_PLAY_QUEUE_CHUNK_LIMIT
-      );
-      for (let index = 0; index < dropped.length; index += 1) {
-        VoiceCallService.voiceAudioDownlinkDroppedBytes += dropped[index].byteLength;
-        VoiceCallService.voiceAudioDownlinkQueuedBytes = Math.max(
-          0,
-          VoiceCallService.voiceAudioDownlinkQueuedBytes - dropped[index].byteLength
-        );
-      }
+    if (VoiceCallService.playbackSuppressed()) {
+      VoiceCallService.voiceAudioDownlinkDroppedBytes += buffer.byteLength;
+      return;
     }
+    // Never enqueue a trailing half PCM16 sample.
+    const sampleBytes = Math.floor(buffer.byteLength / VOICE_PLAY_SAMPLE_BYTES) * VOICE_PLAY_SAMPLE_BYTES;
+    VoiceCallService.voiceAudioDownlinkDroppedBytes += buffer.byteLength - sampleBytes;
+    if (sampleBytes === 0) { return; }
+    VoiceCallService.playQueue.push(sampleBytes === buffer.byteLength ? buffer : buffer.slice(0, sampleBytes));
+    VoiceCallService.voiceAudioDownlinkQueuedBytes += sampleBytes;
+    VoiceCallService.trimPlaybackQueue();
     VoiceCallService.recordPlaybackQueueLevel();
     void VoiceCallService.ensureRenderer();
   }
 
-  private static async ensureRenderer(): Promise<void> {
+  private static ensureRenderer(recoveringOutput: boolean = false): Promise<void> {
     const generation = VoiceCallService.generation;
+    if (VoiceCallService.rendererStartingGeneration === generation && VoiceCallService.rendererStartupPromise !== null) {
+      return VoiceCallService.rendererStartupPromise;
+    }
     if (VoiceCallService.rendererActive || VoiceCallService.stopping
-      || VoiceCallService.rendererStartingGeneration === generation
       || VoiceCallService.rendererFailedGeneration === generation) {
-      return;
+      return Promise.resolve();
     }
     // Set before the first await: incoming PCM must not start a second renderer.
     VoiceCallService.rendererStartingGeneration = generation;
+    const revision = VoiceCallService.rendererRevision;
+    const startup = VoiceCallService.createRenderer(generation, revision, recoveringOutput);
+    VoiceCallService.rendererStartupPromise = startup;
+    return startup;
+  }
+
+  private static async createRenderer(generation: number, revision: number, recoveringOutput: boolean): Promise<void> {
     let renderer: audio.AudioRenderer | null = null;
     try {
       const options: audio.AudioRendererOptions = {
@@ -600,26 +833,31 @@ export class VoiceCallService {
         }
       };
       renderer = await audio.createAudioRenderer(options);
-      if (VoiceCallService.generation !== generation || VoiceCallService.stopping) {
+      if (!VoiceCallService.ownsRenderer(generation, revision)) {
         await VoiceCallService.releaseRendererQuietly(renderer);
         return;
       }
       // Keep hands-free playback while allowing connected headsets to take priority.
       // This preference belongs to this renderer and ends when it is released.
       await renderer.setDefaultOutputDevice(audio.DeviceType.SPEAKER);
-      if (VoiceCallService.generation !== generation || VoiceCallService.stopping) {
+      if (!VoiceCallService.ownsRenderer(generation, revision)) {
         await VoiceCallService.releaseRendererQuietly(renderer);
         return;
       }
+      renderer.on('audioInterrupt', (event: audio.InterruptEvent) => {
+        if (VoiceCallService.ownsRenderer(generation, revision)) {
+          VoiceCallService.handleAudioInterrupt(event, generation);
+        }
+      });
       renderer.on('writeData', (data: ArrayBuffer) => {
-        if (VoiceCallService.generation === generation && !VoiceCallService.stopping) {
+        if (VoiceCallService.ownsRenderer(generation, revision)) {
           VoiceCallService.handleWriteData(data);
         } else {
           new Uint8Array(data).fill(0);
         }
       });
       await renderer.start();
-      if (VoiceCallService.generation !== generation || VoiceCallService.stopping) {
+      if (!VoiceCallService.ownsRenderer(generation, revision)) {
         await VoiceCallService.releaseRendererQuietly(renderer);
         return;
       }
@@ -627,24 +865,34 @@ export class VoiceCallService {
       VoiceCallService.renderer = renderer;
       VoiceCallService.rendererActive = true;
     } catch (error) {
-      if (VoiceCallService.generation === generation) {
+      if (VoiceCallService.ownsRenderer(generation, revision)) {
         VoiceCallService.rendererFailedGeneration = generation;
       }
       if (renderer !== null) {
         await VoiceCallService.releaseRendererQuietly(renderer);
       }
-      if (VoiceCallService.generation === generation) {
+      if (VoiceCallService.ownsRenderer(generation, revision)) {
         VoiceCallService.rendererActive = false;
-        VoiceCallService.failCall(`扬声器启动失败：${VoiceCallService.errorText(error)}`);
+        if (recoveringOutput) {
+          VoiceCallService.reportOutputStatus('扬声器恢复失败，请重新接通');
+        } else {
+          VoiceCallService.failCall('扬声器启动失败，请重试', '');
+        }
       }
     } finally {
-      if (VoiceCallService.rendererStartingGeneration === generation) {
+      if (VoiceCallService.generation === generation && VoiceCallService.rendererRevision === revision) {
         VoiceCallService.rendererStartingGeneration = -1;
+        VoiceCallService.rendererStartupPromise = null;
       }
     }
   }
 
+  private static ownsRenderer(generation: number, revision: number): boolean {
+    return VoiceCallService.generation === generation && VoiceCallService.rendererRevision === revision && !VoiceCallService.stopping;
+  }
+
   private static async releaseRendererQuietly(renderer: audio.AudioRenderer): Promise<void> {
+    try { renderer.off('audioInterrupt'); } catch (_) {}
     try {
       renderer.off('writeData');
     } catch (_) {
@@ -675,8 +923,14 @@ export class VoiceCallService {
     VoiceCallService.voiceAudioLastRendererCallbackEpochMs = callbackEpochMs;
 
     const target = new Uint8Array(data);
+    if (VoiceCallService.playbackSuppressed()) {
+      target.fill(0);
+      VoiceCallService.voiceAudioDownlinkSilenceBytes += target.length;
+      return;
+    }
+    const targetSampleBytes = Math.floor(target.length / VOICE_PLAY_SAMPLE_BYTES) * VOICE_PLAY_SAMPLE_BYTES;
     let filled: number = 0;
-    while (filled < target.length) {
+    while (filled < targetSampleBytes) {
       if (VoiceCallService.playCursorBuffer === null || VoiceCallService.playCursorView === null
         || VoiceCallService.playCursorOffset >= VoiceCallService.playCursorBuffer.byteLength) {
         const next = VoiceCallService.playQueue.shift();
@@ -689,7 +943,7 @@ export class VoiceCallService {
         continue;
       }
       const available = VoiceCallService.playCursorView.length - VoiceCallService.playCursorOffset;
-      const needed = target.length - filled;
+      const needed = targetSampleBytes - filled;
       const take = Math.min(available, needed);
       target.set(VoiceCallService.playCursorView.subarray(
         VoiceCallService.playCursorOffset,
@@ -738,7 +992,30 @@ export class VoiceCallService {
     }
   }
 
-  private static clearPlaybackBuffers(): void {
+  private static trimPlaybackQueue(): void {
+    let excess = VoiceCallService.voiceAudioDownlinkQueuedBytes - VOICE_PLAY_QUEUE_LIMIT_BYTES;
+    while (excess > 0) {
+      if (VoiceCallService.playCursorBuffer === null || VoiceCallService.playCursorView === null
+        || VoiceCallService.playCursorOffset >= VoiceCallService.playCursorBuffer.byteLength) {
+        const next = VoiceCallService.playQueue.shift();
+        if (next === undefined) { break; }
+        VoiceCallService.playCursorBuffer = next;
+        VoiceCallService.playCursorView = new Uint8Array(next);
+        VoiceCallService.playCursorOffset = 0;
+      }
+      const available = VoiceCallService.playCursorBuffer.byteLength - VoiceCallService.playCursorOffset;
+      const dropBytes = Math.min(available, Math.ceil(excess / VOICE_PLAY_SAMPLE_BYTES) * VOICE_PLAY_SAMPLE_BYTES);
+      VoiceCallService.playCursorOffset += dropBytes;
+      VoiceCallService.voiceAudioDownlinkQueuedBytes -= dropBytes;
+      VoiceCallService.voiceAudioDownlinkDroppedBytes += dropBytes;
+      excess -= dropBytes;
+    }
+  }
+
+  private static clearPlaybackBuffers(countDiscarded: boolean = false): void {
+    if (countDiscarded) {
+      VoiceCallService.voiceAudioDownlinkDroppedBytes += VoiceCallService.voiceAudioDownlinkQueuedBytes;
+    }
     VoiceCallService.playQueue = [];
     VoiceCallService.playCursorBuffer = null;
     VoiceCallService.playCursorView = null;
@@ -746,18 +1023,75 @@ export class VoiceCallService {
     VoiceCallService.voiceAudioDownlinkQueuedBytes = 0;
   }
 
-  private static flushRendererQuietly(): void {
-    const renderer = VoiceCallService.renderer;
-    if (renderer === null) {
-      return;
-    }
+  private static requestPlaybackFlush(): void {
+    if (VoiceCallService.playbackFlushing) { return; }
+    // Set the barrier before any await, including pending renderer creation/start.
+    VoiceCallService.playbackFlushing = true;
+    VoiceCallService.playbackFlushOwner += 1;
+    void VoiceCallService.flushPlayback(VoiceCallService.generation, VoiceCallService.playbackFlushOwner);
+  }
+
+  private static async flushPlayback(generation: number, owner: number): Promise<void> {
     try {
-      void renderer.flush().catch(() => {});
-    } catch (_) {
+      let flushedEpoch: number = -1;
+      while (VoiceCallService.generation === generation && VoiceCallService.playbackFlushOwner === owner
+        && !VoiceCallService.stopping && flushedEpoch !== VoiceCallService.playbackEpoch) {
+        const epoch = VoiceCallService.playbackEpoch;
+        const startup = VoiceCallService.rendererStartupPromise;
+        if (startup !== null) { await startup; }
+        if (VoiceCallService.generation !== generation || VoiceCallService.playbackFlushOwner !== owner
+          || VoiceCallService.stopping) { return; }
+        const renderer = VoiceCallService.renderer;
+        if (renderer !== null) {
+          try {
+            await renderer.flush();
+          } catch (_) {
+            if (VoiceCallService.generation !== generation || VoiceCallService.playbackFlushOwner !== owner
+              || VoiceCallService.stopping) { return; }
+            // Revoke callback ownership before any potentially slow stop/release.
+            VoiceCallService.renderer = null;
+            VoiceCallService.rendererActive = false;
+            VoiceCallService.rendererRevision += 1;
+            VoiceCallService.rendererStartingGeneration = -1;
+            VoiceCallService.rendererStartupPromise = null;
+            VoiceCallService.rendererFailedGeneration = -1;
+            VoiceCallService.reportOutputStatus('扬声器正在恢复，通话保持连接');
+            await VoiceCallService.releaseRendererQuietly(renderer);
+            if (VoiceCallService.generation !== generation || VoiceCallService.playbackFlushOwner !== owner
+              || VoiceCallService.stopping) { return; }
+            await VoiceCallService.ensureRenderer(true);
+            if (VoiceCallService.generation !== generation || VoiceCallService.playbackFlushOwner !== owner
+              || VoiceCallService.stopping) { return; }
+            if (VoiceCallService.rendererActive) {
+              VoiceCallService.reportOutputStatus('扬声器已恢复，通话继续');
+            }
+          }
+        }
+        flushedEpoch = epoch;
+      }
+    } finally {
+      if (VoiceCallService.generation === generation && VoiceCallService.playbackFlushOwner === owner) {
+        VoiceCallService.playbackFlushing = false;
+      }
+    }
+  }
+
+  private static reportOutputStatus(detail: string): void {
+    const phase = VoiceCallService.phase;
+    if (phase === 'active' || phase === 'ready' || phase === 'connecting') {
+      VoiceCallService.callbacks.onStatus(phase, detail);
     }
   }
 
   private static teardownAudio(): void {
+    VoiceCallService.playbackFlushOwner += 1;
+    VoiceCallService.playbackFlushing = false;
+    VoiceCallService.playbackSuppressionTokens = [];
+    VoiceCallService.serverPlaybackSuppressionToken = 0;
+    VoiceCallService.serverPlaybackRevision = -1;
+    VoiceCallService.rendererRevision += 1;
+    VoiceCallService.rendererStartupPromise = null;
+    VoiceCallService.rendererStartingGeneration = -1;
     VoiceCallService.clearVoiceAudioHealth();
     VoiceCallService.micQueue = [];
     VoiceCallService.clearPlaybackBuffers();
@@ -765,6 +1099,7 @@ export class VoiceCallService {
     const capturer = VoiceCallService.capturer;
     VoiceCallService.capturer = null;
     if (capturer !== null) {
+      try { capturer.off('audioInterrupt'); } catch (_) {}
       try {
         capturer.off('readData');
       } catch (_) {
@@ -782,6 +1117,18 @@ export class VoiceCallService {
     VoiceCallService.renderer = null;
     if (renderer !== null) {
       void VoiceCallService.releaseRendererQuietly(renderer);
+    }
+  }
+
+  private static handleAudioInterrupt(event: audio.InterruptEvent, generation: number): void {
+    if (generation !== VoiceCallService.generation || VoiceCallService.stopping) {
+      return;
+    }
+    // Screen-off is not an audio interruption. Honor an actual system pause or
+    // stop instead of showing "listening" with a capturer that no longer runs.
+    if (event.hintType === audio.InterruptHint.INTERRUPT_HINT_STOP
+      || event.hintType === audio.InterruptHint.INTERRUPT_HINT_PAUSE) {
+      VoiceCallService.failCall('通话被系统音频打断，请在其他通话结束后重新接通', 'mic');
     }
   }
 
@@ -817,7 +1164,7 @@ export class VoiceCallService {
 
   private static async sendBinary(payload: ArrayBuffer): Promise<void> {
     const client = VoiceCallService.ws;
-    if (client === null) {
+    if (client === null || VoiceCallService.muted || VoiceCallService.stopping) {
       return;
     }
     const startedAt = Date.now();
@@ -941,9 +1288,45 @@ export class VoiceCallService {
     }
   }
 
+  private static setProgress(stage: VoiceCallStage, failure: VoiceCallFailure = ''): void {
+    if (stage !== VoiceCallService.stage || VoiceCallService.stageStartedAt === 0) {
+      VoiceCallService.stageStartedAt = Date.now();
+    }
+    VoiceCallService.stage = stage;
+    VoiceCallService.callbacks.onProgress?.(stage, VoiceCallService.stageStartedAt, failure);
+  }
+
   private static setStatus(status: VoiceCallStatus, detail: string): void {
     VoiceCallService.phase = status;
     VoiceCallService.callbacks.onStatus(status, detail);
+  }
+
+  private static identityFromEvent(event: VoiceServerEvent): CompanionVoiceIdentity | null {
+    const profileId = typeof event.profileId === 'string' ? event.profileId.trim() : '';
+    const roomId = typeof event.roomId === 'string' ? event.roomId.trim() : '';
+    const callId = typeof event.callId === 'string' ? event.callId.trim() : '';
+    if (profileId.length === 0 || roomId.length === 0 || callId.length === 0) {
+      return null;
+    }
+    return { profileId, roomId, callId };
+  }
+
+  private static sameIdentity(left: CompanionVoiceIdentity, right: CompanionVoiceIdentity): boolean {
+    return left.profileId === right.profileId && left.roomId === right.roomId && left.callId === right.callId;
+  }
+
+  private static reportTranscriptIdentityProblem(detail: string): void {
+    const status = VoiceCallService.phase;
+    if (status === 'connecting' || status === 'ready' || status === 'active') {
+      VoiceCallService.callbacks.onStatus(status, detail);
+    }
+  }
+
+  private static flushPendingWithoutIdentity(): void {
+    VoiceCallService.pendingIdentityTranscripts.forEach((entry: VoiceTranscriptEntry) => {
+      VoiceCallService.callbacks.onTranscript(entry, null);
+    });
+    VoiceCallService.pendingIdentityTranscripts = [];
   }
 
   private static resolveVoiceWebSocketUrl(bridgeUrl: string, voiceHttpsBaseUrl: string): string {

@@ -10,6 +10,7 @@ import { DiagnosticLogger } from './diagnosticLogger.js';
 import { analyzeLogRun } from './logAnalyzer.js';
 import { CodexSessionStore } from './codexSessions.js';
 import { CodexThreadService } from './codexThreadService.js';
+import { DesktopInteractionService } from './desktopInteractionService.js';
 import { openCodexThreadDeeplink } from './desktopDeepLink.js';
 import { desktopScriptBridge } from './desktopScriptBridge.js';
 import { buildDesktopScriptClient } from './desktopScriptClient.js';
@@ -55,6 +56,7 @@ import {
 import { attachVoiceUpgrade } from './voiceProxy.js';
 import { createVoiceProcessSupervisor } from './voiceProcess.js';
 import { CompanionConversationService, handleCompanionRoute } from './companionConversationService.js';
+import { MobileLinkGuardianService } from './mobileLinkGuardianService.js';
 import { CompanionComputerService, handleCompanionComputerRoute } from './companionComputerService.js';
 
 export function createApp({ config, adapter }) {
@@ -90,7 +92,9 @@ export function createApp({ config, adapter }) {
     resolveSourceKey: (request) => authGate.sourceKey(request)
   });
   const sessions = config.sessions ?? new CodexSessionStore();
+  const desktopInteractions = config.desktopInteractions ?? new DesktopInteractionService();
   const companionService = config.companionService ?? new CompanionConversationService();
+  const guardianService = config.guardianService ?? new MobileLinkGuardianService({ repoRoot: config.repoRoot, port: config.port });
   const companionComputerService = config.companionComputerService ?? new CompanionComputerService();
   const sessionSettings = config.sessionSettings ?? new SessionSettingsStore({
     repoRoot: config.repoRoot ?? process.cwd()
@@ -194,7 +198,7 @@ export function createApp({ config, adapter }) {
           url: sanitizeRequestUrl(request.url)
         });
       }
-      await route({ request, response, config, store, outbox, eventBus, logger, sessions, companionService, companionComputerService, sessionSettings, defaultReasoningEffortProvider, codexSettingsProvider, accountUsageProvider, threadService, desktopLiveRecovery, desktopLiveDiagnostics, desktopOpener, authGate, deviceRegistry, pairingSessions, pairingEnrollLimiter, voiceSupervisor: voiceProcess });
+      await route({ request, response, config, store, outbox, eventBus, logger, sessions, desktopInteractions, companionService, companionComputerService, sessionSettings, defaultReasoningEffortProvider, codexSettingsProvider, accountUsageProvider, threadService, desktopLiveRecovery, desktopLiveDiagnostics, desktopOpener, authGate, deviceRegistry, pairingSessions, pairingEnrollLimiter, guardianService, voiceSupervisor: voiceProcess });
       if (shouldLogCompletedRequest(request)) {
         const responseBytes = responseByteCounter.bytes || responseContentLength(response);
         await logger.write('bridge', 'info', 'http.request.completed', {
@@ -237,6 +241,7 @@ export function createApp({ config, adapter }) {
     }
   });
   server.on('close', () => outbox?.close());
+  server.on('close', () => desktopInteractions.close?.());
   // 语音链路：受管 voice_server 子进程 + /voice 升级隧道（/voice/status 走普通路由鉴权）。
   const voiceProcess = createVoiceProcessSupervisor({ config, logger });
   attachVoiceUpgrade({ server, config, logger, authGate, supervisor: voiceProcess });
@@ -590,7 +595,7 @@ function createBeforeRunDesktopVerification({ adapter, logger, desktopLiveRecove
   };
 }
 
-async function route({ request, response, config, store, outbox, eventBus, logger, sessions, companionService, companionComputerService, sessionSettings, defaultReasoningEffortProvider, codexSettingsProvider, accountUsageProvider, threadService, desktopLiveRecovery, desktopLiveDiagnostics, desktopOpener, authGate, deviceRegistry, pairingSessions, pairingEnrollLimiter, voiceSupervisor }) {
+async function route({ request, response, config, store, outbox, eventBus, logger, sessions, desktopInteractions, companionService, companionComputerService, sessionSettings, defaultReasoningEffortProvider, codexSettingsProvider, accountUsageProvider, threadService, desktopLiveRecovery, desktopLiveDiagnostics, desktopOpener, authGate, deviceRegistry, pairingSessions, pairingEnrollLimiter, guardianService, voiceSupervisor }) {
   const url = new URL(request.url, 'http://127.0.0.1');
   const method = request.method ?? 'GET';
   if (method === 'OPTIONS') {
@@ -619,6 +624,18 @@ async function route({ request, response, config, store, outbox, eventBus, logge
     return;
   }
   await authGate.requireAuth({ request, url });
+  if (method === 'GET' && url.pathname === '/api/desktop-interactions') {
+    const requests = await desktopInteractions.list(url.searchParams.get('threadId') ?? '');
+    sendJson(response, 200, { requests });
+    return;
+  }
+  const desktopInteractionMatch = url.pathname.match(/^\/api\/desktop-interactions\/([A-Za-z0-9_-]+)$/);
+  if (method === 'POST' && desktopInteractionMatch) {
+    const body = await readJsonObjectBody(request);
+    const result = await desktopInteractions.respond(desktopInteractionMatch[1], body);
+    sendJson(response, 200, result);
+    return;
+  }
   if (await handleCompanionRoute({ request, response, url, service: companionService })) {
     return;
   }
@@ -642,6 +659,17 @@ async function route({ request, response, config, store, outbox, eventBus, logge
     sendJson(response, 200, {
       voice: voiceSupervisor.status()
     });
+    return;
+  }
+
+  if (url.pathname === '/system/guardian') {
+    if (method === 'GET') {
+      sendJson(response, 200, await guardianService.status({ phone: url.searchParams.get('client') === 'phone' }));
+    } else if (method === 'PUT') {
+      sendJson(response, 200, await guardianService.setEnabled(await readJsonObjectBody(request)));
+    } else {
+      sendJson(response, 405, { error: 'Method not allowed' });
+    }
     return;
   }
 
@@ -2997,8 +3025,15 @@ function sendOutboxResponse(response, item, url) {
   }
   const outbox = serializeOutboxItem(item);
   if (item.status === 'submitted' && item.result) {
+    const receiptOnly = !item.result.run || (item.result.deliveryPending === false
+      && String(item.result.run.prompt ?? '') !== item.text);
     sendJson(response, 202, {
       ...serializeDispatchPayload(item.result, url),
+      // A recovered official receipt proves delivery, not a recovered model run.
+      // Keep the phone's run envelope and polling identity without replaying an
+      // obsolete snapshot (including a steered run's earlier prompt) or claiming
+      // that the assistant has finished.
+      ...(receiptOnly ? { run: serializeOutboxRun(item) } : {}),
       outbox
     });
     return;
@@ -3045,7 +3080,9 @@ function serializeOutboxRun(item) {
   const queued = item.status === 'queued'
     || item.status === 'dispatching'
     || (item.status === 'failed' && item.retryable);
-  const status = item.status === 'canceled'
+  const status = item.status === 'submitted'
+    ? 'submitted'
+    : item.status === 'canceled'
     ? 'interrupted'
     : queued
       ? 'queued'
@@ -3055,10 +3092,10 @@ function serializeOutboxRun(item) {
   return {
     id: item.id,
     projectId: item.projectId,
-    prompt: '',
+    prompt: item.text,
     promptPreview: item.text.slice(0, 160),
     promptLength: item.text.length,
-    codexSessionId: item.threadId || null,
+    codexSessionId: item.threadId || (item.status === 'submitted' ? item.result?.threadId : null) || null,
     submissionId: item.submissionId,
     status,
     createdAt: item.createdAt,

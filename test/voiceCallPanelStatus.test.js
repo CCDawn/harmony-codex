@@ -36,8 +36,8 @@ test('voice call empty hint reflects connected, muted, connecting and terminal s
   assert.equal(title('active', '', false), '已接通，可以开始说话');
   assert.notEqual(title('active', '', false), '正在等待接通');
   assert.equal(title('active', '', true), '已接通，麦克风已静音');
-  assert.equal(title('connecting', '正在连接语音通道', false), '正在等待接通');
-  assert.equal(title('ready', 'Codex 正忙，请稍后再试', false), '正在等待接通');
+  assert.equal(title('connecting', '正在连接语音通道', false), '正在连接语音通道');
+  assert.equal(title('ready', '媒体已就绪', false), '开始采集');
   assert.equal(title('error', '麦克风启动失败', false), '通话未能开始');
   assert.equal(title('idle', '通话已结束', false), '通话已结束');
 });

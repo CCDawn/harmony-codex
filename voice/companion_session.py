@@ -19,14 +19,21 @@ from pathlib import Path
 
 try:
     from .voice_server import Session, log
+    from .playback_control import PlaybackControl
 except ImportError:  # voice_server.py may also be run with its directory on sys.path
     from voice_server import Session, log
+    from playback_control import PlaybackControl
 
 
 RPC_HELPER = Path(__file__).resolve().with_name("companion_rpc.mjs")
 RPC_STDOUT_LIMIT = 4 * 1024 * 1024
 RPC_TIMEOUT_S = 35.0
-RPC_STOP_TIMEOUT_S = 5.0
+# start includes identity verification, optional orphan cleanup, and creation;
+# discovery/recovery can use 30s, creation up to 45s including reply delivery.
+# Do not apply a single-request 35s deadline
+# to the complete sequence. The overall deadline remains bounded, with no retry.
+RPC_START_TIMEOUT_S = 110.0
+RPC_STOP_TIMEOUT_S = RPC_TIMEOUT_S
 HELPER_EXIT_TIMEOUT_S = 2.0
 HISTORY_POLL_INTERVAL_S = 2.0
 MAX_HISTORY_ENTRIES = 32
@@ -34,10 +41,19 @@ MAX_TRANSCRIPT_EVENT_BYTES = 256 * 1024
 MAX_TRACKED_TURNS = 512
 
 _OWNED_CALL_ID = re.compile(r"^rtc_[^/?#]+$")
+_ERROR_CODES = {"timeout", "cdp_connection", "http_error", "unknown_error"}
+_ERROR_STAGES = {"discover", "history", "create", "attach", "stop", "reconcile", "unknown"}
 
 
 class CompanionSessionError(RuntimeError):
     """An error with a fixed, log-safe message."""
+
+    def __init__(self, message, *, http_status=None, operation=None, error_code=None, stage=None):
+        super().__init__(message)
+        self.http_status = http_status
+        self.operation = operation
+        self.error_code = error_code if error_code in _ERROR_CODES else None
+        self.stage = stage if stage in _ERROR_STAGES else None
 
 
 class CompanionSession(Session):
@@ -62,6 +78,67 @@ class CompanionSession(Session):
         self._turn_roles = OrderedDict()
         self._turn_initial_sent = set()
         self._completed_turns = set()
+        self.cleanup_pending = True
+        self._media_released = False
+        self.playback_control = PlaybackControl()
+        self._playback_admitted = True
+        self._phone_ready = False
+        self._playback_events = set()
+
+    def should_buffer_output(self):
+        return not self.playback_control_enabled or not self.playback_control.blocked
+
+    def should_send_output(self):
+        return self.should_buffer_output() and self._playback_admitted
+
+    # Automatic interruption is owned by the upstream voice engine. Local VAD
+    # and transcript turn creation are not cancellation acknowledgements: gating
+    # here can discard an entire reply after a noise/echo false positive.
+    # Inherit Session.on_microphone_audio so all input still reaches WebRTC.
+
+    async def on_client_interrupt(self):
+        if not self.playback_control_enabled or not self._phone_ready:
+            await super().on_client_interrupt()
+            return
+        self._block_playback("manual")
+
+    def _block_playback(self, source):
+        revision = self.playback_control.block(user_confirmed=source == "user_turn")
+        self._playback_admitted = False
+        dropped = self.discard_pending_output()
+        log("playback-control", f"state=blocked revision={revision} source={source} dropped={dropped}B")
+        self._queue_playback_event("blocked", revision, source)
+
+    def _queue_playback_event(self, state, revision, source):
+        # Capture identity before cleanup, never send a later call's identity.
+        identity = self._call_identity()
+        task = asyncio.create_task(self._emit_playback_event(state, revision, source, identity))
+        self._playback_events.add(task)
+        task.add_done_callback(self._playback_events.discard)
+
+    async def _emit_playback_event(self, state, revision, source, identity):
+        async with self.output_lock:
+            if self.stopped:
+                return
+            await self.send_json({"type": "playback", "state": state,
+                                  "revision": revision, "source": source, **identity})
+            if state == "blocked":
+                await self.send_json({"type": "speaking", "state": "stop"})
+            elif revision == self.playback_control.revision and not self.playback_control.blocked:
+                # The ordered control event precedes any new PCM on this socket.
+                self._playback_admitted = True
+                self.out_evt.set()
+
+    def _observe_playback_turn(self, turn_id, role):
+        if role == "user":
+            self.playback_control.user_started()
+        else:
+            revision = self.playback_control.assistant_started(turn_id)
+            if revision is not None and self.playback_control_enabled and self._phone_ready:
+                self._playback_admitted = False
+                self.discard_pending_output()
+                log("playback-control", f"state=resumed revision={revision} source=assistant_turn")
+                self._queue_playback_event("resumed", revision, "assistant_turn")
 
     async def _start_helper(self):
         if not self.helper_path.is_file():
@@ -91,6 +168,8 @@ class CompanionSession(Session):
             raise CompanionSessionError("Companion helper unavailable")
 
         async with self._rpc_lock:
+            started = time.monotonic()
+            operation = method if method in {"discover", "history", "start", "attach", "stop"} else "unknown"
             self._next_rpc_id += 1
             request_id = self._next_rpc_id
             request = {"id": request_id, "method": method, "params": params or {}}
@@ -99,7 +178,9 @@ class CompanionSession(Session):
                 await process.stdin.drain()
                 response = await self._read_rpc_response(process, request_id, timeout_s)
             except asyncio.TimeoutError as exc:
-                raise CompanionSessionError("Companion request timed out") from exc
+                log("companion-rpc-error", f"operation={operation} code=timeout stage=rpc elapsedMs={round((time.monotonic()-started)*1000)}")
+                raise CompanionSessionError("Companion request timed out", operation=operation,
+                                            error_code="timeout") from exc
             except asyncio.CancelledError:
                 raise
             except CompanionSessionError:
@@ -110,7 +191,18 @@ class CompanionSession(Session):
             if not isinstance(response, dict) or response.get("id") != request_id:
                 raise CompanionSessionError("Companion response mismatch")
             if response.get("error"):
-                raise CompanionSessionError("Companion request failed")
+                # Only the helper's strict status format may cross this boundary.
+                match = re.fullmatch(r"Companion HTTP ([1-5][0-9]{2})", str(response["error"]))
+                status = int(match.group(1)) if match else None
+                code = response.get("errorCode")
+                code = code if isinstance(code, str) and code in _ERROR_CODES else ("http_error" if status else "unknown_error")
+                stage = response.get("stage")
+                stage = stage if isinstance(stage, str) and stage in _ERROR_STAGES else "unknown"
+                if response.get("operation") == "reconcile":
+                    operation = "reconcile"
+                log("companion-rpc-error", f"operation={operation} code={code} stage={stage} http={status or 0} elapsedMs={round((time.monotonic()-started)*1000)}")
+                raise CompanionSessionError("Companion request failed", http_status=status, operation=operation,
+                                            error_code=code, stage=stage)
             result = response.get("result")
             if not isinstance(result, dict):
                 raise CompanionSessionError("Companion response invalid")
@@ -119,8 +211,10 @@ class CompanionSession(Session):
     @staticmethod
     async def _read_rpc_response(process, request_id, timeout_s):
         """Read our response, discarding an older reply left by a cancelled RPC."""
+        deadline = asyncio.get_running_loop().time() + timeout_s
         for _ in range(8):
-            line = await asyncio.wait_for(process.stdout.readline(), timeout=timeout_s)
+            remaining = deadline - asyncio.get_running_loop().time()
+            line = await asyncio.wait_for(process.stdout.readline(), timeout=max(0, remaining))
             if not line:
                 raise CompanionSessionError("Companion helper closed")
             try:
@@ -152,7 +246,20 @@ class CompanionSession(Session):
 
     async def exchange_offer(self, app, local_sdp):
         """Create a Companion call using this session's generated WebRTC offer."""
-        result = await self._rpc("start", {"sdp": local_sdp})
+        # Cancellation must not discard a late allocation receipt. Drain the
+        # bounded create RPC, retain ownership, then let cleanup stop that call.
+        pending = asyncio.create_task(self._allocate_call(local_sdp))
+        try:
+            return await asyncio.shield(pending)
+        except asyncio.CancelledError:
+            try:
+                await pending
+            except Exception:
+                log("companion-cancel-create-unresolved")
+            raise
+
+    async def _allocate_call(self, local_sdp):
+        result = await self._rpc("start", {"sdp": local_sdp}, timeout_s=RPC_START_TIMEOUT_S)
         call_id = result.get("callId")
         if isinstance(call_id, str) and _OWNED_CALL_ID.fullmatch(call_id):
             self.call_id = call_id
@@ -186,6 +293,7 @@ class CompanionSession(Session):
         event_type = event.get("type")
         if not isinstance(event_type, str):
             return
+        self.media_diagnostics.control(event)
         if event_type in self._ERROR_EVENTS:
             self.rt_errors.append("Companion realtime error")
             if self.rt_started.is_set():
@@ -208,6 +316,7 @@ class CompanionSession(Session):
             if turn_id in self._turn_initial_sent:
                 return
             self._turn_initial_sent.add(turn_id)
+            self._observe_playback_turn(turn_id, role)
             self._log_turn_event(event_type, role, transcript, False)
             if transcript:
                 self._send_turn_transcript(turn_id, role, transcript, False)
@@ -241,6 +350,8 @@ class CompanionSession(Session):
             if not self._remember_turn(turn_id, role):
                 return
             self._completed_turns.add(turn_id)
+            if role == "user":
+                self.playback_control.user_done()
             self._log_turn_event(event_type, role, transcript, True)
             self._send_turn_transcript(turn_id, role, transcript, True)
 
@@ -272,7 +383,16 @@ class CompanionSession(Session):
             "role": role,
             "text": text,
             "final": final,
+            **self._call_identity(),
         }))
+
+    def _call_identity(self):
+        # Keep the official identity on each event; a delayed callback must not
+        # become a message in whatever assistant the phone selected later.
+        return {key: value for key, value in (
+            ("profileId", self.profile_id), ("roomId", self.room_id),
+            ("callId", self.call_id),
+        ) if isinstance(value, str) and value}
 
     @staticmethod
     def _clean_history(entries):
@@ -328,35 +448,84 @@ class CompanionSession(Session):
             pass
 
     async def run(self):
-        try:
+        failure_stage = "assistant"
+        startup = receiver = None
+
+        async def prepare():
+            nonlocal failure_stage
             await self._start_helper()
             await self._discover_profile()
             await self.setup_webrtc(None)
+            failure_stage = "media"
+            await self.send_json({"type": "progress", "stage": "media"})
             await self.wait_media_connected()
+
+        try:
+            await self.send_json({"type": "progress", "stage": "assistant"})
+            # A single reader observes stop/disconnect even during discovery,
+            # SDP gathering and call creation. It remains the reader when ready.
+            receiver = asyncio.create_task(self.recv_loop())
+            startup = asyncio.create_task(prepare())
+            await asyncio.wait((receiver, startup), return_when=asyncio.FIRST_COMPLETED)
+            if receiver.done():
+                await receiver
+                return
+            await startup
+            if self.close_sent or self.stopped:
+                return
             self.last_client_audio = time.monotonic()
             log("companion-session-ready")
             await self.send_json({
                 "type": "ready",
+                **({"playbackControlVersion": 1,
+                    "bargeInAvailable": False}
+                   if self.playback_control_enabled else {}),
                 "profileName": self.profile_name,
                 "roomId": self.room_id,
+                **self._call_identity(),
             })
+            self._phone_ready = True
+            log("playback-ready", f"version={1 if self.playback_control_enabled else 0} automatic=upstream")
             self._tasks = [
                 asyncio.create_task(self.outbound_pump()),
                 asyncio.create_task(self.speaker_watch()),
                 asyncio.create_task(self.idle_watch()),
                 asyncio.create_task(self._history_poller()),
             ]
-            await self.recv_loop()
+            await receiver
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             # This path deliberately hides exception text, which may contain private data.
             log("companion-session-error", type(exc).__name__)
             if not self.close_sent:
-                await self.send_json({"type": "error", "message": "个人助手语音连接失败"})
+                message = ("个人助手准备失败" if failure_stage == "assistant"
+                           else "语音媒体连接失败")
+                await self.send_json({
+                    "type": "error",
+                    "failureStage": failure_stage,
+                    "message": message,
+                    **({"httpStatus": exc.http_status} if isinstance(exc, CompanionSessionError)
+                       and exc.http_status is not None else {}),
+                    **({"errorCode": exc.error_code} if isinstance(exc, CompanionSessionError)
+                       and exc.error_code is not None else {}),
+                    **({"operation": exc.operation} if isinstance(exc, CompanionSessionError)
+                       and exc.operation in {"discover", "history", "start", "attach", "stop", "reconcile"} else {}),
+                    **({"stage": exc.stage} if isinstance(exc, CompanionSessionError)
+                       and exc.stage is not None else {}),
+                })
             await self.emit_closed("error")
         finally:
+            self.stopped = True
+            for task in (receiver, startup):
+                if task is not None and not task.done():
+                    task.cancel()
+            # Close local media before waiting for a late create receipt.
+            await self._release_media()
+            await asyncio.gather(*(t for t in (receiver, startup) if t is not None),
+                                 return_exceptions=True)
             await self.cleanup()
+            self.cleanup_pending = False
             log("companion-session-end", f"in={self.audio_bytes_in} out={self.audio_bytes_out}")
 
     async def _stop_owned_call(self):
@@ -365,8 +534,8 @@ class CompanionSession(Session):
         try:
             await self._rpc("stop", {}, timeout_s=RPC_STOP_TIMEOUT_S)
         except Exception:
-            log("companion-stop-failed")
-        finally:
+            log("companion-stop-pending")
+        else:
             self._owns_call = False
             self.call_id = None
 
@@ -381,7 +550,10 @@ class CompanionSession(Session):
             await asyncio.wait_for(process.wait(), timeout=HELPER_EXIT_TIMEOUT_S)
         except asyncio.TimeoutError:
             log("companion-helper-terminate")
-            process.kill()
+            try:
+                process.kill()
+            except ProcessLookupError:
+                return
             try:
                 await asyncio.wait_for(process.wait(), timeout=HELPER_EXIT_TIMEOUT_S)
             except Exception:
@@ -389,20 +561,37 @@ class CompanionSession(Session):
         except Exception:
             log("companion-helper-stop-failed")
 
+    async def _release_media(self):
+        if self._media_released:
+            return
+        self._media_released = True
+        self.local_media_release = True
+        self.log_media_state()
+        if self.track:
+            try:
+                self.track.halt_stream()
+            except Exception:
+                log("companion-track-release-failed")
+        if self.pc:
+            try:
+                await self.pc.close()
+            except Exception:
+                pass
+
     async def cleanup(self):
         self.stopped = True
+        pending_controls = list(self._playback_events)
+        for task in pending_controls:
+            task.cancel()
+        if pending_controls:
+            await asyncio.gather(*pending_controls, return_exceptions=True)
+        self._playback_events.clear()
         tasks = list(self._tasks)
         self._tasks = []
         for task in tasks:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        await self._release_media()
         await self._stop_owned_call()
-        if self.track:
-            self.track.halt_stream()
-        if self.pc:
-            try:
-                await self.pc.close()
-            except Exception:
-                pass
         await self._stop_helper()

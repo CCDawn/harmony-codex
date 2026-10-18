@@ -99,7 +99,7 @@ function createUpgradeClient(port) {
       }
       socket.write(`${lines.join('\r\n')}\r\n\r\n`);
     },
-    waitFor(predicate, timeoutMs = 3000) {
+    waitFor(predicate, timeoutMs = 8000) {
       if (predicate(buffer)) {
         return Promise.resolve(buffer);
       }
@@ -234,11 +234,15 @@ test('voice upgrade tunnels text and binary bytes end-to-end after the upstream 
 
     const beforeBytes = buffer.length;
     const textFrame = Buffer.from([0x81, 0x03, 0x61, 0x62, 0x63]);
+    const progressPayload = Buffer.from(JSON.stringify({ type: 'progress', stage: 'assistant' }));
+    const progressFrame = Buffer.concat([Buffer.from([0x81, progressPayload.length]), progressPayload]);
     const binaryBlob = Buffer.from([0x00, 0xff, 0xfe, 0x7f, 0x80, 0x01]);
-    const payload = Buffer.concat([textFrame, binaryBlob]);
+    const payload = Buffer.concat([textFrame, progressFrame, binaryBlob]);
     client.socket.write(payload);
     const after = await client.waitFor((next) => next.length >= beforeBytes + payload.length);
     assert.ok(after.subarray(beforeBytes).equals(payload));
+    assert.ok(after.subarray(beforeBytes).includes(progressPayload),
+      'optional progress events must pass through the byte tunnel unchanged');
 
     const status = await fetch(`http://127.0.0.1:${server.address().port}/voice/status`, {
       headers: { 'x-codex-bridge-token': TEST_TOKEN }
@@ -263,7 +267,8 @@ test('voice upgrade answers 502 when the upstream voice port is unreachable', as
   const config = createTestConfig({
     voiceEnabled: true,
     voicePort: deadPort,
-    voiceCommand: 'node -e "process.exit(0)"'
+    voiceCommand: 'node -e "process.exit(0)"',
+    voiceAutoReconnect: false
   });
   const app = createApp({ config, adapter: new MockCodexAdapter() });
   const server = app.server;

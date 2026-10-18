@@ -1,3 +1,6 @@
+import path from 'node:path';
+import { extractLocalImageInputs } from './codexTurnInput.js';
+
 const SESSION_TIMESTAMP_SKEW_MS = 5_000;
 
 export function createOutboxReceiptReconciler({ threadService = null, sessions = null, store = null } = {}) {
@@ -6,7 +9,8 @@ export function createOutboxReceiptReconciler({ threadService = null, sessions =
     // a receipt for this submission. Confirm the exact input in official history.
     if (item.result?.deliveryPending === true) {
       const task = store?.getTask?.(item.resultId);
-      const threadId = item.threadId || task?.codexSessionId || task?.createdCodexSessionId;
+      const receiptTask = task ?? persistedReceiptTask(item);
+      const threadId = item.threadId || receiptTask?.codexSessionId || receiptTask?.createdCodexSessionId;
       const detail = threadId && sessions?.getSession
         ? await sessions.getSession(threadId, { tail: 200 }).catch(() => null)
         : null;
@@ -14,10 +18,16 @@ export function createOutboxReceiptReconciler({ threadService = null, sessions =
       const found = detail?.entries?.find(entry => isUserEntry(entry)
         && String(entry.text ?? '').trim() === String(item.text ?? '').trim()
         && Date.parse(entry.timestamp) >= attemptAt);
-      if (found) {
+      const canonicalImageReceipt = !found && await findCanonicalImageReceipt({ item, task: receiptTask, threadId, attemptAt, sessions });
+      if (found || canonicalImageReceipt) {
         return {
           status: 'submitted', evidence: 'session_user_message',
-          result: { ...(task ? { run: task } : item.result), deliveryPending: false }
+          // A persisted run is evidence only; its old running state is not a
+          // recovered task. Without a live task, return an official receipt.
+          result: {
+            ...(task ? { run: task } : sessionReceiptResult(item, threadId, found || canonicalImageReceipt)),
+            deliveryPending: false
+          }
         };
       }
       const expired = Number.isFinite(attemptAt) && Date.now() - attemptAt > 90_000;
@@ -72,6 +82,69 @@ export function createOutboxReceiptReconciler({ threadService = null, sessions =
       }
     };
   };
+}
+
+function persistedReceiptTask(item) {
+  const task = item.result?.run;
+  const threadId = task?.codexSessionId || task?.createdCodexSessionId;
+  if (!item.resultId || task?.id !== item.resultId || !threadId
+    || (item.kind === 'existing_thread' && threadId !== item.threadId)) return null;
+  return task;
+}
+
+function sessionReceiptResult(item, threadId, entry) {
+  const observedAt = String(entry.timestamp ?? '');
+  return {
+    id: `session-receipt:${threadId}:${observedAt}`,
+    threadId,
+    submissionId: item.submissionId,
+    observedAt
+  };
+}
+
+async function findCanonicalImageReceipt({ item, task, threadId, attemptAt, sessions }) {
+  const images = extractLocalImageInputs(item.text);
+  if (images.length === 0 || !Number.isFinite(attemptAt)
+    || task?.id !== item.resultId || typeof sessions?.readSessionRecordsAfterCursor !== 'function') {
+    return false;
+  }
+  // Display entries append image markdown and sanitize text. Read the original
+  // official input only from this task's captured, thread-scoped rollout cursor.
+  const cursor = [...(Array.isArray(task.events) ? task.events : [])].reverse().find(event => (
+    event.type === 'codex.session_file.cursor_captured'
+    && (!event.taskId || event.taskId === task.id)
+    && event.payload?.sessionId === threadId
+    && event.payload.filePath
+    && Number.isSafeInteger(event.payload.offset)
+    && event.payload.offset >= 0
+  ))?.payload;
+  if (!cursor) return false;
+  const records = await sessions.readSessionRecordsAfterCursor(cursor).catch(() => []);
+  return Array.isArray(records) && records.find(record => {
+    const message = record?.payload;
+    if (record?.type !== 'response_item' || message?.type !== 'message' || message.role !== 'user'
+      || !(Date.parse(record.timestamp) >= attemptAt) || !Array.isArray(message.content)) return false;
+    const content = message.content;
+    if (content.length !== 1 + images.length * 3 || content[0]?.type !== 'input_text'
+      || String(content[0].text ?? '').trim() !== String(item.text ?? '').trim()) return false;
+    return images.every((image, index) => {
+      const [opening, pixels, closing] = content.slice(1 + index * 3, 4 + index * 3);
+      const wrapper = opening?.type === 'input_text'
+        ? String(opening.text ?? '').match(/^<image name=\[Image #(\d+)\] path=(.+)>$/) : null;
+      if (!wrapper || Number(wrapper[1]) !== index + 1 || pixels?.type !== 'input_image'
+        || closing?.type !== 'input_text' || String(closing.text ?? '').trim() !== '</image>') return false;
+      let imagePath = wrapper[2];
+      if (imagePath.startsWith('"')) {
+        try { imagePath = JSON.parse(imagePath); } catch { return false; }
+      }
+      return typeof imagePath === 'string' && sameImagePath(imagePath, image.path);
+    });
+  });
+}
+
+function sameImagePath(left, right) {
+  const normalize = value => path.win32.normalize(value).toLowerCase();
+  return normalize(left) === normalize(right);
 }
 
 function isUserEntry(entry) {

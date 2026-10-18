@@ -109,20 +109,29 @@ function Get-CodexDesktopShellProcesses {
   })
 }
 
+function Invoke-DesktopRecoveryScript {
+  param([string]$ScriptPath,[string[]]$Arguments,[string]$LogName)
+  $logRoot=Join-Path ([string]$repoRoot) 'logs\startup'
+  New-Item -ItemType Directory -Force -Path $logRoot | Out-Null
+  # Native pipeline invocation waits for inherited stdout pipes from the
+  # long-lived live-host, even after its launcher exits. Wait for the process
+  # itself, with no inherited pipes, so the management mutex is released.
+  $child=Start-MobileLinkDetached -HostPath $powerShellHostPath -ScriptPath $ScriptPath -Arguments $Arguments -LogPath (Join-Path $logRoot $LogName) -WorkingDirectory ([string]$repoRoot)
+  try {
+    if (-not $child.WaitForExit(120000)) { return -1 }
+    return $child.ExitCode
+  } finally { $child.Dispose() }
+}
+
 function Invoke-SoftRecovery {
   Write-WatchLog '桌面 CDP 仍在，尝试只恢复 live-host（不会停止 Codex）'
   $script = Join-Path ([string]$repoRoot) 'scripts\recover-codex-desktop-live-soft.ps1'
-  $arguments = @(
-    '-NoProfile',
-    '-ExecutionPolicy', 'Bypass',
-    '-File', $script,
-    '-BridgeUrl', $bridgeUrl
-  )
+  $arguments = @('-BridgeUrl', $bridgeUrl)
   if (-not [string]::IsNullOrWhiteSpace($SessionId)) {
     $arguments += @('-SessionId', $SessionId)
   }
-  & $powerShellHostPath @arguments
-  return $LASTEXITCODE -eq 0
+  $code=Invoke-DesktopRecoveryScript -ScriptPath $script -Arguments $arguments -LogName 'desktop-soft-recovery.log'
+  return $code -eq 0
 }
 
 function Test-DesktopSupervisorArmed {
@@ -132,7 +141,16 @@ function Test-DesktopSupervisorArmed {
   }
   try {
     $arm = Get-Content -Raw -LiteralPath $armPath | ConvertFrom-Json
-    $heartbeat = [datetimeoffset]::Parse([string]$arm.heartbeatAt).UtcDateTime
+    # PowerShell 7 can deserialize ISO dates to DateTime. Stringifying that
+    # value drops its UTC offset and makes a fresh heartbeat appear stale.
+    $value = $arm.heartbeatAt
+    $heartbeat = if ($value -is [datetime]) {
+      $value.ToUniversalTime()
+    } elseif ($value -is [datetimeoffset]) {
+      $value.UtcDateTime
+    } else {
+      [datetimeoffset]::Parse([string]$value).UtcDateTime
+    }
     $ageSeconds = ([datetime]::UtcNow - $heartbeat).TotalSeconds
     if ($ageSeconds -gt 20 -or $ageSeconds -lt -5) {
       return $false
@@ -147,18 +165,12 @@ function Test-DesktopSupervisorArmed {
 function Invoke-StartRemoteDesktop {
   Write-WatchLog '未检测到 Codex 桌面进程，启动带 CDP 的受控远程模式'
   $script = Join-Path ([string]$repoRoot) 'scripts\restart-codex-desktop-live.ps1'
-  $arguments = @(
-    '-NoProfile',
-    '-ExecutionPolicy', 'Bypass',
-    '-File', $script,
-    '-BridgeUrl', $bridgeUrl,
-    '-RefusePlainCodex'
-  )
+  $arguments = @('-BridgeUrl', $bridgeUrl, '-RefusePlainCodex')
   if (-not [string]::IsNullOrWhiteSpace($SessionId)) {
     $arguments += @('-SessionId', $SessionId)
   }
-  & $powerShellHostPath @arguments
-  return $LASTEXITCODE -eq 0 -or $LASTEXITCODE -eq 10
+  $code=Invoke-DesktopRecoveryScript -ScriptPath $script -Arguments $arguments -LogName 'desktop-relaunch.log'
+  return $code -eq 0 -or $code -eq 10
 }
 
 Write-WatchLog "desktop live watchdog started: bridge=$bridgeUrl; interval=${IntervalSeconds}s"
@@ -190,7 +202,7 @@ while ($true) {
         } else {
           Write-WatchLog '未检测到 Codex，桌面应用未开，不自动拉起'
         }
-      } elseif ($status.CdpPort -gt 0 -or $status.ProcessMode -eq 'remote_debug') {
+      } elseif ($status.ProcessMode -ne 'plain' -and ($status.CdpPort -gt 0 -or $status.ProcessMode -eq 'remote_debug')) {
         $recovered = Invoke-SoftRecovery
       } else {
         Write-WatchLog '检测到普通 Codex 正在运行且没有 CDP；为保护当前桌面工作，不自动关闭它。请用一键启动入口恢复远程模式。'

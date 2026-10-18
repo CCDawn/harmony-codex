@@ -169,7 +169,16 @@ if ($sessions.ok) {
 
 $desktopLive = Invoke-HttpJson -Uri "$BridgeUrl/desktop/live/status" -Headers $headers
 if ($desktopLive.ok) {
-  Add-Check -Id 'cdp' -Status 'ok' -Message 'desktop live status reachable through bridge' -Details $desktopLive.value
+  $desktopReady = $false
+  if ($desktopLive.value -and $desktopLive.value.PSObject.Properties['desktop']) {
+    $desktop = $desktopLive.value.desktop
+    $desktopReady = $null -ne $desktop -and $null -ne $desktop.PSObject.Properties['desktopLive'] -and $desktop.desktopLive -eq $true
+  }
+  if ($desktopReady) {
+    Add-Check -Id 'cdp' -Status 'ok' -Message 'desktop live channel ready through bridge' -Details $desktopLive.value
+  } else {
+    Add-Check -Id 'cdp' -Status 'warn' -Message 'desktop status API reachable, but desktop live channel is not ready' -Details $desktopLive.value
+  }
 } else {
   $directCdp = Invoke-HttpJson -Uri 'http://127.0.0.1:9229/json/version'
   if ($directCdp.ok) {
@@ -199,7 +208,7 @@ if ($relayConfig.ContainsKey('__error')) {
   Add-Check -Id 'relay-config' -Status 'ok' -Message "relay config present for $($relayConfig.RelayHost):$($relayConfig.RelayPort)"
 }
 
-$failedRequired = @($checks | Where-Object { $_.id -in @('node', 'package') -and $_.status -eq 'fail' })
+$failedRequired = @($checks | Where-Object { $_.id -in @('node', 'package', 'bridge', 'sessions') -and $_.status -ne 'ok' })
 $summary = [pscustomobject]@{
   ok = $failedRequired.Count -eq 0
   generatedAt = (Get-Date).ToString('o')

@@ -12,7 +12,18 @@ param(
   [switch]$SkipHdcRelay,
   [switch]$SkipCodexDesktop,
   [switch]$KeepExistingCodex,
-  [switch]$ForceRestart
+  [switch]$ForceRestart,
+  [string]$LinkControlVersion = '',
+  [string]$GuardianConfigVersion = '',
+  [switch]$GuardianRepair,
+  # 并行启动：All=主流程（默认，重活全部转后台轨道）；CodexDesktop=桌面子轨道；
+  # Background=后台服务轨道（watchdog/语音/HDC/会话尾探，由主流程 fork，不 join）。
+  [ValidateSet('All', 'CodexDesktop', 'Background')]
+  [string]$Phase = 'All',
+  # 桌面子轨道把状态/退出码写回该 JSON，供主流程 join 合并。
+  [string]$TrackResultFile = '',
+  # 一键回退旧的纯串行执行路径（也可设环境变量 CODEX_MOBILE_STACK_SERIAL=1）。
+  [switch]$Serial
 )
 
 Set-StrictMode -Version Latest
@@ -28,7 +39,44 @@ if ($RuntimeMode -notin @('desktop', 'desktop-primary', 'app-server-shadow', 'ap
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 . (Join-Path $repoRoot 'tools\windows\mobile-link-lifecycle.ps1')
-if (Test-MobileLinkPaused $repoRoot) { throw '链路已在管理应用中停止，请使用启动链路恢复。' }
+# 兜底诊断：terminating error 在 `& script *> log` 包装下不会进重定向（实验证实），
+# 导致 exit 1 时看不到任何错误文本。任何未捕获 terminating error 都先把完整错误记录
+# （含位置信息）追加写入固定文件 logs\startup\stack-fatal.log，再以 exit 1 退出；
+# 并把错误首行写 stdout（*> 可捕获），使 manager-start.log 同样可见。
+trap {
+  try {
+    $fatalDir = if (Get-Variable logRoot -ErrorAction SilentlyContinue) { $logRoot } else { Join-Path (Split-Path -Parent $PSScriptRoot) 'logs\startup' }
+    New-Item -ItemType Directory -Force -Path $fatalDir -ErrorAction SilentlyContinue | Out-Null
+    $detail = "=== $(Get-Date -Format 'yyyy-MM-ddTHH:mm:ss.fff') PID=$PID phase=$Phase ===`r`n" +
+      ($_ | Out-String) + "`r`n" +
+      [string]$_.InvocationInfo.PositionMessage + "`r`n" +
+      [string]$_.ScriptStackTrace + "`r`n"
+    Add-Content -LiteralPath (Join-Path $fatalDir 'stack-fatal.log') -Value $detail -Encoding utf8
+  } catch { }
+  Write-Host ("一键启动遇到未处理错误: " + $_.Exception.Message) -ForegroundColor Red
+  exit 1
+}
+trap [OperationCanceledException] {
+  Write-Host $_.Exception.Message -ForegroundColor Yellow
+  try {
+    $fatalDir = if (Get-Variable logRoot -ErrorAction SilentlyContinue) { $logRoot } else { Join-Path (Split-Path -Parent $PSScriptRoot) 'logs\startup' }
+    New-Item -ItemType Directory -Force -Path $fatalDir -ErrorAction SilentlyContinue | Out-Null
+    $detail = "=== $(Get-Date -Format 'yyyy-MM-ddTHH:mm:ss.fff') PID=$PID phase=$Phase kind=canceled ===`r`n" +
+      ($_ | Out-String) + "`r`n" +
+      [string]$_.ScriptStackTrace + "`r`n"
+    Add-Content -LiteralPath (Join-Path $fatalDir 'stack-fatal.log') -Value $detail -Encoding utf8
+  } catch { }
+  # 桌面子轨道模式下，取消也必须把结果写回主流程（Write-DesktopTrackResult 在函数区定义，
+  # 顶部 Assert 抛出时可能尚未定义，因此先探测再调用）。
+  if (Get-Command Write-DesktopTrackResult -ErrorAction SilentlyContinue) {
+    Write-DesktopTrackResult -ExitCode 12 -ErrorText ([string]$_.Exception.Message)
+  }
+  exit 12
+}
+function Assert-LinkBootstrapAllowed {
+  Assert-MobileLinkLaunchIntent -Repo $repoRoot -LinkControlVersion $LinkControlVersion -GuardianConfigVersion $GuardianConfigVersion -GuardianRepair:$GuardianRepair
+}
+Assert-LinkBootstrapAllowed
 if ([string]::IsNullOrWhiteSpace($BridgeUrl)) {
   $BridgeUrl = "http://127.0.0.1:$BridgePort"
 }
@@ -76,6 +124,11 @@ function Resolve-CompatiblePowerShellHost {
 $script:PowerShellHostPath = Resolve-CompatiblePowerShellHost
 $script:StartupStatus = [ordered]@{}
 $script:CodexFrontendRepairRestarted = $false
+# -Serial 或环境变量 CODEX_MOBILE_STACK_SERIAL=1 时完全回退旧的纯串行执行路径。
+$script:UseSerialStartup = [bool]$Serial -or ("$env:CODEX_MOBILE_STACK_SERIAL" -eq '1')
+$script:StackStartedAt = Get-Date
+# 桌面实时通道最近一次在线探测结果（桌面子轨道用它回填 DesktopScript 状态）。
+$script:LastDesktopLiveOnline = $false
 
 function Set-StartupStatus {
   param(
@@ -98,6 +151,13 @@ function Get-StartupStatus {
     State = 'unknown'
     Message = '未检查'
   }
+}
+
+function Get-StartupStatusState {
+  param([string]$Name)
+  # StrictMode 安全的状态读取：即使返回对象缺少 State 属性也按 'unknown' 处理。
+  $status = Get-StartupStatus -Name $Name
+  return [string](Get-ObjectValue -Object $status -Name 'State' -Fallback 'unknown')
 }
 
 function Write-StartupStatusLine {
@@ -149,15 +209,20 @@ function Write-FinalStartupSummary {
     default { @('LocalBridge', 'CodexDesktop', 'DesktopScript', 'SessionApi') }
   }
   $hardFailed = $false
+  $hardDeferred = $false
   foreach ($name in $hardNames) {
     $state = [string](Get-StartupStatus -Name $name).State
-    if ($state -eq 'failed' -or $state -eq 'degraded' -or $state -eq 'unknown') {
+    if ($state -eq 'failed' -or $state -eq 'degraded') {
       $hardFailed = $true
+    } elseif ($state -eq 'unknown') {
+      # 关键路径极简后，桌面/会话等状态由后台轨道确认中：不算失败，但退出码仍为 2
+      # （控制脚本对 0/2 同样接受并继续其桌面恢复与状态收集）。
+      $hardDeferred = $true
     }
   }
   $hdcState = [string](Get-StartupStatus -Name 'HdcTarget').State
   $voiceFailed = [string](Get-StartupStatus -Name 'VoiceTunnel').State -eq 'failed'
-  $script:StartupExitCode = if ($hardFailed -or $voiceFailed) { 2 } else { 0 }
+  $script:StartupExitCode = if ($hardFailed -or $hardDeferred -or $voiceFailed) { 2 } else { 0 }
   if ($hardFailed) {
     $unavailableMessage = if ($RuntimeMode -eq 'app-server-primary') {
       '整体状态：不可用，需要先修复 bridge / App Server 主链路。'
@@ -169,6 +234,8 @@ function Write-FinalStartupSummary {
     Write-Host "    $unavailableMessage" -ForegroundColor Red
   } elseif ($voiceFailed) {
     Write-Host '    整体状态：会话通道就绪，语音隧道任务异常，请查看统一状态。' -ForegroundColor Yellow
+  } elseif ($hardDeferred) {
+    Write-Host '    整体状态：关键链路已就绪；桌面/会话等状态已转后台轨道确认中，请稍后查看统一状态或日志。' -ForegroundColor Yellow
   } elseif ($hdcState -eq 'ok' -or $hdcState -eq 'skipped') {
     $readyMessage = if ($RuntimeMode -eq 'app-server-primary') {
       '整体状态：正常。App Server 主链路可用；桌面 CDP 仅作为回退能力。'
@@ -324,6 +391,7 @@ function Stop-ProcessTree {
     Stop-ProcessTree -ProcessId ([int]$child.ProcessId) -AllProcesses $AllProcesses
   }
   if ($ProcessId -ne $PID) {
+    Assert-LinkBootstrapAllowed
     Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue
   }
 }
@@ -331,11 +399,16 @@ function Stop-ProcessTree {
 function Get-MatchingProcesses {
   param(
     [string]$Pattern,
-    [switch]$RequireRepoPath
+    [switch]$RequireRepoPath,
+    # 调用方已持有 Win32_Process 快照时可传入复用，避免一次运行内重复全量枚举。
+    [object[]]$AllProcesses = @()
   )
 
+  if ($AllProcesses.Count -eq 0) {
+    $AllProcesses = @(Get-CimInstance Win32_Process)
+  }
   $escapedRepo = [Regex]::Escape($repoRoot)
-  return @(Get-CimInstance Win32_Process | Where-Object {
+  return @($AllProcesses | Where-Object {
     $commandLine = [string]$_.CommandLine
     if ($_.ProcessId -eq $PID -or [string]::IsNullOrWhiteSpace($commandLine)) {
       $false
@@ -360,7 +433,7 @@ function Stop-MatchingProcessTree {
   )
 
   $allProcesses = @(Get-CimInstance Win32_Process)
-  $targets = @(Get-MatchingProcesses -Pattern $Pattern -RequireRepoPath:$RequireRepoPath)
+  $targets = @(Get-MatchingProcesses -Pattern $Pattern -RequireRepoPath:$RequireRepoPath -AllProcesses $allProcesses)
   foreach ($target in $targets) {
     Write-Info "停止旧进程树 PID=$($target.ProcessId): $Pattern"
     Stop-ProcessTree -ProcessId ([int]$target.ProcessId) -AllProcesses $allProcesses
@@ -369,6 +442,13 @@ function Stop-MatchingProcessTree {
 
 function Stop-StaleLauncherWindows {
   Write-Step "整理一键启动窗口"
+  # 关键路径条件化：桥端口空闲说明当前没有旧实例占着链路（残留引导窗口自身也会随
+  # Wait-BridgeHealth 超时退出），跳过整套 WMI 全量扫描；端口被占或 -Serial 时才跑
+  # 原完整清理（保持原语义：有旧窗口/旧进程时仍要清理）。
+  if (-not $script:UseSerialStartup -and -not (Test-LocalPortListening -HostAddress '127.0.0.1' -Port $BridgePort)) {
+    Write-Info "桥端口 $BridgePort 空闲，跳过旧启动窗口扫描"
+    return
+  }
   $allProcesses = @(Get-CimInstance Win32_Process)
   $protectedProcessIds = [System.Collections.Generic.HashSet[int]]::new()
   $currentId = [int]$PID
@@ -380,7 +460,7 @@ function Stop-StaleLauncherWindows {
     $currentId = [int]$current.ParentProcessId
   }
 
-  $launchers = @(Get-MatchingProcesses -Pattern 'start-codex-mobile-stack\.ps1' -RequireRepoPath | Where-Object {
+  $launchers = @(Get-MatchingProcesses -Pattern 'start-codex-mobile-stack\.ps1' -RequireRepoPath -AllProcesses $allProcesses | Where-Object {
     -not $protectedProcessIds.Contains([int]$_.ProcessId)
   })
   if ($launchers.Count -eq 0) {
@@ -389,6 +469,7 @@ function Stop-StaleLauncherWindows {
   }
   foreach ($launcher in $launchers) {
     Write-Info "关闭旧的一键启动窗口 PID=$($launcher.ProcessId)"
+    Assert-LinkBootstrapAllowed
     Stop-Process -Id ([int]$launcher.ProcessId) -Force -ErrorAction SilentlyContinue
   }
 }
@@ -503,7 +584,10 @@ function Get-LocalBridgeHealth {
 }
 
 function Wait-BridgeHealth {
-  param([int]$TimeoutSeconds = 25)
+  param(
+    [int]$TimeoutSeconds = 25,
+    [int]$IntervalMilliseconds = 700
+  )
 
   $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
   $lastError = ''
@@ -513,9 +597,67 @@ function Wait-BridgeHealth {
       return $probe.Value
     }
     $lastError = $probe.Error
-    Start-Sleep -Milliseconds 700
+    Start-Sleep -Milliseconds $IntervalMilliseconds
   }
   throw "Bridge 健康检查失败: $BridgeUrl/health; $lastError"
+}
+
+# 以下三个条件等待把「停止旧进程后的固定 sleep」改成「等到可检查条件满足或超时」；
+# -Serial 模式下不做条件等待，直接复现旧的固定 sleep。
+function Wait-PortFreeOrFixedSleep {
+  param(
+    [string]$HostAddress,
+    [int]$Port,
+    [int]$LegacyMilliseconds,
+    [int]$TimeoutSeconds = 3
+  )
+
+  if ($script:UseSerialStartup) {
+    Start-Sleep -Milliseconds $LegacyMilliseconds
+    return
+  }
+  $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+  while ((Get-Date) -lt $deadline -and (Test-LocalPortListening -HostAddress $HostAddress -Port $Port)) {
+    Start-Sleep -Milliseconds 100
+  }
+}
+
+function Wait-MatchingProcessGoneOrFixedSleep {
+  param(
+    [string]$Pattern,
+    [int]$LegacyMilliseconds,
+    [int]$TimeoutSeconds = 3
+  )
+
+  if ($script:UseSerialStartup) {
+    Start-Sleep -Milliseconds $LegacyMilliseconds
+    return
+  }
+  $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+  while ((Get-Date) -lt $deadline -and @(Get-MatchingProcesses -Pattern $Pattern -RequireRepoPath).Count -gt 0) {
+    Start-Sleep -Milliseconds 200
+  }
+}
+
+function Wait-RelayStateOrFixedSleep {
+  param(
+    [hashtable]$Config,
+    [int]$LegacySeconds,
+    [int]$TimeoutSeconds = 3
+  )
+
+  if ($script:UseSerialStartup) {
+    Start-Sleep -Seconds $LegacySeconds
+    return
+  }
+  $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+  while ((Get-Date) -lt $deadline) {
+    $probe = Get-RelayStateSafe -Config $Config
+    if ($probe.Ok) {
+      return
+    }
+    Start-Sleep -Milliseconds 400
+  }
 }
 
 function Set-AppServerRuntimeStartupStatus {
@@ -540,25 +682,28 @@ function Set-AppServerRuntimeStartupStatus {
 function Start-LocalBridgeProcess {
   $stdout = Join-Path $logRoot 'bridge.stdout.log'
   $stderr = Join-Path $logRoot 'bridge.stderr.log'
-  $command = @"
-`$env:CODEX_BRIDGE_HOST='0.0.0.0'
-`$env:CODEX_BRIDGE_PORT='$BridgePort'
-`$env:CODEX_BRIDGE_WORKSPACE='$repoRoot'
-`$env:CODEX_BRIDGE_TOKEN='$BridgeToken'
-`$env:CODEX_BRIDGE_TOTP_SECRET='$BridgeTotpSecret'
-`$env:CODEX_BRIDGE_PUBLIC_URL='$BridgePublicUrl'
-`$env:CODEX_BRIDGE_ADAPTER='codex'
-`$env:CODEX_BRIDGE_RUNTIME_MODE='$RuntimeMode'
-`$env:CODEX_BRIDGE_APP_SERVER_CANARY_THREADS='$CanaryThreadIds'
-`$env:CODEX_BRIDGE_VOICE_ENABLED='$VoiceEnabledText'
-`$env:CODEX_BRIDGE_VOICE_COMMAND='$VoiceCommand'
-node src/server.js
-"@
-  Start-Process -WindowStyle Hidden -FilePath $script:PowerShellHostPath -ArgumentList @(
-    '-NoProfile',
-    '-ExecutionPolicy', 'Bypass',
-    '-Command', $command
-  ) -WorkingDirectory $repoRoot -RedirectStandardOutput $stdout -RedirectStandardError $stderr | Out-Null
+  # 直接以本进程环境拉起 node，省去 pwsh 包装层的启动开销（冷启动关键路径）。
+  # 注入的变量与原包装层逐项一致；voice 变量由顶部 voice\voice_server.py 存在性守卫。
+  # 这些变量仅用于 bridge 子进程；其余轨道子进程均以显式参数接收自己的凭据。
+  $env:CODEX_BRIDGE_HOST='0.0.0.0'
+  $env:CODEX_BRIDGE_PORT="$BridgePort"
+  $env:CODEX_BRIDGE_WORKSPACE="$repoRoot"
+  $env:CODEX_BRIDGE_TOKEN="$BridgeToken"
+  $env:CODEX_BRIDGE_TOTP_SECRET="$BridgeTotpSecret"
+  $env:CODEX_BRIDGE_PUBLIC_URL="$BridgePublicUrl"
+  $env:CODEX_BRIDGE_ADAPTER='codex'
+  $env:CODEX_BRIDGE_RUNTIME_MODE="$RuntimeMode"
+  $env:CODEX_BRIDGE_APP_SERVER_CANARY_THREADS="$CanaryThreadIds"
+  $env:CODEX_BRIDGE_VOICE_ENABLED="$VoiceEnabledText"
+  $env:CODEX_BRIDGE_VOICE_COMMAND="$VoiceCommand"
+  $node = (Get-Command node.exe -ErrorAction Stop).Source
+  Assert-LinkBootstrapAllowed
+  # 直接拉起 node 后命令行不再包含 repo 根路径，lifecycle 的归属判定
+  # （Get-MobileLinkOwnedProcesses 按 $root\ 或 $root/ 匹配）会把 bridge 当外部
+  # 进程：Stop 杀不掉、Start 因端口属主未知而拒绝。附加一个脚本不解析的
+  # argv 标记（正斜杠形式，避免结尾反斜杠+引号的转义歧义）恢复归属可见性。
+  $workspaceMarker = '--codex-bridge-workspace=' + $repoRoot.Replace('\','/') + '/'
+  Start-Process -WindowStyle Hidden -FilePath $node -ArgumentList @('src/server.js', $workspaceMarker) -WorkingDirectory $repoRoot -RedirectStandardOutput $stdout -RedirectStandardError $stderr | Out-Null
 }
 
 function Ensure-LocalBridge {
@@ -585,11 +730,15 @@ function Ensure-LocalBridge {
     Write-Warn "已指定 -ForceRestart，将重启本地 bridge"
   }
 
-  Stop-ProjectProcess -Pattern 'src[\\/]server\.js'
-  Stop-BridgePortOwner -Port $BridgePort
-  Start-Sleep -Milliseconds 500
+  # 起桥前清理条件化：探活已确认离线且端口空闲时，不存在需要停止的占用者，
+  # 跳过两轮 WMI 全量扫描（-Serial 保持原无条件清理路径）。
+  if ($script:UseSerialStartup -or (Test-LocalPortListening -HostAddress '127.0.0.1' -Port $BridgePort)) {
+    Stop-ProjectProcess -Pattern 'src[\\/]server\.js'
+    Stop-BridgePortOwner -Port $BridgePort
+    Wait-PortFreeOrFixedSleep -HostAddress '127.0.0.1' -Port $BridgePort -LegacyMilliseconds 500
+  }
   Start-LocalBridgeProcess
-  $health = Wait-BridgeHealth -TimeoutSeconds 25
+  $health = Wait-BridgeHealth -TimeoutSeconds 25 -IntervalMilliseconds 250
   $run = Get-ObjectValue -Object $health -Name 'run' -Fallback $null
   $runId = Get-ObjectValue -Object $run -Name 'runId' -Fallback 'unknown'
   $runtime = Get-ObjectValue -Object $health -Name 'runtime' -Fallback $null
@@ -629,6 +778,7 @@ function Ensure-BackgroundScript {
     '-ExecutionPolicy', 'Bypass',
     '-File', $ScriptPath
   ) + $Arguments
+  Assert-LinkBootstrapAllowed
   Start-Process -WindowStyle Hidden -FilePath $script:PowerShellHostPath -ArgumentList $argumentList -WorkingDirectory $repoRoot -RedirectStandardOutput $stdout -RedirectStandardError $stderr | Out-Null
   Write-Info "$DisplayName 已启动"
 }
@@ -637,7 +787,7 @@ function Ensure-LocalBridgeWatchdog {
   Write-Step "检查本地 bridge 自动恢复"
   $expectedArgument = '-RuntimeMode\s+[''" ]?' + [regex]::Escape($RuntimeMode) + '(?:[''"]|\s|$)'
   $allProcesses = @(Get-CimInstance Win32_Process)
-  $staleWatchdogs = @(Get-MatchingProcesses -Pattern 'watch-local-bridge\.ps1' -RequireRepoPath | Where-Object {
+  $staleWatchdogs = @(Get-MatchingProcesses -Pattern 'watch-local-bridge\.ps1' -RequireRepoPath -AllProcesses $allProcesses | Where-Object {
     [string]$_.CommandLine -notmatch $expectedArgument
   })
   foreach ($stale in $staleWatchdogs) {
@@ -691,6 +841,7 @@ function Start-RelayProcess {
   $stdout = Join-Path $logRoot "$Name.stdout.log"
   $stderr = Join-Path $logRoot "$Name.stderr.log"
   $script = Join-Path $repoRoot 'tools\harmony\start-hdc-relay.ps1'
+  Assert-LinkBootstrapAllowed
   Start-Process -WindowStyle Hidden -FilePath $script:PowerShellHostPath -ArgumentList @(
     '-NoProfile',
     '-ExecutionPolicy', 'Bypass',
@@ -764,9 +915,9 @@ function Ensure-BridgeProxy {
       Write-Warn "公网 bridge 代理池为空，将启动 bridge 代理"
     }
     Stop-BridgeProxyProcesses
-    Start-Sleep -Milliseconds 500
+    Wait-MatchingProcessGoneOrFixedSleep -Pattern 'start-hdc-relay\.ps1.*\bBridgeProxy\b|bridge:relay-proxy|start-bridge-proxy\.mjs' -LegacyMilliseconds 500
     Start-RelayProcess -Mode 'BridgeProxy' -Name 'bridge-proxy'
-    Start-Sleep -Seconds 2
+    Wait-RelayStateOrFixedSleep -Config $Config -LegacySeconds 2
 
     $after = Get-RelayStateSafe -Config $Config
     if ($after.Ok) {
@@ -827,7 +978,7 @@ function Ensure-LocalHdcProxy {
     Write-Warn "已指定 -ForceRestart，将重启本项目本地 HDC proxy"
   }
   Stop-HdcProxyProcesses
-  Start-Sleep -Milliseconds 500
+  Wait-MatchingProcessGoneOrFixedSleep -Pattern 'start-hdc-relay\.ps1.*\bProxy\b|hdc:proxy|start-local-proxy\.mjs|HDC_PROXY_PORT' -LegacyMilliseconds 500
   Start-RelayProcess -Mode 'Proxy' -Name 'local-proxy'
 
   $deadline = (Get-Date).AddSeconds(12)
@@ -894,10 +1045,12 @@ function Ensure-HdcConnection {
   } else {
     if (Test-HdcTargetConnected -HdcPath $hdcPath -Target $target) {
       Write-Warn "HDC target 列表显示已连接，但 shell 未确认；将重新 tconn: $target"
+      Assert-LinkBootstrapAllowed
       & $hdcPath kill -r 2>&1 | Out-Null
       Start-Sleep -Milliseconds 700
     }
     Write-Info "执行 hdc tconn $target"
+    Assert-LinkBootstrapAllowed
     $output = @(& $hdcPath tconn $target 2>&1)
     $output | Out-Host
     if ($LASTEXITCODE -ne 0) {
@@ -932,6 +1085,7 @@ function Ensure-HdcConnection {
         Start-Sleep -Milliseconds 500
       }
       if (Test-LocalPortListening -HostAddress $proxyHost -Port $proxyPort) {
+        Assert-LinkBootstrapAllowed
         $retryOutput = @(& $hdcPath tconn $target 2>&1)
         $retryOutput | Out-Host
         $global:LASTEXITCODE = 0
@@ -1044,7 +1198,7 @@ function Ensure-HdcRelay {
   $config = Import-PowerShellDataFile -LiteralPath $ConfigPath
   if ($ForceRestart) {
     Stop-RelayProcesses -Config $config
-    Start-Sleep -Milliseconds 600
+    Wait-MatchingProcessGoneOrFixedSleep -Pattern 'watch-hdc-connection\.ps1|watch-bridge-proxy\.ps1|start-hdc-relay\.ps1' -LegacyMilliseconds 600
   }
 
   Ensure-BridgeProxy -Config $config
@@ -1079,6 +1233,7 @@ function Get-DesktopLiveStatus {
 }
 
 function Test-DesktopLiveOnline {
+  $script:LastDesktopLiveOnline = $false
   $status = Get-DesktopLiveStatus
   if (-not $status.Ok) {
     return $false
@@ -1099,6 +1254,7 @@ function Test-DesktopLiveOnline {
   } else {
     Set-StartupStatus -Name 'CodexStatusBadge' -State 'degraded' -Message '脚本桥在线，但 CDP 不可探测；前端状态条无法校验，下一次注入后会自绘'
   }
+  $script:LastDesktopLiveOnline = $true
   return $true
 }
 
@@ -1230,6 +1386,7 @@ function Show-CodexFrontendWindow {
 
   try {
     Write-Info "检测到 Codex 壳进程但无窗口，尝试唤醒前端: PID=$($shell[0].ProcessId)"
+    Assert-LinkBootstrapAllowed
     Start-Process -FilePath $codexExe -WorkingDirectory (Split-Path -Parent $codexExe) | Out-Null
     for ($i = 0; $i -lt 10; $i++) {
       Start-Sleep -Milliseconds 500
@@ -1237,6 +1394,8 @@ function Show-CodexFrontendWindow {
         return $true
       }
     }
+  } catch [OperationCanceledException] {
+    throw
   } catch {
     Write-Warn "唤醒 Codex 前端失败: $($_.Exception.Message)"
   }
@@ -1263,6 +1422,7 @@ function Repair-CodexFrontendWindowWithLiveRestart {
   Write-Warn "Codex 实时通道在线但前端窗口缺失，将重新拉起带 CDP 的 Codex 前端"
   $script:CodexFrontendRepairRestarted = $true
   Set-StartupStatus -Name 'CodexDesktop' -State 'ok' -Message '实时通道在线但前端缺失，已重新拉起带 CDP 的 Codex'
+  Assert-LinkBootstrapAllowed
   & $script:PowerShellHostPath @args
   if ($LASTEXITCODE -ne 0) {
     Set-StartupStatus -Name 'CodexDesktop' -State 'failed' -Message "前端重拉起/CDP 注入失败，退出码: $LASTEXITCODE"
@@ -1448,6 +1608,7 @@ function Ensure-CodexDesktopLive {
     Set-StartupStatus -Name 'CodexDesktop' -State 'ok' -Message '按 -ForceRestart 或缺失 live 通道，已启动/重启 Codex 并注入 CDP'
   }
 
+  Assert-LinkBootstrapAllowed
   & $script:PowerShellHostPath @args
   if ($LASTEXITCODE -ne 0) {
     Set-StartupStatus -Name 'CodexDesktop' -State 'failed' -Message "启动/CDP 注入失败，退出码: $LASTEXITCODE"
@@ -1472,7 +1633,137 @@ function Ensure-CodexDesktopLive {
   }
 }
 
+# ---------- 并行轨道（默认并行模式；-Serial 不经过这些函数） ----------
+# 桌面轨道 = 本脚本以 -Phase CodexDesktop 子进程再次运行，只跑 Codex 桌面段；
+# 主流程同时在本进程内跑 HDC 链路段，最后通过结果文件 join 并合并退出码语义。
+function Write-DesktopTrackResult {
+  param(
+    [int]$ExitCode,
+    [string]$ErrorText
+  )
+
+  if ([string]::IsNullOrWhiteSpace($TrackResultFile)) {
+    return
+  }
+  try {
+    $statuses = @()
+    foreach ($key in @($script:StartupStatus.Keys)) {
+      $status = $script:StartupStatus[$key]
+      $statuses += [pscustomobject]@{
+        name = [string]$key
+        state = [string]$status.State
+        message = [string]$status.Message
+      }
+    }
+    [pscustomobject]@{
+      pid = $PID
+      exitCode = $ExitCode
+      error = $ErrorText
+      finishedAt = [datetime]::UtcNow.ToString('o')
+      statuses = $statuses
+    } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $TrackResultFile -Encoding utf8
+  } catch {
+    # 顶层 trap 可能在 Write-Warn 等函数定义前调用本函数，这里只用 Write-Host。
+    Write-Host "    写入桌面轨道结果失败: $($_.Exception.Message)" -ForegroundColor Yellow
+  }
+}
+
+function Start-DesktopTrackProcess {
+  $resultFile = Join-Path $logRoot ("desktop-track.{0}.result.json" -f $PID)
+  Remove-Item -LiteralPath $resultFile -ErrorAction SilentlyContinue
+  $trackArgs = @(
+    '-NoProfile',
+    '-ExecutionPolicy', 'Bypass',
+    '-File', $PSCommandPath,
+    '-Phase', 'CodexDesktop',
+    '-TrackResultFile', $resultFile,
+    '-BridgePort', "$BridgePort"
+  )
+  $trackArgs = Add-OptionalStringArgument -Arguments $trackArgs -Name '-BridgeToken' -Value $BridgeToken
+  $trackArgs = Add-OptionalStringArgument -Arguments $trackArgs -Name '-BridgeTotpSecret' -Value $BridgeTotpSecret
+  $trackArgs = Add-OptionalStringArgument -Arguments $trackArgs -Name '-BridgePublicUrl' -Value $BridgePublicUrl
+  $trackArgs = Add-OptionalStringArgument -Arguments $trackArgs -Name '-BridgeUrl' -Value $BridgeUrl
+  $trackArgs = Add-OptionalStringArgument -Arguments $trackArgs -Name '-RuntimeMode' -Value $RuntimeMode
+  $trackArgs = Add-OptionalStringArgument -Arguments $trackArgs -Name '-CanaryThreadIds' -Value $CanaryThreadIds
+  $trackArgs = Add-OptionalStringArgument -Arguments $trackArgs -Name '-ConfigPath' -Value $ConfigPath
+  $trackArgs = Add-OptionalStringArgument -Arguments $trackArgs -Name '-SessionId' -Value $SessionId
+  $trackArgs = Add-OptionalStringArgument -Arguments $trackArgs -Name '-LinkControlVersion' -Value $LinkControlVersion
+  $trackArgs = Add-OptionalStringArgument -Arguments $trackArgs -Name '-GuardianConfigVersion' -Value $GuardianConfigVersion
+  if ($KeepExistingCodex) { $trackArgs += '-KeepExistingCodex' }
+  if ($ForceRestart) { $trackArgs += '-ForceRestart' }
+  if ($GuardianRepair) { $trackArgs += '-GuardianRepair' }
+  Assert-LinkBootstrapAllowed
+  $process = Start-Process -WindowStyle Hidden -FilePath $script:PowerShellHostPath -ArgumentList $trackArgs -WorkingDirectory $repoRoot -RedirectStandardOutput (Join-Path $logRoot 'desktop-track.stdout.log') -RedirectStandardError (Join-Path $logRoot 'desktop-track.stderr.log') -PassThru
+  return [pscustomobject]@{
+    Process = $process
+    ResultFile = $resultFile
+  }
+}
+
+# 后台服务轨道：watchdog + 语音 + HDC 全家 + 会话链路收尾探测。fork 后不 join、
+# 不阻塞主流程退出；状态快照写结果文件供诊断，watchdog/guardian 负责兜底恢复。
+function Start-ServicesTrackProcess {
+  $resultFile = Join-Path $logRoot ("background-track.{0}.result.json" -f $PID)
+  Remove-Item -LiteralPath $resultFile -ErrorAction SilentlyContinue
+  $trackArgs = @(
+    '-NoProfile',
+    '-ExecutionPolicy', 'Bypass',
+    '-File', $PSCommandPath,
+    '-Phase', 'Background',
+    '-TrackResultFile', $resultFile,
+    '-BridgePort', "$BridgePort"
+  )
+  $trackArgs = Add-OptionalStringArgument -Arguments $trackArgs -Name '-BridgeToken' -Value $BridgeToken
+  $trackArgs = Add-OptionalStringArgument -Arguments $trackArgs -Name '-BridgeTotpSecret' -Value $BridgeTotpSecret
+  $trackArgs = Add-OptionalStringArgument -Arguments $trackArgs -Name '-BridgePublicUrl' -Value $BridgePublicUrl
+  $trackArgs = Add-OptionalStringArgument -Arguments $trackArgs -Name '-BridgeUrl' -Value $BridgeUrl
+  $trackArgs = Add-OptionalStringArgument -Arguments $trackArgs -Name '-RuntimeMode' -Value $RuntimeMode
+  $trackArgs = Add-OptionalStringArgument -Arguments $trackArgs -Name '-CanaryThreadIds' -Value $CanaryThreadIds
+  $trackArgs = Add-OptionalStringArgument -Arguments $trackArgs -Name '-ConfigPath' -Value $ConfigPath
+  $trackArgs = Add-OptionalStringArgument -Arguments $trackArgs -Name '-SessionId' -Value $SessionId
+  $trackArgs = Add-OptionalStringArgument -Arguments $trackArgs -Name '-LinkControlVersion' -Value $LinkControlVersion
+  $trackArgs = Add-OptionalStringArgument -Arguments $trackArgs -Name '-GuardianConfigVersion' -Value $GuardianConfigVersion
+  if ($KeepExistingCodex) { $trackArgs += '-KeepExistingCodex' }
+  if ($ForceRestart) { $trackArgs += '-ForceRestart' }
+  if ($GuardianRepair) { $trackArgs += '-GuardianRepair' }
+  if ($SkipHdcRelay) { $trackArgs += '-SkipHdcRelay' }
+  if ($SkipCodexDesktop) { $trackArgs += '-SkipCodexDesktop' }
+  Assert-LinkBootstrapAllowed
+  return Start-Process -WindowStyle Hidden -FilePath $script:PowerShellHostPath -ArgumentList $trackArgs -WorkingDirectory $repoRoot -RedirectStandardOutput (Join-Path $logRoot 'background-track.stdout.log') -RedirectStandardError (Join-Path $logRoot 'background-track.stderr.log') -PassThru
+}
+
+# Show-RelayState 是纯展示步骤：fork 成后台进程与桌面/HDC 轨道并行，末尾只做有界等待。
+function Start-RelayStateTrack {
+  $relayArgs = @(
+    '-NoProfile',
+    '-ExecutionPolicy', 'Bypass',
+    '-File', (Join-Path $repoRoot 'tools\harmony\check-relay-state.ps1'),
+    '-ConfigPath', $ConfigPath,
+    '-SkipDesktopScreenshot'
+  )
+  $relayArgs = Add-OptionalStringArgument -Arguments $relayArgs -Name '-BridgeToken' -Value $BridgeToken
+  Assert-LinkBootstrapAllowed
+  return Start-Process -WindowStyle Hidden -FilePath $script:PowerShellHostPath -ArgumentList $relayArgs -WorkingDirectory $repoRoot -RedirectStandardOutput (Join-Path $logRoot 'relay-state.stdout.log') -RedirectStandardError (Join-Path $logRoot 'relay-state.stderr.log') -PassThru
+}
+
 function Test-BridgeApi {
+  if (-not $script:UseSerialStartup) {
+    # 关键路径收尾只保留一次 /health 快速确认（Ensure-LocalBridge 刚以 10s 预算验证过；
+    # 此处再失败说明 bridge 在数秒内真正死亡，按原语义抛错 exit 1，不再重试等待）。
+    # DesktopScript/SessionApi 探测整体移入后台服务轨道收尾：冷启动时桌面恢复
+    # （由控制脚本在栈退出后执行）完成前 sessions 探测必然超时，且密集轮询
+    # /codex/sessions 会触发按源 429 限流连累 /health。
+    Write-Step "验证手机会话 API"
+    $probe = Get-LocalBridgeHealth
+    if (-not $probe.Ok) {
+      throw "Bridge 健康检查失败: $BridgeUrl/health; $($probe.Error)"
+    }
+    $run = Get-ObjectValue -Object $probe.Value -Name 'run' -Fallback $null
+    $runId = Get-ObjectValue -Object $run -Name 'runId' -Fallback 'unknown'
+    Write-Info "Bridge health: run=$runId（桌面/会话状态由后台轨道确认）"
+    return
+  }
+
   Write-Step "验证手机会话 API"
   $headers = Get-BridgeHeaders
   $health = Wait-BridgeHealth -TimeoutSeconds 10
@@ -1509,22 +1800,168 @@ function Test-BridgeApi {
   }
 }
 
-Stop-StaleLauncherWindows
-Ensure-LocalBridge
-Ensure-LocalBridgeWatchdog
-Ensure-HdcRelay
-Show-RelayState
-Ensure-CodexDesktopLive
-Ensure-DesktopLiveWatchdog
-. (Join-Path $repoRoot 'tools\windows\mobile-voice-tunnel.ps1')
-try {
-  Ensure-MobileVoiceTunnel $repoRoot
-  Set-StartupStatus -Name 'VoiceTunnel' -State 'ok' -Message '任务检查完成；实际转发与通话请查看统一状态'
-} catch {
-  Set-StartupStatus -Name 'VoiceTunnel' -State 'failed' -Message '语音隧道配置、绑定或任务恢复失败；其他通道继续检测'
+# ---------- 主入口拓扑 ----------
+if ($Phase -eq 'CodexDesktop') {
+  # 桌面子轨道：由主流程以子进程调用（bridge 已由主流程拉起），只跑 Codex 桌面段，
+  # 结束时把状态快照与退出码写回 -TrackResultFile 供主流程 join。
+  $trackErrorText = ''
+  try {
+    Ensure-CodexDesktopLive
+    Ensure-DesktopLiveWatchdog
+    if ((Get-StartupStatusState -Name 'CodexDesktop') -eq 'skipped') {
+      Set-StartupStatus -Name 'DesktopScript' -State 'skipped' -Message '按参数跳过 Codex 桌面检查'
+    } elseif ($script:LastDesktopLiveOnline) {
+      Set-StartupStatus -Name 'DesktopScript' -State 'ok' -Message '脚本桥在线'
+    } else {
+      Set-StartupStatus -Name 'DesktopScript' -State 'degraded' -Message '脚本桥未在线'
+    }
+  } catch [OperationCanceledException] {
+    throw
+  } catch {
+    $trackErrorText = $_.Exception.Message
+    Write-Warn "Codex 桌面轨道失败: $trackErrorText"
+  }
+  if ([string]::IsNullOrWhiteSpace($trackErrorText)) {
+    Write-DesktopTrackResult -ExitCode 0 -ErrorText ''
+    exit 0
+  }
+  Write-DesktopTrackResult -ExitCode 1 -ErrorText $trackErrorText
+  exit 1
+}
+
+if ($Phase -eq 'Background') {
+  # 后台服务轨道：watchdog + 语音 + HDC 全家 + 会话链路收尾探测。主流程不 join 本
+  # 轨道；状态快照与退出码写 -TrackResultFile 供诊断，watchdog/guardian 兜底恢复。
+  # 会话探测刻意温和（尝试 2 次、间隔 ≥3s），避免 /codex/sessions 按源 429 限流连累 /health。
+  $trackErrorText = ''
+  try {
+    Ensure-LocalBridgeWatchdog
+    Ensure-DesktopLiveWatchdog
+    . (Join-Path $repoRoot 'tools\windows\mobile-voice-tunnel.ps1')
+    try {
+      Assert-LinkBootstrapAllowed
+      Ensure-MobileVoiceTunnel $repoRoot -CanStart { Assert-LinkBootstrapAllowed; $true }
+      Set-StartupStatus -Name 'VoiceTunnel' -State 'ok' -Message '任务检查完成；实际转发与通话请查看统一状态'
+    } catch [OperationCanceledException] {
+      throw
+    } catch {
+      Set-StartupStatus -Name 'VoiceTunnel' -State 'failed' -Message '语音隧道配置、绑定或任务恢复失败；其他通道继续检测'
+    }
+    Ensure-HdcRelay
+    if ((Get-StartupStatusState -Name 'DesktopScript') -eq 'unknown') {
+      $desktopOnline = $false
+      foreach ($attempt in 1..2) {
+        if (Test-DesktopLiveOnline) {
+          $desktopOnline = $true
+          break
+        }
+        if ($attempt -lt 2) { Start-Sleep -Seconds 3 }
+      }
+      if ($desktopOnline) {
+        Set-StartupStatus -Name 'DesktopScript' -State 'ok' -Message '脚本桥在线（后台确认）'
+      } else {
+        Set-StartupStatus -Name 'DesktopScript' -State 'degraded' -Message '脚本桥未在线（后台确认，可稍后在统一状态重试）'
+      }
+    }
+    $sessionOnline = $false
+    $threadCount = 0
+    $threadError = ''
+    foreach ($attempt in 1..2) {
+      $threads = Invoke-JsonSafe -Uri "$BridgeUrl/api/codex/threads" -Headers (Get-BridgeHeaders) -TimeoutSec 8
+      if ($threads.Ok) {
+        $sessionOnline = $true
+        $threadItems = Get-ObjectValue -Object $threads.Value -Name 'threads' -Fallback $null
+        if ($null -eq $threadItems) {
+          $threadItems = Get-ObjectValue -Object $threads.Value -Name 'items' -Fallback $threads.Value
+        }
+        $threadCount = @($threadItems).Count
+        break
+      }
+      $threadError = [string]$threads.Error
+      if ($attempt -lt 2) { Start-Sleep -Seconds 4 }
+    }
+    if ($sessionOnline) {
+      Write-Info "会话 API 已响应: count=$threadCount（后台确认）"
+      Set-StartupStatus -Name 'SessionApi' -State 'ok' -Message "已响应 count=$threadCount（后台确认）"
+    } else {
+      Write-Warn "会话 API 暂不可读（后台确认）: $threadError"
+      Set-StartupStatus -Name 'SessionApi' -State 'degraded' -Message "暂不可读（后台确认，可稍后在统一状态重试）: $threadError"
+    }
+  } catch [OperationCanceledException] {
+    throw
+  } catch {
+    $trackErrorText = $_.Exception.Message
+    Write-Warn "后台服务轨道失败: $trackErrorText"
+  }
+  if ([string]::IsNullOrWhiteSpace($trackErrorText)) {
+    Write-DesktopTrackResult -ExitCode 0 -ErrorText ''
+    exit 0
+  }
+  Write-DesktopTrackResult -ExitCode 1 -ErrorText $trackErrorText
+  exit 1
+}
+
+if ($script:UseSerialStartup) {
+  # 旧纯串行路径（-Serial / CODEX_MOBILE_STACK_SERIAL=1），逐行复现改造前执行顺序。
+  Stop-StaleLauncherWindows
+  Ensure-LocalBridge
+  Ensure-LocalBridgeWatchdog
+  Ensure-HdcRelay
+  Show-RelayState
+  Ensure-CodexDesktopLive
+  Ensure-DesktopLiveWatchdog
+  . (Join-Path $repoRoot 'tools\windows\mobile-voice-tunnel.ps1')
+  try {
+    Assert-LinkBootstrapAllowed
+    Ensure-MobileVoiceTunnel $repoRoot -CanStart { Assert-LinkBootstrapAllowed; $true }
+    Set-StartupStatus -Name 'VoiceTunnel' -State 'ok' -Message '任务检查完成；实际转发与通话请查看统一状态'
+  } catch [OperationCanceledException] {
+    throw
+  } catch {
+    Set-StartupStatus -Name 'VoiceTunnel' -State 'failed' -Message '语音隧道配置、绑定或任务恢复失败；其他通道继续检测'
+  }
+} else {
+  # 关键路径极简（默认）：条件化清场 → bridge → 单次 /health → 退出。
+  # 其余全部转后台轨道，fork 后不 join、不阻塞退出；退出码 2 表示关键链路已就绪、
+  # 其余状态由后台轨道确认中，bridge 失败仍按原语义抛错 exit 1。
+  Stop-StaleLauncherWindows
+  Ensure-LocalBridge
+  if (-not $SkipHdcRelay) {
+    try {
+      Start-RelayStateTrack | Out-Null
+      Write-Info '公网 bridge/HDC 状态检查已在后台启动'
+    } catch [OperationCanceledException] {
+      throw
+    } catch {
+      Write-Warn "公网 bridge/HDC 状态检查启动失败: $($_.Exception.Message)"
+    }
+  }
+  if (-not $SkipCodexDesktop) {
+    try {
+      Start-DesktopTrackProcess | Out-Null
+      Write-Info 'Codex 桌面轨道已在后台启动（不等待）'
+    } catch [OperationCanceledException] {
+      throw
+    } catch {
+      Write-Warn "Codex 桌面轨道启动失败: $($_.Exception.Message)"
+      Set-StartupStatus -Name 'CodexDesktop' -State 'degraded' -Message '桌面轨道未能启动'
+    }
+  } else {
+    Ensure-CodexDesktopLive
+    Ensure-DesktopLiveWatchdog
+  }
+  try {
+    Start-ServicesTrackProcess | Out-Null
+    Write-Info '后台服务轨道已在启动（watchdog/语音/HDC/会话确认）'
+  } catch [OperationCanceledException] {
+    throw
+  } catch {
+    Write-Warn "后台服务轨道启动失败: $($_.Exception.Message)"
+  }
 }
 Test-BridgeApi
 
+Assert-LinkBootstrapAllowed
 Write-FinalStartupSummary
 
 Write-Step "一键状态补齐完成"

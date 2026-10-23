@@ -17,12 +17,17 @@ $script:desktopRecovery=$null
 $status=[pscustomobject]@{diagnostics=[pscustomobject]@{checks=@(
   [pscustomobject]@{id='bridge';state='ready'},
   [pscustomobject]@{id='desktop';state='ready'},
-  [pscustomobject]@{id='sessions';state='ready'}
+  [pscustomobject]@{id='sessions';state='ready'},
+  [pscustomobject]@{id='companion';state='ready'}
 )}}
 Assert ((Get-LinkStartupOutcome $status).exitCode -eq 0) 'Ready requires desktop and sessions as well as bridge'
+$status.diagnostics.checks[3].state='error'
+Assert ((Get-LinkStartupOutcome $status).state -eq 'partial') 'Every startup must reject unreadable personal assistant content'
+Assert ((Get-LinkStartupOutcome $status -RequireAssistant $true).state -eq 'partial') 'Normal and restart startup must use the same assistant acceptance'
+$status.diagnostics.checks[3].state='ready'
 $status.diagnostics.checks += [pscustomobject]@{id='voice';state='error'}
 Assert ((Get-LinkStartupOutcome $status).state -eq 'partial') 'Known voice failure must be reported alongside ready conversations'
-$status.diagnostics.checks=$status.diagnostics.checks[0..2]
+$status.diagnostics.checks=$status.diagnostics.checks[0..3]
 $status.diagnostics.checks[2].state='error'
 Assert ((Get-LinkStartupOutcome $status).exitCode -eq 2) 'Session HTTP failure must fail startup despite healthy bridge and desktop'
 $status.diagnostics.checks[1].state='blocked'

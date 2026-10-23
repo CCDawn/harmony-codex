@@ -137,6 +137,53 @@ function Test-MobileLinkPaused {
   catch { return $true } # Corrupt control state must not trigger automatic recovery.
 }
 
+function Assert-MobileLinkLaunchIntent {
+  param(
+    [string]$Repo,
+    [string]$LinkControlVersion='',
+    [string]$GuardianConfigVersion='',
+    [switch]$GuardianRepair
+  )
+  # Read and hash the same bytes so an atomic replacement cannot validate one
+  # generation's hash and another generation's permission. "missing" is the
+  # controller's explicit snapshot for a state file that did not yet exist.
+  $snapshots=@(
+    @{path=(Get-MobileLinkStatePath $Repo);expected=$LinkControlVersion;guardian=$false},
+    @{path=(Join-Path $Repo 'logs\state\mobile-link-guardian-config.json');expected=$GuardianConfigVersion;guardian=$true}
+  )
+  foreach ($snapshot in $snapshots) {
+    if ($snapshot.guardian -and -not $GuardianRepair -and -not $snapshot.expected) { continue }
+    try {
+      $exists=Test-Path -LiteralPath $snapshot.path -ErrorAction Stop
+      if (-not $exists) {
+        if (($snapshot.expected -and $snapshot.expected -ne 'missing') -or ($snapshot.guardian -and $GuardianRepair)) {
+          throw 'Required launch snapshot is missing'
+        }
+        continue
+      }
+      $bytes=[IO.File]::ReadAllBytes($snapshot.path)
+      if ($snapshot.expected) {
+        $sha=[Security.Cryptography.SHA256]::Create()
+        try { $version=[BitConverter]::ToString($sha.ComputeHash($bytes)).Replace('-','') }
+        finally { $sha.Dispose() }
+        if ($snapshot.expected -ne $version) { throw 'Launch generation changed' }
+      }
+      $state=[Text.Encoding]::UTF8.GetString($bytes).TrimStart([char]0xFEFF) | ConvertFrom-Json -ErrorAction Stop
+      if (-not $snapshot.guardian) {
+        if ($null -eq $state -or $null -eq $state.PSObject.Properties['desiredState'] -or $state.desiredState -ne 'running') {
+          throw 'Link is stopped or control state is invalid'
+        }
+      } elseif ($GuardianRepair) {
+        if ($null -eq $state -or $null -eq $state.PSObject.Properties['enabled'] -or $state.enabled -isnot [bool] -or $state.enabled -ne $true) {
+          throw 'Guardian permission was withdrawn'
+        }
+      }
+    } catch {
+      throw [OperationCanceledException]::new('链路启动已取消：停止意图或启动版本已失效。')
+    }
+  }
+}
+
 function Set-MobileLinkDesiredState {
   param([string]$Repo, [ValidateSet('running','stopped')][string]$State)
   $path = Get-MobileLinkStatePath $Repo

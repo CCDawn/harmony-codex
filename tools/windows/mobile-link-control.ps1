@@ -4,9 +4,11 @@ param(
   [ValidateRange(1,65535)][int]$BridgePort=8787,
   [switch]$RestartDesktop,
   [switch]$ScheduledRepairWorker,
+  [ValidatePattern('^$|^[a-f0-9]{32}$')][string]$OperationId='',
   [switch]$GuardianRepair,
   [ValidateSet('reconnect','restart_services','restart_desktop')][string]$GuardianStage='reconnect',
-  [string]$GuardianComponents=''
+  [string]$GuardianComponents='',
+  [string]$StandbyFile=''
 )
 Set-StrictMode -Version Latest
 $ErrorActionPreference='Stop'
@@ -20,6 +22,31 @@ $gate = New-MobileLinkMutex $repo
 $owns = $false
 $bridgeUrl='http://127.0.0.1:'+$BridgePort
 $script:desktopRecovery = $null
+$script:linkOperationId=''
+$script:fastStartStatus=$null
+$script:fastStartOutcome=$null
+$script:linkTotpKey=$null
+$operationScript=Join-Path $PSScriptRoot 'mobile-link-operation.ps1'
+if (Test-Path -LiteralPath $operationScript) { . $operationScript }
+function Set-LinkOperationPhase([string]$Phase) {
+  if (-not $script:linkOperationId) { return }
+  if (-not (Set-MobileLinkOperation -Repo $repo -OperationId $script:linkOperationId -Phase $Phase)) { throw 'Operation ownership expired or changed' }
+  $current=Get-MobileLinkOperation $repo
+  if ($current.phase -ne $Phase) { throw 'Operation deadline or cancellation changed the outcome' }
+  if (-not $current.active -and $Phase -notin @('ready','partial','failed')) { throw 'Operation deadline reached' }
+}
+function Wait-LinkOperation([string]$Id) {
+  do {
+    $current=Get-MobileLinkOperation $repo
+    if (-not $current -or $current.operationId -ne $Id) { throw 'Joined operation superseded' }
+    if ($current.active -and [datetimeoffset]::UtcNow -ge [datetimeoffset]::Parse($current.deadlineAt)) {
+      Set-MobileLinkOperation -Repo $repo -OperationId $Id -Phase failed | Out-Null
+      $current=Get-MobileLinkOperation $repo
+    }
+    if (-not $current.active) { return $current }
+    Start-Sleep -Seconds 1
+  } while ($true)
+}
 function Get-LinkValue([object]$Object,[string]$Name,$Fallback=$null) {
   if ($null -eq $Object) { return $Fallback }
   $property=$Object.PSObject.Properties[$Name]
@@ -27,17 +54,29 @@ function Get-LinkValue([object]$Object,[string]$Name,$Fallback=$null) {
   $property.Value
 }
 function Get-LinkDiagnostics([bool]$Paused,[object]$VoiceTunnel) {
+  $process=$null
   try {
     $node=(Get-Command node -ErrorAction Stop).Source
     $diagnosticScript=Join-Path $repo 'tools\windows\mobile-link-diagnostics.mjs'
-    $output=& $node $diagnosticScript --port $BridgePort --paused $Paused.ToString().ToLowerInvariant() --voice-state ([string]$VoiceTunnel.state) 2>$null
-    $parsed=($output -join "`n") | ConvertFrom-Json
+    # Bounded probe: a hung node diagnostic must not pin the whole control command.
+    $info=[Diagnostics.ProcessStartInfo]::new($node)
+    $info.UseShellExecute=$false
+    $info.CreateNoWindow=$true
+    $info.RedirectStandardOutput=$true
+    $info.RedirectStandardError=$true
+    $info.StandardOutputEncoding=[Text.Encoding]::UTF8
+    $info.StandardErrorEncoding=[Text.Encoding]::UTF8
+    $info.Arguments='"'+$diagnosticScript+'" --port '+$BridgePort+' --paused '+$Paused.ToString().ToLowerInvariant()+' --voice-state "'+[string]$VoiceTunnel.state+'"'
+    $process=[Diagnostics.Process]::Start($info)
+    $stdout=$process.StandardOutput.ReadToEndAsync();$stderr=$process.StandardError.ReadToEndAsync()
+    if(-not $process.WaitForExit(20000)){$process.Kill();throw 'Diagnostics probe timed out'}
+    $parsed=$stdout.Result | ConvertFrom-Json
     if (-not (Get-LinkValue $parsed 'severity')) { throw 'Incomplete diagnostics' }
     return $parsed
   } catch {
     Write-LinkEvent ('diagnostics-failed type='+$_.Exception.GetType().Name+' line='+$_.InvocationInfo.ScriptLineNumber)
     return [pscustomobject]@{ severity=$(if($Paused){'stopped'}else{'unknown'}); summary=$(if($Paused){'链路已停止'}else{'业务检测未完成，不能确认通道状态'}); nextAction=$(if($Paused){'start'}else{'check_logs'}); checks=@(); restartRequired=$false }
-  }
+  } finally { if($process){$process.Dispose()} }
 }
 function Get-LinkHdcStatus {
   $hdc=''
@@ -107,11 +146,25 @@ function Get-DesktopLauncherArguments {
   }
   $Arguments
 }
+function Get-LinkBootstrapArguments {
+  param([string[]]$Arguments)
+  # Bind a detached bootstrap to the intent that authorized this launch.
+  # A later Stop/Start or Disable/Enable must invalidate the old child.
+  $controlPath=Join-Path $repo 'logs\state\mobile-link-control.json'
+  $version=if(Test-Path -LiteralPath $controlPath){(Get-FileHash -LiteralPath $controlPath -Algorithm SHA256).Hash}else{'missing'}
+  $Arguments+=@('-LinkControlVersion',$version)
+  if ($GuardianRepair) {
+    $configPath=Join-Path $repo 'logs\state\mobile-link-guardian-config.json'
+    $Arguments+=@('-GuardianRepair','-GuardianConfigVersion',(Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash)
+  }
+  $Arguments
+}
 function Invoke-DesktopRepair {
   $safe=Invoke-DesktopSafeRecovery
   if ($safe.state -in @('not-needed','recovered','pending')) { return $safe }
   if ((Get-Variable GuardianRepair -ValueOnly -ErrorAction SilentlyContinue) -and -not (Test-GuardianRepairAllowed)) { return [pscustomobject]@{state='cancelled';message='自动恢复已取消'} }
   Write-LinkEvent 'desktop-restart-requested'
+  if (Get-Command Set-LinkOperationPhase -ErrorAction SilentlyContinue) { Set-LinkOperationPhase 'restarting_desktop' }
   $arguments=@('-BridgeUrl',$bridgeUrl)
   if (Get-Variable GuardianRepair -ValueOnly -ErrorAction SilentlyContinue) { $arguments=Get-DesktopLauncherArguments $arguments }
   $launcher=Start-MobileLinkDetached -HostPath (Get-Process -Id $PID).Path -ScriptPath (Join-Path $repo 'scripts\restart-codex-desktop-live.ps1') -Arguments $arguments -LogPath (Join-Path $repo 'logs\startup\desktop-repair.log') -WorkingDirectory $repo
@@ -129,6 +182,7 @@ function Invoke-DesktopRepair {
 }
 function Start-MissingDesktop {
   if ((Get-Variable GuardianRepair -ValueOnly -ErrorAction SilentlyContinue) -and -not (Test-GuardianRepairAllowed)) { return [pscustomobject]@{state='cancelled';message='自动恢复已取消'} }
+  if (Get-Command Set-LinkOperationPhase -ErrorAction SilentlyContinue) { Set-LinkOperationPhase 'connecting_desktop' }
   # StartOnly refuses an existing desktop and never stops its processes, even
   # if the status snapshot became stale while the launcher was starting.
   $arguments=@('-BridgeUrl',$bridgeUrl,'-StartOnly','-RefusePlainCodex')
@@ -157,8 +211,8 @@ function Get-LinkStartupOutcome([object]$Status,[bool]$RequireAssistant=$false) 
   $required=@('bridge','desktop','sessions')
   $ready=@($checks | Where-Object { $_.id -in $required -and $_.state -eq 'ready' }).Count -eq $required.Count
   $recoveryState=[string](Get-LinkValue $script:desktopRecovery 'state' '')
-  if (($recoveryState -eq 'restarted' -or $RequireAssistant) -and $ready -and -not @($checks | Where-Object { $_.id -eq 'companion' -and $_.state -eq 'ready' }).Count) {
-    return [pscustomobject]@{state='partial';exitCode=2;message='桌面已重连，但个人助手会话读取尚未通过，请查看检测结果'}
+  if ($ready -and -not @($checks | Where-Object { $_.id -eq 'companion' -and $_.state -eq 'ready' }).Count) {
+    return [pscustomobject]@{state='partial';exitCode=2;message='桌面已连接，但个人助手会话读取尚未通过，请查看检测结果'}
   }
   if ($ready) {
     if (@($checks | Where-Object { $_.id -eq 'voice' -and $_.state -eq 'error' }).Count) {
@@ -207,7 +261,187 @@ function Get-LinkApi([string]$Path) {
   try { Invoke-RestMethod -Uri ($bridgeUrl+$Path) -Headers (Get-LinkHeaders) -TimeoutSec 3 }
   catch { $null }
 }
+function Get-LinkQuickProbe {
+  # Cheap pending-loop signal: operation progress file plus two short-timeout
+  # bridge reads over the existing $bridgeUrl. These mirror the data sources of
+  # the full diagnostics (bridge=/health, desktop=/desktop/live/status) so a
+  # "possibly ready" verdict can be detected without running the node probe.
+  # Never throws; an unreachable bridge reads as "not ready".
+  $operation=$null
+  if (Get-Command Get-MobileLinkOperation -ErrorAction SilentlyContinue) { $operation=Get-MobileLinkOperation $repo }
+  $health=$null
+  try { $health=Invoke-RestMethod -Uri ($bridgeUrl+'/health') -Headers (Get-LinkHeaders) -TimeoutSec 2 } catch { }
+  $desktop=$null
+  try { $desktop=Invoke-RestMethod -Uri ($bridgeUrl+'/desktop/live/status') -Headers (Get-LinkHeaders) -TimeoutSec 2 } catch { }
+  $healthOk=([bool](Get-LinkValue $health 'ok' $false) -and [string](Get-LinkValue (Get-LinkValue $health 'runtime') 'mode' '') -eq 'desktop')
+  $desktopLive=[bool](Get-LinkValue (Get-LinkValue $desktop 'desktop') 'desktopLive' $false)
+  $remainingSeconds=$null
+  if ($operation) {
+    try { $remainingSeconds=[int]([datetimeoffset]::Parse([string]$operation.deadlineAt)-[datetimeoffset]::UtcNow).TotalSeconds } catch { }
+  }
+  [pscustomobject]@{
+    healthOk=$healthOk; desktopLive=$desktopLive
+    phase=[string](Get-LinkValue $operation 'phase' ''); message=[string](Get-LinkValue $operation 'message' '')
+    remainingSeconds=$remainingSeconds
+  }
+}
+function Get-LinkTotpCode([string]$Secret) {
+  # RFC 6238 compatible with src/totp.js: base32 secret, HMAC-SHA1, 30s step,
+  # 6 digits. Lets the control script authenticate like mobile-link-diagnostics.mjs.
+  if (-not $Secret) { return $null }
+  if ($null -eq $script:linkTotpKey) {
+    $clean=($Secret -replace '[\s-]','').TrimEnd('=').ToUpperInvariant()
+    $alphabet='ABCDEFGHIJKLMNOPQRSTUVWXYZ234567'
+    $bytes=New-Object System.Collections.Generic.List[byte]
+    $bits=0; $value=[long]0
+    foreach($char in $clean.ToCharArray()){
+      $index=$alphabet.IndexOf($char)
+      if($index -lt 0){ return $null }
+      $value=(($value -shl 5) -bor $index) -band 4294967295
+      $bits+=5
+      if($bits -ge 8){ $bytes.Add([byte](($value -shr ($bits-8)) -band 255)); $bits-=8 }
+    }
+    if($bytes.Count -eq 0){ return $null }
+    $script:linkTotpKey=$bytes.ToArray()
+  }
+  $step=[long][math]::Floor([DateTimeOffset]::UtcNow.ToUnixTimeSeconds()/30)
+  $message=[byte[]]@(0,0,0,0,[byte](($step -shr 24) -band 255),[byte](($step -shr 16) -band 255),[byte](($step -shr 8) -band 255),[byte]($step -band 255))
+  $hmac=[Security.Cryptography.HMACSHA1]::new([byte[]]$script:linkTotpKey)
+  try { $digest=$hmac.ComputeHash($message) } finally { $hmac.Dispose() }
+  $offset=$digest[19] -band 0x0F
+  $binary=((([int]$digest[$offset] -band 0x7F) -shl 24) -bor (([int]$digest[$offset+1] -band 255) -shl 16) -bor (([int]$digest[$offset+2] -band 255) -shl 8) -bor ([int]$digest[$offset+3] -band 255))
+  return ($binary % 1000000).ToString('D6')
+}
+function Get-LinkFastProbe {
+  param([switch]$SkipHealth)
+  # Start fast-path readiness: the three signals behind the ready verdict,
+  # read directly over the loopback bridge with token+OTP auth identical to
+  # mobile-link-diagnostics.mjs. Never throws; failures read as "not ready".
+  # -SkipHealth omits the /health request for callers that already latched the
+  # bridge green; the locked verdict is reported so the synthesized status and
+  # the ready condition stay correct without repeating the request each round.
+  $headers=Get-LinkHeaders
+  $code=Get-LinkTotpCode ([string]$env:CODEX_BRIDGE_TOTP_SECRET)
+  if ($code) { $headers['X-Codex-Bridge-OTP']=$code }
+  $health=$null; $desktop=$null; $sessions=$null
+  if (-not $SkipHealth) {
+    try { $health=Invoke-RestMethod -Uri ($bridgeUrl+'/health') -Headers $headers -TimeoutSec 1 } catch { }
+  }
+  try { $desktop=Invoke-RestMethod -Uri ($bridgeUrl+'/desktop/live/status') -Headers $headers -TimeoutSec 1 } catch { }
+  try { $sessions=Invoke-RestMethod -Uri ($bridgeUrl+'/codex/sessions?limit=1') -Headers $headers -TimeoutSec 1 } catch { }
+  $operation=$null
+  if (Get-Command Get-MobileLinkOperation -ErrorAction SilentlyContinue) { $operation=Get-MobileLinkOperation $repo }
+  $remainingSeconds=$null
+  if ($operation) {
+    try { $remainingSeconds=[int]([datetimeoffset]::Parse([string]$operation.deadlineAt)-[datetimeoffset]::UtcNow).TotalSeconds } catch { }
+  }
+  [pscustomobject]@{
+    healthOk=$(if($SkipHealth){$true}else{[bool](Get-LinkValue $health 'ok' $false) -and [string](Get-LinkValue (Get-LinkValue $health 'runtime') 'mode' '') -eq 'desktop'})
+    desktopLive=[bool](Get-LinkValue (Get-LinkValue $desktop 'desktop') 'desktopLive' $false)
+    sessionsReady=($null -ne (Get-LinkValue $sessions 'sessions' $null))
+    remainingSeconds=$remainingSeconds
+  }
+}
+function New-LinkFastStatus {
+  param([object]$Probe)
+  # Start fast-path output: the same envelope the tray consumes, with the three
+  # readiness checks synthesized from the cheap probes instead of a node run.
+  $checks=@(
+    [pscustomobject]@{id='bridge';title='本地桥接';state=$(if($Probe.healthOk){'ready'}else{'error'});message=$(if($Probe.healthOk){'健康检查通过，使用桌面模式'}else{'桥接健康检查未通过'})}
+    [pscustomobject]@{id='desktop';title='Codex 桌面连接';state=$(if($Probe.desktopLive){'ready'}else{'error'});message=$(if($Probe.desktopLive){'桌面实时通道已连接'}else{'桌面通道未连接，可尝试安全修复'})}
+    [pscustomobject]@{id='sessions';title='普通会话';state=$(if($Probe.sessionsReady){'ready'}else{'error'});message=$(if($Probe.sessionsReady){'会话列表读取正常；未验证发送'}else{'会话接口未就绪'})}
+  )
+  $failures=@($checks | Where-Object { $_.state -in @('error','blocked') })
+  $diagnostics=[pscustomobject]@{
+    severity=$(if($failures.Count){'degraded'}else{'unverified'})
+    summary=$(if($failures.Count){'连接需要处理：'+(@($failures | ForEach-Object { $_.title }) -join '、')}else{'读取与连接检测通过；发送、通话和远程操作仍需验证'})
+    nextAction=$(if($failures.Count){'safe_repair'}else{'none'})
+    checks=$checks
+  }
+  [pscustomobject]@{
+    version=2; checkedAt=[datetime]::UtcNow.ToString('o'); paused=(Test-MobileLinkPaused $repo)
+    bridgeHealthy=$Probe.healthOk; runtimeMode=$(if($Probe.healthOk){'desktop'}else{'unknown'}); desktopLive=$Probe.desktopLive
+    services=@(); ports=@(); voiceTunnel=(Get-MobileVoiceTunnelStatus $repo); diagnostics=$diagnostics; desktopRecovery=$script:desktopRecovery; config='BridgeConfig.ets + hdc-relay.local.psd1 + voice-tunnel.local.psd1'
+    logDirectory=(Join-Path $repo 'logs'); officialCodex='external-host'
+  }
+}
+function Complete-LinkFastStart {
+  param([object]$Startup)
+  # Active fast verification for Start: bridge bring-up, desktop soft recovery
+  # and readiness probing run concurrently instead of waiting for the stack
+  # script to finish. The stack exit code is recorded, never awaited as a gate.
+  $spawnedAt=[datetimeoffset]::UtcNow
+  $bridgeGreen=$false
+  $recoveryStarted=$false
+  $startupExitRecorded=$false
+  $greenHealthMisses=0
+  $phaseTick=0
+  do {
+    # 绿灯锁定后每 5 轮（约 2s）做一次含 /health 的全量探测：bridge 在 green
+    # 之后、三绿之前死亡时，连续 8 次未恢复（约 16s，足够看门狗拉活）即按
+    # 降级收场，而不是持锁空转到 operation 死线。
+    $recheckHealth=$bridgeGreen -and (($phaseTick % 5) -eq 4)
+    $probe=Get-LinkFastProbe -SkipHealth:($bridgeGreen -and -not $recheckHealth)
+    if ($recheckHealth) {
+      if ($probe.healthOk) { $greenHealthMisses=0 }
+      else {
+        $greenHealthMisses++
+        if ($greenHealthMisses -ge 8) {
+          $script:fastStartStatus=New-LinkFastStatus -Probe (Get-LinkFastProbe)
+          $script:fastStartOutcome=Get-LinkStartupOutcome $script:fastStartStatus
+          Write-LinkEvent 'fast-start bridge-lost-after-green'
+          break
+        }
+      }
+    }
+    if ($probe.healthOk -and -not $bridgeGreen) { $bridgeGreen=$true; Write-LinkEvent 'fast-start bridge-green' }
+    if ($bridgeGreen -and -not $recoveryStarted -and -not $probe.desktopLive) {
+      if (Get-Command Set-LinkOperationPhase -ErrorAction SilentlyContinue) { Set-LinkOperationPhase 'connecting_desktop' }
+      $recoveryStarted=$true
+      # Soft recovery only needs the bridge; the stack keeps working in background.
+      $script:desktopRecovery=Invoke-DesktopSafeRecovery
+      if ((Get-LinkValue $script:desktopRecovery 'state' '') -in @('failed','blocked')) {
+        $script:fastStartStatus=New-LinkFastStatus -Probe (Get-LinkFastProbe)
+        $script:fastStartOutcome=Get-LinkStartupOutcome $script:fastStartStatus
+        break
+      }
+      $probe=Get-LinkFastProbe -SkipHealth:$bridgeGreen
+    }
+    if ($bridgeGreen -and $probe.desktopLive -and $probe.sessionsReady) {
+      $script:fastStartStatus=New-LinkFastStatus -Probe $probe
+      # Same state/message/exit the full-diagnostics ready outcome produces; the
+      # assistant/voice detail checks stay a Status/Repair responsibility.
+      $script:fastStartOutcome=[pscustomobject]@{state='ready';exitCode=0;message='桌面连接与会话读取已就绪；通话状态请查看单独检测结果'}
+      Write-LinkEvent 'fast-start ready'
+      break
+    }
+    if (-not $startupExitRecorded -and $Startup.HasExited) {
+      $startupExitRecorded=$true
+      Write-LinkEvent ('startup-exit='+$Startup.ExitCode)
+      Write-LinkEvent 'startup-returned'
+    }
+    if ($startupExitRecorded -and -not $bridgeGreen -and ([datetimeoffset]::UtcNow - $spawnedAt).TotalSeconds -ge 60) {
+      throw '链路启动脚本未成功完成，请查看启动日志。'
+    }
+    if (Test-MobileLinkPaused $repo) { throw 'Operation cancelled by Stop' }
+    if ($GuardianRepair -and -not (Test-GuardianRepairAllowed)) { throw 'Guardian operation cancelled' }
+    $phaseTick++
+    if ($phaseTick -ge 5) {
+      $phaseTick=0
+      # Deadline and ownership enforcement on the same ~2s cadence the previous
+      # pending loop used; Set-LinkOperationPhase throws once the deadline passes.
+      if (Get-Command Set-LinkOperationPhase -ErrorAction SilentlyContinue) { Set-LinkOperationPhase ($(if($bridgeGreen){'connecting_desktop'}else{'starting_services'})) }
+    }
+    Start-Sleep -Milliseconds 400
+  } while ($true)
+}
 function Get-LinkStatus {
+  if (Get-Command Get-MobileLinkOperation -ErrorAction SilentlyContinue) {
+    $progress=Get-MobileLinkOperation $repo
+    if ($progress -and $progress.active -and [datetimeoffset]::UtcNow -ge [datetimeoffset]::Parse($progress.deadlineAt)) {
+      Set-MobileLinkOperation -Repo $repo -OperationId $progress.operationId -Phase failed | Out-Null
+    }
+  }
   $all = @(Get-CimInstance Win32_Process)
   $owned = @(Get-MobileLinkOwnedProcesses -Repo $repo -Processes $all)
   $services = @($owned | ForEach-Object {
@@ -244,19 +478,105 @@ function Get-LinkStatus {
   $state | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $dir 'mobile-link-status.json') -Encoding utf8
   $state
 }
+function Start-LinkBridgeProcess {
+  # Fast Start path: launch the node bridge directly instead of paying a second
+  # pwsh cold start inside the stack script's Phase All flow. The injected
+  # environment and argv stay item-for-item identical to the stack's
+  # Start-LocalBridgeProcess, including the voice presence guard and the
+  # unparsed ownership marker argv that lifecycle process matching requires.
+  $stdout=Join-Path $repo 'logs\startup\bridge.stdout.log'
+  $stderr=Join-Path $repo 'logs\startup\bridge.stderr.log'
+  $runtimeMode=[string]$env:CODEX_BRIDGE_RUNTIME_MODE
+  if ([string]::IsNullOrWhiteSpace($runtimeMode)) { $runtimeMode='desktop' }
+  $runtimeMode=$runtimeMode.Trim().ToLowerInvariant()
+  # Same voice presence guard as the stack: without voice\voice_server.py the bridge stays voice-free.
+  $voiceEnabled='0'
+  $voiceCommand=''
+  $voiceServerPath=Join-Path $repo 'voice\voice_server.py'
+  if (Test-Path -LiteralPath $voiceServerPath) {
+    $voiceEnabled='1'
+    $voicePython=Join-Path $repo '.venv\Scripts\python.exe'
+    if (-not (Test-Path -LiteralPath $voicePython)) { $voicePython='python' }
+    $voiceCommand='"'+$voicePython+'" "'+$voiceServerPath+'" --port 8790'
+  }
+  $env:CODEX_BRIDGE_HOST='0.0.0.0'
+  $env:CODEX_BRIDGE_PORT="$BridgePort"
+  $env:CODEX_BRIDGE_WORKSPACE="$repo"
+  $env:CODEX_BRIDGE_ADAPTER='codex'
+  $env:CODEX_BRIDGE_RUNTIME_MODE="$runtimeMode"
+  $env:CODEX_BRIDGE_APP_SERVER_CANARY_THREADS="$([string]$env:CODEX_BRIDGE_APP_SERVER_CANARY_THREADS)"
+  $env:CODEX_BRIDGE_VOICE_ENABLED="$voiceEnabled"
+  $env:CODEX_BRIDGE_VOICE_COMMAND="$voiceCommand"
+  $node=(Get-Command node.exe -ErrorAction Stop).Source
+  # Direct node argv no longer contains the repo root path, so lifecycle
+  # ownership matching would treat the bridge as external (Stop could not kill
+  # it and Start would refuse the port). The unparsed marker restores the
+  # forward-slash root match. Double quotes keep the values interpolated --
+  # single-quoted literals would hand node '' and parseInt would yield NaN.
+  $workspaceMarker='--codex-bridge-workspace='+$repo.Replace('\','/')+'/'
+  $bridge=Start-Process -WindowStyle Hidden -FilePath $node -ArgumentList @('src/server.js',$workspaceMarker) -WorkingDirectory $repo -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
+  $null=$bridge.Handle # Retain the handle so a fast exit still yields ExitCode.
+  return $bridge
+}
+function Start-LinkBackgroundTrack {
+  param([string]$RuntimeMode)
+  # Fork the stack script's existing Background sub-phase: watchdogs, voice
+  # tunnel, HDC relay and the gentle session confirmation probes. That phase
+  # never launches the bridge; the argument passthrough mirrors the stack's own
+  # Start-ServicesTrackProcess fork. Best-effort: a failed fork is recorded and
+  # never fatal; Ensure-LinkMonitors re-checks the watchers after readiness.
+  $trackArguments=@(
+    '-Phase','Background',
+    '-TrackResultFile',(Join-Path $repo ('logs\startup\background-track.'+$PID+'.result.json')),
+    '-BridgePort',"$BridgePort",
+    '-BridgeUrl',$bridgeUrl,
+    '-RuntimeMode',$RuntimeMode,
+    '-ConfigPath',(Join-Path $repo 'tools\harmony\hdc-relay.local.psd1')
+  )
+  if ($env:CODEX_BRIDGE_TOKEN) { $trackArguments+=@('-BridgeToken',$env:CODEX_BRIDGE_TOKEN) }
+  if ($env:CODEX_BRIDGE_TOTP_SECRET) { $trackArguments+=@('-BridgeTotpSecret',$env:CODEX_BRIDGE_TOTP_SECRET) }
+  if ($env:CODEX_BRIDGE_PUBLIC_URL) { $trackArguments+=@('-BridgePublicUrl',$env:CODEX_BRIDGE_PUBLIC_URL) }
+  if ($env:CODEX_BRIDGE_APP_SERVER_CANARY_THREADS) { $trackArguments+=@('-CanaryThreadIds',$env:CODEX_BRIDGE_APP_SERVER_CANARY_THREADS) }
+  $trackArguments=Get-LinkBootstrapArguments ($trackArguments+@('-SkipCodexDesktop','-KeepExistingCodex'))
+  $track=Start-MobileLinkDetached -HostPath (Get-Process -Id $PID).Path -ScriptPath (Join-Path $repo 'scripts\start-codex-mobile-stack.ps1') -Arguments $trackArguments -LogPath (Join-Path $repo 'logs\startup\background-track.log') -WorkingDirectory $repo
+  $track.Dispose()
+}
 function Start-Link {
+  if ($GuardianRepair -and $RestartDesktop) {
+    # The third guardian round must keep its component scope. Do not run the
+    # full bootstrap, touch a cooling public proxy, or require optional HDC.
+    $selected=@($GuardianComponents -split ',' | Where-Object { $_ -in @('desktop','sessions','companion') })
+    if (-not $selected.Count) { throw 'Missing scoped desktop recovery components' }
+    if (-not (Test-GuardianRepairAllowed)) { return }
+    Set-LinkEnvironment
+    if (-not (Test-GuardianRepairAllowed)) { return }
+    Set-LinkOperationPhase 'connecting_desktop'
+    $script:desktopRecovery=Invoke-DesktopRepair
+    return
+  }
   Write-LinkEvent 'checking-start-ownership'
-  # Refuse a runtime conversion or an unknown port owner instead of silently stopping it.
-  $listeners=@(Get-NetTCPConnection -State Listen -LocalPort $BridgePort -ErrorAction SilentlyContinue)
-  if ($listeners.Count -gt 0) {
-    $owned=@(Get-MobileLinkOwnedProcesses -Repo $repo -Processes @(Get-CimInstance Win32_Process))
-    $ids=@($owned | ForEach-Object { [int]$_.ProcessId })
-    if (@($listeners | Where-Object { [int]$_.OwningProcess -notin $ids }).Count -gt 0) {
-      throw '桥接端口由外部服务持有，保留现有服务。'
-    }
-    $health=Get-LinkApi '/health'
-    if (-not $health -or -not $health.ok -or $health.runtime.mode -ne 'desktop') {
-      throw '8787 已被占用或桥接模式不同；安全修复保留现场，请查看日志。'
+  # Cheap-first occupancy gate: a 200ms loopback TcpClient connect resolves a
+  # free port without paying the cold Get-NetTCPConnection/WMI ownership scan.
+  # The full refusal semantics only run when something actually listens.
+  $portOccupied=$false
+  try {
+    $probeClient=[Net.Sockets.TcpClient]::new()
+    try { $portOccupied=[bool]$probeClient.ConnectAsync('127.0.0.1',$BridgePort).Wait(200) }
+    finally { $probeClient.Dispose() }
+  } catch { $portOccupied=$false } # Refused connect = free port.
+  if ($portOccupied) {
+    # Refuse a runtime conversion or an unknown port owner instead of silently stopping it.
+    $listeners=@(Get-NetTCPConnection -State Listen -LocalPort $BridgePort -ErrorAction SilentlyContinue)
+    if ($listeners.Count -gt 0) {
+      $owned=@(Get-MobileLinkOwnedProcesses -Repo $repo -Processes @(Get-CimInstance Win32_Process))
+      $ids=@($owned | ForEach-Object { [int]$_.ProcessId })
+      if (@($listeners | Where-Object { [int]$_.OwningProcess -notin $ids }).Count -gt 0) {
+        throw '桥接端口由外部服务持有，保留现有服务。'
+      }
+      $health=Get-LinkApi '/health'
+      if (-not $health -or -not $health.ok -or $health.runtime.mode -ne 'desktop') {
+        throw '8787 已被占用或桥接模式不同；安全修复保留现场，请查看日志。'
+      }
     }
   }
   # Guardian follows persisted intent; it must never turn a concurrent manual
@@ -265,15 +585,32 @@ function Start-Link {
     if (-not (Test-GuardianRepairAllowed)) { return }
   } else { Set-MobileLinkDesiredState -Repo $repo -State running }
   Set-LinkEnvironment
+  if (Get-Command Set-LinkOperationPhase -ErrorAction SilentlyContinue) { Set-LinkOperationPhase 'starting_services' }
   Write-LinkEvent 'starting-stack-with-desktop-protected'
   New-Item -ItemType Directory -Force -Path (Join-Path $repo 'logs\startup') | Out-Null
   # Bootstrap bridge separately; only explicit Repair -RestartDesktop may restart the official desktop.
   if ($GuardianRepair -and -not (Test-GuardianRepairAllowed)) { return }
-  $startup=Start-MobileLinkDetached -HostPath (Get-Process -Id $PID).Path -ScriptPath (Join-Path $repo 'scripts\start-codex-mobile-stack.ps1') -Arguments @('-BridgePort',"$BridgePort",'-SkipCodexDesktop','-KeepExistingCodex') -LogPath (Join-Path $repo 'logs\startup\manager-start.log') -WorkingDirectory $repo
-  try { if($GuardianRepair){if(-not $startup.WaitForExit(90000)){throw 'Guardian bootstrap timeout'}}else{$startup.WaitForExit()}; Write-LinkEvent ('startup-exit='+$startup.ExitCode); if ($startup.ExitCode -notin @(0,2)) { throw '链路启动脚本未成功完成，请查看启动日志。' } }
+  if ($Action -eq 'Start' -and -not $GuardianRepair) {
+    # Fast start: launch the node bridge directly and hand watchdog/voice/HDC
+    # work to the stack's Background sub-phase, skipping the Phase All pwsh hop
+    # entirely. Desktop soft recovery is triggered as soon as the bridge
+    # answers, so it overlaps with the background track instead of waiting.
+    Write-LinkEvent 'bridge-direct-launch'
+    $bridge=Start-LinkBridgeProcess
+    try { Start-LinkBackgroundTrack -RuntimeMode ([string]$env:CODEX_BRIDGE_RUNTIME_MODE) }
+    catch { Write-LinkEvent ('background-track-fork-failed type='+$_.Exception.GetType().Name) }
+    try { Complete-LinkFastStart -Startup $bridge } finally { $bridge.Dispose() }
+    Ensure-LinkMonitors
+    return
+  }
+  $startupArguments=Get-LinkBootstrapArguments @('-BridgePort',"$BridgePort",'-SkipCodexDesktop','-KeepExistingCodex')
+  $startup=Start-MobileLinkDetached -HostPath (Get-Process -Id $PID).Path -ScriptPath (Join-Path $repo 'scripts\start-codex-mobile-stack.ps1') -Arguments $startupArguments -LogPath (Join-Path $repo 'logs\startup\manager-start.log') -WorkingDirectory $repo
+  try { if(-not $startup.WaitForExit(90000)){throw 'Bootstrap timeout'}; Write-LinkEvent ('startup-exit='+$startup.ExitCode); if ($startup.ExitCode -notin @(0,2)) { throw '链路启动脚本未成功完成，请查看启动日志。' } }
   finally { $startup.Dispose() }
   Write-LinkEvent 'startup-returned'
   if ($GuardianRepair -and -not (Test-GuardianRepairAllowed)) { return }
+  if (Test-MobileLinkPaused $repo) { throw 'Operation cancelled by Stop' }
+  if (Get-Command Set-LinkOperationPhase -ErrorAction SilentlyContinue) { Set-LinkOperationPhase 'connecting_desktop' }
   # Exit 2 means dependencies are not ready yet, not a fatal bootstrap error.
   # Resolve the desktop dependency synchronously before collecting final status.
   $script:desktopRecovery=if ($Action -eq 'Repair' -and $RestartDesktop) { Invoke-DesktopRepair } else { Invoke-DesktopSafeRecovery }
@@ -312,9 +649,37 @@ function Test-GuardianRepairAllowed {
     return $config.enabled -eq $true -and (-not $RestartDesktop -or $config.allowForceRestart -eq $true)
   } catch { return $false }
 }
+function Get-GuardianVoiceRepairComponents {
+  param([string[]]$Requested)
+  $process=$null
+  try {
+    $voice=Get-MobileVoiceTunnelStatus $repo
+    $info=[Diagnostics.ProcessStartInfo]::new((Get-Command node -ErrorAction Stop).Source)
+    $info.UseShellExecute=$false;$info.CreateNoWindow=$true
+    $info.RedirectStandardOutput=$true;$info.RedirectStandardError=$true
+    $info.StandardOutputEncoding=[Text.Encoding]::UTF8
+    $info.StandardErrorEncoding=[Text.Encoding]::UTF8
+    $diagnosticScript=Join-Path $repo 'tools\windows\mobile-link-diagnostics.mjs'
+    $info.Arguments='"'+$diagnosticScript+'" --port '+$BridgePort+' --voice-repair-json --voice-state "'+$voice.state+'"'
+    $process=[Diagnostics.Process]::Start($info)
+    $stdout=$process.StandardOutput.ReadToEndAsync();$stderr=$process.StandardError.ReadToEndAsync()
+    if(-not $process.WaitForExit(35000)){$process.Kill();throw 'Voice recheck timed out'}
+    if($process.ExitCode -ne 0){throw 'Voice recheck failed'}
+    $fresh=$stdout.Result | ConvertFrom-Json
+    $signals=Get-LinkValue $fresh 'guardianSignals'
+    $faults=Get-LinkValue $signals 'faults'
+    if($null -eq $faults -or @($faults | Where-Object { (Get-LinkValue $_ 'repairable') -ne $true }).Count){return}
+    foreach($component in $Requested){
+      $id=if($component -eq 'voice'){'voice_transport'}else{'voice_tunnel'}
+      $kind=if($component -eq 'voice'){'local_service'}else{'transport'}
+      if(@($faults | Where-Object { (Get-LinkValue $_ 'id') -eq $id -and (Get-LinkValue $_ 'component') -eq $component -and (Get-LinkValue $_ 'kind') -eq $kind }).Count){$component}
+    }
+  } catch { Write-LinkEvent 'guardian-voice-recheck-unconfirmed; preserving services' }
+  finally { if($process){$process.Dispose()} }
+}
 function Invoke-GuardianScopedRepair {
   New-Item -ItemType Directory -Force -Path (Join-Path $repo 'logs\startup') | Out-Null
-  $components=@($GuardianComponents -split ',' | Where-Object { $_ -in @('bridge','desktop','sessions','companion','public','voice') })
+  $components=@($GuardianComponents -split ',' | Where-Object { $_ -in @('bridge','desktop','sessions','companion','public','voice','voice_tunnel') })
   if (-not (Test-GuardianRepairAllowed)) { return }
   if ($GuardianStage -eq 'restart_services') {
     if ('bridge' -in $components) {
@@ -326,7 +691,8 @@ function Invoke-GuardianScopedRepair {
       Stop-MobileLinkOwnedProcesses -Repo $repo -Roles @('bridge','bridge-host') | Out-Null
       if (-not (Test-GuardianRepairAllowed)) { return }
       Set-LinkEnvironment
-      $startup=Start-MobileLinkDetached -HostPath (Get-Process -Id $PID).Path -ScriptPath (Join-Path $repo 'scripts\start-codex-mobile-stack.ps1') -Arguments @('-BridgePort',"$BridgePort",'-SkipCodexDesktop','-KeepExistingCodex','-SkipHdcRelay') -LogPath (Join-Path $repo 'logs\startup\guardian-bridge-repair.log') -WorkingDirectory $repo
+      $startupArguments=Get-LinkBootstrapArguments @('-BridgePort',"$BridgePort",'-SkipCodexDesktop','-KeepExistingCodex','-SkipHdcRelay')
+      $startup=Start-MobileLinkDetached -HostPath (Get-Process -Id $PID).Path -ScriptPath (Join-Path $repo 'scripts\start-codex-mobile-stack.ps1') -Arguments $startupArguments -LogPath (Join-Path $repo 'logs\startup\guardian-bridge-repair.log') -WorkingDirectory $repo
       try { if (-not $startup.WaitForExit(90000) -or $startup.ExitCode -notin @(0,2)) { throw 'Bridge bootstrap failed or timed out' } } finally { $startup.Dispose() }
     }
     if ('public' -in $components -and (Test-GuardianRepairAllowed)) {
@@ -335,12 +701,22 @@ function Invoke-GuardianScopedRepair {
       $proxy=Start-MobileLinkDetached -HostPath (Get-Process -Id $PID).Path -ScriptPath (Join-Path $repo 'tools\harmony\start-hdc-relay.ps1') -Arguments @('-Mode','BridgeProxy') -LogPath (Join-Path $repo 'logs\startup\guardian-public-repair.log') -WorkingDirectory $repo
       $proxy.Dispose()
     }
-    if ('voice' -in $components -and (Test-GuardianRepairAllowed)) {
-      # The bridge supervisor recreates only its managed voice child on exit;
-      # a local media-service fault must not be mistaken for just an SSH fault.
+  }
+  $requestedVoice=@($components | Where-Object { $_ -in @('voice','voice_tunnel') })
+  if($requestedVoice.Count -and (Test-GuardianRepairAllowed)){
+    # Queued faults can already be healthy. A fresh, scoped probe is required
+    # before stopping anything; unknown/auth/upstream failures preserve services.
+    $confirmed=@(Get-GuardianVoiceRepairComponents -Requested $requestedVoice)
+    if('voice' -in $confirmed -and $GuardianStage -eq 'restart_services' -and (Test-GuardianRepairAllowed)){
+      Write-LinkEvent 'guardian-voice-repair stopping-media; local-fault-reconfirmed'
       Stop-MobileLinkOwnedProcesses -Repo $repo -Roles @('voice') | Out-Null
-      Stop-MobileVoiceTunnel $repo
-      if (Test-GuardianRepairAllowed) { Ensure-MobileVoiceTunnel $repo }
+    }
+    if('voice_tunnel' -in $confirmed -and (Test-GuardianRepairAllowed)){
+      if($GuardianStage -eq 'restart_services'){
+        Write-LinkEvent 'guardian-voice-repair restarting-tunnel; media-preserved'
+        Stop-MobileVoiceTunnel $repo -CanStop { Test-GuardianRepairAllowed }
+      }
+      if(Test-GuardianRepairAllowed){Ensure-MobileVoiceTunnel $repo -CanStart { Test-GuardianRepairAllowed }}
     }
   }
   if (@($components | Where-Object { $_ -in @('desktop','sessions','companion') }).Count -and (Test-GuardianRepairAllowed)) {
@@ -348,9 +724,36 @@ function Invoke-GuardianScopedRepair {
   }
 }
 try {
+  # 托盘预热握手：-StandbyFile 由托盘在 exe 初始化时传入，此时本进程已完成
+  # pwsh 冷启动与脚本解析（真正的预热），等待托盘探测结论——go 则按正常
+  # Start 继续，abort/超时则无副作用退出。认领 operation、互斥闸门、状态
+  # 写入等一切副作用都发生在本块之后，超时路径零痕迹。
+  if ($StandbyFile -and $Action -eq 'Start') {
+    $standbyDeadline=[datetime]::UtcNow.AddSeconds(6)
+    $standbyGo=$false
+    while ([datetime]::UtcNow -lt $standbyDeadline) {
+      if (Test-Path -LiteralPath $StandbyFile) {
+        $standbyContent=((Get-Content -Raw -LiteralPath $StandbyFile -ErrorAction SilentlyContinue) -replace '\s','')
+        # 只认终值：空/半截内容是与托盘 WriteAllText 并发首读的瞬态，
+        # 继续轮询等终值，避免误判 abort 白吃一次托盘 25s 兜底。
+        if ($standbyContent -eq 'go') { $standbyGo=$true; break }
+        if ($standbyContent -eq 'abort') { break }
+      }
+      Start-Sleep -Milliseconds 100
+    }
+    if (-not $standbyGo) { Write-LinkEvent 'standby-abort'; exit 0 }
+    Remove-Item -LiteralPath $StandbyFile -ErrorAction SilentlyContinue
+    Write-LinkEvent 'standby-go'
+  }
   # Persist manual intent before waiting for any in-flight repair. Its next
   # irreversible boundary will observe the stop even while holding the gate.
-  if ($Action -eq 'Stop') { Set-MobileLinkDesiredState -Repo $repo -State stopped }
+  if ($Action -eq 'Stop') {
+    Set-MobileLinkDesiredState -Repo $repo -State stopped
+    if (Get-Command Get-MobileLinkOperation -ErrorAction SilentlyContinue) {
+      $cancelled=Get-MobileLinkOperation $repo
+      if ($cancelled -and $cancelled.active) { Set-MobileLinkOperation -Repo $repo -OperationId $cancelled.operationId -Phase failed | Out-Null }
+    }
+  }
   if ($Action -eq 'GuardianRepair') {
     $GuardianRepair=$true
     if ($GuardianStage -eq 'restart_desktop') { $Action='Repair'; $RestartDesktop=$true }
@@ -358,7 +761,12 @@ try {
   if ($GuardianRepair -and -not (Test-GuardianRepairAllowed)) { @{skipped=$true;reason='guardian_disabled_or_paused'} | ConvertTo-Json -Compress; return }
   if ($Action -eq 'Repair' -and $RestartDesktop -and -not $ScheduledRepairWorker) {
     . (Join-Path $PSScriptRoot 'mobile-link-repair-task.ps1')
-    $operation=Start-MobileLinkRepairTask -Repo $repo -BridgePort $BridgePort -GuardianRepair:$GuardianRepair
+    $operation=Start-MobileLinkRepairTask -Repo $repo -BridgePort $BridgePort -GuardianRepair:$GuardianRepair -GuardianComponents $GuardianComponents
+    if ($operation.joined -and $operation.action -ne 'Repair') {
+      $joined=Wait-LinkOperation $operation.runId
+      [pscustomobject]@{action=$Action;operationId=$joined.operationId;startupOutcome=@{state=$joined.phase;exitCode=$(if($joined.phase -eq 'ready'){0}else{2});message=$joined.message}} | ConvertTo-Json -Depth 6 -Compress
+      if ($joined.phase -ne 'ready') { exit 2 }; return
+    }
     $deadline=[datetime]::UtcNow.AddSeconds(240)
     do {
       if (Test-Path -LiteralPath $operation.resultPath) {
@@ -370,11 +778,32 @@ try {
       }
       Start-Sleep -Seconds 1
     } while ([datetime]::UtcNow -lt $deadline)
-    throw 'Independent repair is still running; inspect desktop-repair-worker.json.'
+    $current=Get-MobileLinkOperation $repo
+    [pscustomobject]@{action=$Action;operationId=$operation.runId;startupOutcome=@{state=$(if($current -and $current.operationId -eq $operation.runId){$current.phase}else{'pending'});exitCode=2;message='独立修复任务仍在后台执行，请查看操作进度。'}} | ConvertTo-Json -Depth 6 -Compress
+    exit 2
+  }
+  if ($Action -in @('Start','Repair')) {
+    if ($OperationId) {
+      $current=Get-MobileLinkOperation $repo
+      if (-not $current -or $current.operationId -ne $OperationId -or -not $current.active) { throw 'Scheduled operation no longer owns progress' }
+      $script:linkOperationId=$OperationId
+    } else {
+      $claim=New-MobileLinkOperation -Repo $repo -Action $Action
+      if ($claim.joined) {
+        $joined=Wait-LinkOperation $claim.operation.operationId
+        [pscustomobject]@{action=$Action;operationId=$joined.operationId;startupOutcome=@{state=$joined.phase;exitCode=$(if($joined.phase -eq 'ready'){0}else{2});message=$joined.message}} | ConvertTo-Json -Depth 6 -Compress
+        if ($joined.phase -ne 'ready') { exit 2 }; return
+      }
+      $script:linkOperationId=$claim.operation.operationId
+    }
+    Set-LinkOperationPhase 'checking'
   }
   if ($Action -ne 'Status') {
     $waitMs=15000
     if ($Action -eq 'Maintain') { $waitMs=0 }
+    # Stop has already published cancellation. Give bounded launchers time to
+    # observe it, then clean up any service started immediately before Stop.
+    if ($Action -eq 'Stop') { $waitMs=180000 }
     try { $owns=$gate.WaitOne($waitMs) } catch [Threading.AbandonedMutexException] { $owns=$true }
     if (-not $owns -and $Action -eq 'Maintain') { Get-LinkStatus | ConvertTo-Json -Depth 6 -Compress; return }
     if (-not $owns) { throw '另一项链路管理操作正在进行，请稍后重试。' }
@@ -396,7 +825,12 @@ try {
       @{reloaded=$true} | ConvertTo-Json -Compress; return
     }
     'GuardianRepair' { Invoke-GuardianScopedRepair; @{accepted=$true;stage=$GuardianStage} | ConvertTo-Json -Compress; return }
-    'Maintain' { Ensure-LinkMonitors }
+    'Maintain' {
+      Ensure-LinkMonitors
+      # Only monitor mutations need the lifecycle gate. Slow read-only status
+      # probes must not make a foreground Start/Repair exhaust its lock wait.
+      if ($owns) { $gate.ReleaseMutex(); $owns=$false }
+    }
     'Start' { Start-Link }
     'Repair' { Start-Link }
     'Stop' {
@@ -422,7 +856,37 @@ try {
     }
   }
   Write-LinkEvent 'collecting-status'
-  $status=Get-LinkStatus
+  if ($Action -in @('Start','Repair')) { Set-LinkOperationPhase 'verifying' }
+  # Fast Start already verified readiness through the probe loop; its snapshot
+  # carries synthesized checks so the shared tail below stays untouched.
+  $status=if ($script:fastStartStatus) { $script:fastStartStatus } else { Get-LinkStatus }
+  # A detached desktop launcher may outlive its initial wait. Keep only read-only
+  # verification alive; never issue another restart while it is pending.
+  if (-not $script:fastStartStatus -and $Action -in @('Start','Repair') -and (Get-LinkValue $script:desktopRecovery 'state' '') -eq 'pending') {
+    Set-LinkOperationPhase 'pending'
+    # Cheap-first polling: only escalate to the full status probe when the quick
+    # signal says the link may be ready, the quick signal jumped, or the operation
+    # deadline is near. Terminal detection still comes from the full status, so
+    # exit conditions and output stay identical to the previous every-round probe.
+    $quickSignature=''
+    do {
+      $pendingOutcome=Get-LinkStartupOutcome $status -RequireAssistant ($Action -eq 'Repair' -and $RestartDesktop)
+      if ($pendingOutcome.state -ne 'pending') { break }
+      if (Test-MobileLinkPaused $repo) { throw 'Operation cancelled by Stop' }
+      if ($GuardianRepair -and -not (Test-GuardianRepairAllowed)) { throw 'Guardian operation cancelled' }
+      Start-Sleep -Seconds 2
+      Set-LinkOperationPhase 'pending'
+      $quick=Get-LinkQuickProbe
+      $quickSignatureNew='health='+$quick.healthOk+';desktop='+$quick.desktopLive+';phase='+$quick.phase+';message='+$quick.message
+      $quickReady=$quick.healthOk -and $quick.desktopLive
+      $quickDeadlineNear=($null -eq $quick.remainingSeconds) -or $quick.remainingSeconds -le 20
+      if ($quickReady -or $quickDeadlineNear -or $quickSignatureNew -ne $quickSignature) {
+        $quickSignature=$quickSignatureNew
+        $status=Get-LinkStatus
+      }
+    } while ($true)
+    Set-LinkOperationPhase 'verifying'
+  }
   # A freshly opened desktop may still be loading the assistant module. Retry
   # readback only; never repeat the restart just because the first read timed out.
   if ($Action -eq 'Repair' -and $RestartDesktop) {
@@ -436,9 +900,11 @@ try {
   }
   $resultCode=0
   if ($Action -in @('Start','Repair')) {
-    $outcome=Get-LinkStartupOutcome $status -RequireAssistant ($Action -eq 'Repair' -and $RestartDesktop)
+    $outcome=if ($script:fastStartOutcome) { $script:fastStartOutcome } else { Get-LinkStartupOutcome $status -RequireAssistant ($Action -eq 'Repair' -and $RestartDesktop) }
     $status | Add-Member -NotePropertyName startupOutcome -NotePropertyValue $outcome
     $resultCode=$outcome.exitCode
+    $phase=if($outcome.state -in @('ready','partial','pending')){$outcome.state}else{'failed'}
+    Set-LinkOperationPhase $phase
     Write-LinkEvent ('startup-outcome='+$outcome.state)
     $status | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $repo 'logs\state\mobile-link-status.json') -Encoding utf8
   }
@@ -446,6 +912,9 @@ try {
   Write-LinkEvent 'completed'
   if ($resultCode -ne 0) { exit $resultCode }
 } catch {
+  if ($script:linkOperationId) {
+    try { Set-MobileLinkOperation -Repo $repo -OperationId $script:linkOperationId -Phase failed | Out-Null } catch { }
+  }
   Write-LinkEvent ('failed type='+$_.Exception.GetType().Name+' line='+$_.InvocationInfo.ScriptLineNumber)
   # Avoid writing exception details which can contain authenticated URLs or response data.
   [pscustomobject]@{ error='链路操作未完成：端口、模式、配置或操作互斥检查未通过。请打开日志目录检查。'; action=$Action } | ConvertTo-Json -Compress

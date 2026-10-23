@@ -1,6 +1,7 @@
 ﻿[CmdletBinding()]
 param(
-  [ValidateSet('Status','Enable','Disable','Ensure','Run')][string]$Action='Status',
+  [ValidateSet('Status','Enable','Disable','SetPolicy','Ensure','Run')][string]$Action='Status',
+  [ValidateSet('Preserve','Allow','Deny')][string]$RestartPolicy='Preserve',
   [ValidateRange(1,65535)][int]$BridgePort=8787,
   [switch]$Once
 )
@@ -34,17 +35,21 @@ function Write-GuardianJson([string]$Path,$Object) {
 }
 function Get-GuardianConfig { Read-GuardianJson $configPath ([pscustomobject]@{version=1;enabled=$false;allowForceRestart=$false;updatedAt=$null}) }
 function Set-GuardianConfig {
-  param([bool]$Enabled,[string]$ExpectedUpdatedAt='')
+  param([Nullable[bool]]$Enabled=$null,[string]$ExpectedUpdatedAt='',
+    [ValidateSet('Preserve','Allow','Deny')][string]$Policy='Preserve')
   $gate=New-MobileLinkMutex ($repo+'\guardian-config');$owns=$false
   try {
     try {$owns=$gate.WaitOne(1000)}catch [Threading.AbandonedMutexException]{$owns=$true}
     if(-not $owns){throw 'Guardian config busy'}
+    $config=Get-GuardianConfig
     if($ExpectedUpdatedAt){
-      $current=Value (Get-GuardianConfig) 'updatedAt'
+      $current=Value $config 'updatedAt'
       if(-not $current -or ([datetimeoffset]$current).UtcTicks -ne ([datetimeoffset]$ExpectedUpdatedAt).UtcTicks){return $null}
     }
+    $enabledValue=if($null -eq $Enabled){(Value $config 'enabled' $false) -eq $true}else{[bool]$Enabled}
+    $forceValue=if($Policy -eq 'Preserve'){(Value $config 'allowForceRestart' $false) -eq $true}else{$Policy -eq 'Allow'}
     $updated=[datetime]::UtcNow.ToString('o')
-    Write-GuardianJson $configPath @{version=1;enabled=$Enabled;allowForceRestart=$true;updatedAt=$updated}
+    Write-GuardianJson $configPath @{version=1;enabled=$enabledValue;allowForceRestart=$forceValue;updatedAt=$updated}
     $updated
   }finally{if($owns){$gate.ReleaseMutex()};$gate.Dispose()}
 }
@@ -64,7 +69,7 @@ function Get-GuardianStatus {
   }
   # Return a fixed public shape; internal counters, paths, errors and credentials
   # never cross the CLI/API boundary.
-  [pscustomobject]@{version=1;enabled=$enabled;phase=$phase;summary=$summary
+  [pscustomobject]@{version=1;enabled=$enabled;allowForceRestart=((Value $config 'allowForceRestart' $false) -eq $true);phase=$phase;summary=$summary
     checkedAt=(Value $saved 'checkedAt');heartbeatAt=(Value $saved 'heartbeatAt');lastSuccessAt=(Value $saved 'lastSuccessAt');lastRepairAt=(Value $saved 'lastRepairAt')
     attempts=[int](Value $saved 'attempts' 0);nextCheckAt=(Value $saved 'nextCheckAt')
     faults=@(Value $saved 'faults' @());history=@(Value $saved 'history' @())}
@@ -134,7 +139,7 @@ function Ensure-GuardianWatchers {
 $script:workerStatus=$null
 try {
   if ($Action -in @('Enable','Disable')) {
-    $pending=Set-GuardianConfig -Enabled $false
+    $pending=Set-GuardianConfig -Enabled $false -Policy $RestartPolicy
     if($Action -eq 'Enable'){
       # Complete the old-watcher handoff before committing enabled=true. Leave
       # the config mutex free so a concurrent Disable can cancel this request.
@@ -146,6 +151,7 @@ try {
       Write-GuardianJson $statusPath $fresh
     }
   }
+  if ($Action -eq 'SetPolicy') { $null=Set-GuardianConfig -Policy $RestartPolicy }
   if ($Action -eq 'Ensure' -and (Value (Get-GuardianConfig) 'enabled' $false) -eq $true) {
     try { Ensure-GuardianWatchers } catch { $null=Set-GuardianConfig -Enabled $false; throw }
   }

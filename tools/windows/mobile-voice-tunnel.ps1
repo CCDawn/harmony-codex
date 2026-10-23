@@ -79,8 +79,64 @@ function Get-MobileVoiceTunnelTask {
   $task
 }
 
+function Get-MobileVoiceTunnelProcessEvidence {
+  param([object]$Config,[string]$Repo,[switch]$OwnersOnly)
+  $ownerRunning=$false
+  $transportConnected=$false
+  $owners=@()
+  try {
+    $processes=@(Get-CimInstance Win32_Process -ErrorAction Stop)
+    # Match the real -File argument, including the quoted switches emitted by
+    # the managed runner. A path mentioned inside -Command is not ownership.
+    $switches='(?:\s+"?-(?:NoProfile|NonInteractive|NoLogo)"?|\s+"?-ExecutionPolicy"?\s+"?Bypass"?|\s+"?-WindowStyle"?\s+"?Hidden"?)*'
+    $invocation='(?i)^\s*(?:"[^"]+"|\S+)'+$switches+'\s+"?-File"?\s+(?:"([^"]+)"|(\S+))'
+    $owners=@(foreach ($process in $processes) {
+      if ([string]$process.Name -notin @('powershell.exe','pwsh.exe')) { continue }
+      $file=[regex]::Match([string]$process.CommandLine,$invocation+'\s*$')
+      $scriptPath=$file.Groups[1].Value
+      if (-not $scriptPath) { $scriptPath=$file.Groups[2].Value }
+      if ($file.Success -and $scriptPath -and
+          [IO.Path]::GetFullPath($scriptPath) -ieq $Config.ScriptPath) {
+        $creationDate=$null
+        if ($null -ne $process.PSObject.Properties['CreationDate']) { $creationDate=$process.CreationDate }
+        # Copy identity fields: callers must not rely on a mutable/live CIM view
+        # when they later re-read a PID before terminating an owned supervisor.
+        [pscustomobject]@{ProcessId=[int]$process.ProcessId;CreationDate=$creationDate;Name=[string]$process.Name;CommandLine=[string]$process.CommandLine}
+      }
+    })
+    $supervisorIds=@($owners | ForEach-Object { $_.ProcessId })
+    $ownerRunning=$supervisorIds.Count -gt 0
+    if ($OwnersOnly) { return [pscustomobject]@{ownerRunning=$ownerRunning;owners=$owners;transportConnected=$false;observed=$true} }
+    # The installed wrapper can live outside this checkout. The runner belongs
+    # to this repository and must be a direct child of that exact wrapper.
+    $runnerPath=[IO.Path]::GetFullPath((Join-Path $Repo 'tools\harmony\run-voice-tunnel.ps1'))
+    $runnerArguments='(?:\s+"?-(?:ConfigPath|LogPath)"?\s+(?:"[^"]+"|\S+))*\s*$'
+    $runnerIds=@(foreach ($process in $processes) {
+      if ([int]$process.ParentProcessId -notin $supervisorIds -or
+          [string]$process.Name -notin @('powershell.exe','pwsh.exe')) { continue }
+      $file=[regex]::Match([string]$process.CommandLine,$invocation+$runnerArguments)
+      $scriptPath=$file.Groups[1].Value
+      if (-not $scriptPath) { $scriptPath=$file.Groups[2].Value }
+      if ($file.Success -and $scriptPath -and
+          [IO.Path]::GetFullPath($scriptPath) -ieq $runnerPath) { [int]$process.ProcessId }
+    })
+    foreach ($ssh in $processes) {
+      if ([string]$ssh.Name -ine 'ssh.exe' -or
+          [int]$ssh.ParentProcessId -notin (@($supervisorIds)+@($runnerIds))) { continue }
+      $connections=@(Get-NetTCPConnection -State Established -OwningProcess ([int]$ssh.ProcessId) -ErrorAction Stop)
+      if ($connections.Count -gt 0) { $transportConnected=$true;break }
+    }
+    [pscustomobject]@{ownerRunning=$ownerRunning;owners=$owners;transportConnected=$transportConnected;observed=$true}
+  } catch {
+    # Retain a verified owner even when socket inspection fails. Starting the
+    # task again would duplicate that supervisor rather than repair transport.
+    [pscustomobject]@{ownerRunning=$ownerRunning;owners=$owners;transportConnected=$false;observed=$false}
+  }
+}
+
 function Get-MobileVoiceTunnelForwardEvidence {
-  param([object]$Config)
+  param([object]$Config,[string]$Repo)
+  $processEvidence=Get-MobileVoiceTunnelProcessEvidence $Config $Repo
   $logPath=Join-Path (Split-Path -Parent $Config.ScriptPath) 'tunnel.log'
   $stream=$null
   $lastConnect=$false
@@ -88,7 +144,7 @@ function Get-MobileVoiceTunnelForwardEvidence {
   $lastExitCode=0
   $lastForwardEvent=$null
   try {
-    if (-not (Test-Path -LiteralPath $logPath)) { return [pscustomobject]@{running=$false;transportConnected=$false;state='unverified';message='计划任务在运行，但隧道日志不可用，无法确认 SSH 转发状态'} }
+    if (-not (Test-Path -LiteralPath $logPath)) { return [pscustomobject]@{running=$false;ownerRunning=$processEvidence.ownerRunning;transportConnected=$processEvidence.transportConnected;state='unverified';message='隧道日志不可用，无法确认 SSH 转发状态'} }
     $stream=[IO.FileStream]::new($logPath,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::ReadWrite)
     # Read line by line with bounded memory. A fixed tail can drop the
     # supervisor's connect and OpenSSH's forward-success lines during a long
@@ -121,55 +177,26 @@ function Get-MobileVoiceTunnelForwardEvidence {
       }
     } finally { $reader.Dispose() }
   } catch {
-    return [pscustomobject]@{running=$false;transportConnected=$false;state='unverified';message='隧道日志不可读取，无法确认 SSH 转发状态'}
+    return [pscustomobject]@{running=$false;ownerRunning=$processEvidence.ownerRunning;transportConnected=$processEvidence.transportConnected;state='unverified';message='隧道日志不可读取，无法确认 SSH 转发状态'}
   } finally {
     if ($null -ne $stream) { $stream.Dispose() }
   }
   if ($lastForwardEvent -eq 'failed') {
-    return [pscustomobject]@{running=$false;transportConnected=$false;state='forward-failed';message='受管 SSH 远端端口转发被拒绝，可能有已有隧道占用；公网语音可用性需另行验证'}
+    return [pscustomobject]@{running=$false;ownerRunning=$processEvidence.ownerRunning;transportConnected=$processEvidence.transportConnected;state='forward-failed';message='受管 SSH 远端端口转发被拒绝，可能有已有隧道占用；公网语音可用性需另行验证'}
   }
   if ($lastExitAfterConnect -and $lastExitCode -ne 0) {
-    return [pscustomobject]@{running=$false;transportConnected=$false;state='connection-failed';message='SSH 隧道连接或转发失败，请检查隧道日志'}
+    return [pscustomobject]@{running=$false;ownerRunning=$processEvidence.ownerRunning;transportConnected=$processEvidence.transportConnected;state='connection-failed';message='SSH 隧道连接或转发失败，请检查隧道日志'}
   }
   $forwardConfirmed=$lastConnect -and -not $lastExitAfterConnect -and $lastForwardEvent -eq 'success'
 
   # A live task or SSH socket alone is insufficient. Only an explicit OpenSSH remote
   # forward success record for port 18787, paired with the bound supervisor's active
   # SSH transport, verifies forwarding.
-  try {
-    $processes=@(Get-CimInstance Win32_Process -ErrorAction Stop)
-    $supervisorIds=@(foreach ($process in $processes) {
-      if ([IO.Path]::GetFileName([string]$process.Name) -notin @('powershell.exe','pwsh.exe')) { continue }
-      $file=[regex]::Match([string]$process.CommandLine,'(?i)(?:^|\s)-File\s+(?:"([^"]+)"|(\S+))')
-      $scriptPath=$file.Groups[1].Value
-      if (-not $scriptPath) { $scriptPath=$file.Groups[2].Value }
-      if ($file.Success -and $scriptPath -and
-          [IO.Path]::GetFullPath($scriptPath) -eq $Config.ScriptPath) { [int]$process.ProcessId }
-    })
-    # Current supervisors use one managed runner to stream readable SSH logs.
-    # Only its direct child is eligible; unrelated SSH processes are not adopted.
-    $runnerIds=@(foreach($process in $processes) {
-      if ([int]$process.ParentProcessId -in $supervisorIds -and
-          [string]$process.Name -in @('powershell.exe','pwsh.exe') -and
-          [string]$process.CommandLine -match '(?i)[\\/]run-voice-tunnel\.ps1(?:"|\s|$)') {
-        [int]$process.ProcessId
-      }
-    })
-    foreach ($supervisorId in @($supervisorIds)+@($runnerIds)) {
-      foreach ($ssh in $processes) {
-        if ([IO.Path]::GetFileName([string]$ssh.Name) -ne 'ssh.exe' -or
-            [int]$ssh.ParentProcessId -ne $supervisorId) { continue }
-        $connections=@(Get-NetTCPConnection -State Established -OwningProcess ([int]$ssh.ProcessId) -ErrorAction Stop)
-        if ($connections.Count -gt 0) {
-          if ($forwardConfirmed) { return [pscustomobject]@{running=$true;transportConnected=$true;state='Running';message='远端 SSH 转发已确认建立；实际通话尚未验证'} }
-          return [pscustomobject]@{running=$false;transportConnected=$true;state='unverified';message='SSH 连接已建立，但远端端口转发尚未验证'}
-        }
-      }
-    }
-  } catch {
-    return [pscustomobject]@{running=$false;transportConnected=$false;state='unverified';message='计划任务在运行，但无法确认 SSH 转发进程或连接状态'}
+  if ($processEvidence.transportConnected) {
+    if ($forwardConfirmed) { return [pscustomobject]@{running=$true;ownerRunning=$processEvidence.ownerRunning;transportConnected=$true;state='Running';message='远端 SSH 转发已确认建立；实际通话尚未验证'} }
+    return [pscustomobject]@{running=$false;ownerRunning=$processEvidence.ownerRunning;transportConnected=$true;state='unverified';message='SSH 连接已建立，但远端端口转发尚未验证'}
   }
-  [pscustomobject]@{running=$false;transportConnected=$false;state='unverified';message='计划任务在运行，但没有可确认的 SSH 转发连接'}
+  [pscustomobject]@{running=$false;ownerRunning=$processEvidence.ownerRunning;transportConnected=$false;state='unverified';message='没有可确认的 SSH 转发连接'}
 }
 
 function Get-MobileVoiceTunnelStatus {
@@ -180,9 +207,11 @@ function Get-MobileVoiceTunnelStatus {
     $task=Get-MobileVoiceTunnelTask $config
     if ($null -eq $task) { return [pscustomobject]@{configured=$true;available=$false;running=$false;taskRunning=$false;transportConnected=$false;state='Missing';taskState='Missing';taskName=$config.TaskName;message='已配置的语音隧道任务不存在'} }
     $taskState=[string]$task.State
-    if ($taskState -eq 'Running') {
-      $evidence=Get-MobileVoiceTunnelForwardEvidence $config
-      return [pscustomobject]@{configured=$true;available=$true;running=$evidence.running;taskRunning=$true;transportConnected=$evidence.transportConnected;state=$evidence.state;taskState=$taskState;taskName=$config.TaskName;message=$evidence.message}
+    if ($taskState -in @('Running','Ready')) {
+      $evidence=Get-MobileVoiceTunnelForwardEvidence $config $Repo
+      if ($taskState -eq 'Running' -or $evidence.ownerRunning) {
+        return [pscustomobject]@{configured=$true;available=$true;running=$evidence.running;taskRunning=($taskState -eq 'Running');transportConnected=$evidence.transportConnected;state=$evidence.state;taskState=$taskState;taskName=$config.TaskName;message=$evidence.message}
+      }
     }
     [pscustomobject]@{configured=$true;available=$true;running=$false;taskRunning=$false;transportConnected=$false;state=$taskState;taskState=$taskState;taskName=$config.TaskName;message="语音隧道任务未运行（$taskState）"}
   } catch {
@@ -191,16 +220,23 @@ function Get-MobileVoiceTunnelStatus {
 }
 
 function Ensure-MobileVoiceTunnel {
-  param([string]$Repo)
+  param([string]$Repo,[scriptblock]$CanStart=$null)
   if (Test-MobileLinkPaused $Repo) { return }
+  if ($null -ne $CanStart -and -not (& $CanStart)) { return }
   $config=Get-MobileVoiceTunnelConfig $Repo
   if ($null -eq $config) { return }
   $task=Get-MobileVoiceTunnelTask $config
   if ($null -eq $task) { throw 'Configured voice tunnel task is missing.' }
   if ([string]$task.State -eq 'Disabled') {
+    if (Test-MobileLinkPaused $Repo) { return }
+    if ($null -ne $CanStart -and -not (& $CanStart)) { return }
     Enable-ScheduledTask -TaskName $config.TaskName -TaskPath '\' | Out-Null
   }
   if ([string]$task.State -ne 'Running') {
+    $processEvidence=Get-MobileVoiceTunnelProcessEvidence $config $Repo -OwnersOnly
+    if ($processEvidence.ownerRunning -or -not $processEvidence.observed) { return }
+    if (Test-MobileLinkPaused $Repo) { return }
+    if ($null -ne $CanStart -and -not (& $CanStart)) { return }
     Start-ScheduledTask -TaskName $config.TaskName -TaskPath '\'
     $path=Join-Path $Repo 'logs\state\voice-tunnel-recovery.json'
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $path) | Out-Null
@@ -213,22 +249,57 @@ function Ensure-MobileVoiceTunnel {
   }
 }
 
+function Test-MobileVoiceTunnelSameOwner {
+  param([object]$Expected,[object]$Current)
+  if ($null -eq $Current -or $null -eq $Expected.CreationDate -or
+      $null -eq $Current.PSObject.Properties['CreationDate'] -or $null -eq $Current.CreationDate) { return $false }
+  try {
+    return [int]$Expected.ProcessId -eq [int]$Current.ProcessId -and
+      ([datetime]$Expected.CreationDate).ToUniversalTime() -eq ([datetime]$Current.CreationDate).ToUniversalTime() -and
+      [string]$Expected.Name -ieq [string]$Current.Name -and
+      [string]$Expected.CommandLine -ceq [string]$Current.CommandLine
+  } catch { return $false }
+}
+
 function Stop-MobileVoiceTunnel {
-  param([string]$Repo)
+  param([string]$Repo,[scriptblock]$CanStop=$null)
   $config=Get-MobileVoiceTunnelConfig $Repo
   if ($null -eq $config) { return }
   $task=Get-MobileVoiceTunnelTask $config
   if ($null -eq $task) { return }
+  $evidence=Get-MobileVoiceTunnelProcessEvidence $config $Repo -OwnersOnly
   $wasRunning=[string]$task.State -eq 'Running'
+  if ($null -ne $CanStop -and -not (& $CanStop)) { return }
   Disable-ScheduledTask -TaskName $config.TaskName -TaskPath '\' | Out-Null
   if ($wasRunning) {
+    if ($null -ne $CanStop -and -not (& $CanStop)) { return }
     Stop-ScheduledTask -TaskName $config.TaskName -TaskPath '\'
+  }
+  if (-not $evidence.observed) { throw 'Unable to inspect the bound voice tunnel supervisor.' }
+  foreach ($expected in $evidence.owners) {
+    if ($null -eq $expected.CreationDate) { throw 'Bound voice tunnel supervisor has no verifiable creation time.' }
+    $current=@(Get-CimInstance Win32_Process -Filter "ProcessId=$($expected.ProcessId)" -ErrorAction Stop)
+    if ($current.Count -eq 0) { continue }
+    if ($current.Count -ne 1 -or -not (Test-MobileVoiceTunnelSameOwner $expected $current[0])) {
+      throw 'Bound voice tunnel supervisor identity changed; refusing to stop the replacement process.'
+    }
+    if ($null -ne $CanStop -and -not (& $CanStop)) { return }
+    try {
+      # The managed kill-on-close job reaps the runner and SSH. Only the exact
+      # supervisor is stopped here; no name-based or broad child termination.
+      Stop-Process -Id ([int]$expected.ProcessId) -Force -ErrorAction Stop
+    } catch {
+      $afterStop=@(Get-CimInstance Win32_Process -Filter "ProcessId=$($expected.ProcessId)" -ErrorAction Stop)
+      if ($afterStop.Count -gt 0 -and (Test-MobileVoiceTunnelSameOwner $expected $afterStop[0])) { throw }
+    }
   }
   $deadline=[datetime]::UtcNow.AddSeconds(5)
   do {
     $current=Get-MobileVoiceTunnelTask $config
-    if ($null -eq $current -or [string]$current.State -ne 'Running') { return }
+    $remaining=Get-MobileVoiceTunnelProcessEvidence $config $Repo -OwnersOnly
+    if (-not $remaining.observed) { throw 'Unable to verify that the bound voice tunnel supervisor stopped.' }
+    if (($null -eq $current -or [string]$current.State -ne 'Running') -and -not $remaining.ownerRunning) { return }
     Start-Sleep -Milliseconds 100
   } while ([datetime]::UtcNow -lt $deadline)
-  throw 'Voice tunnel task did not stop.'
+  throw 'Voice tunnel task or bound supervisor did not stop.'
 }

@@ -11,6 +11,6 @@ if ([string]::IsNullOrWhiteSpace($OutputPath)) {
 }
 $OutputPath = [System.IO.Path]::GetFullPath($OutputPath)
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $OutputPath) | Out-Null
-& $compiler /nologo /target:winexe /optimize+ /reference:System.Drawing.dll /reference:System.Windows.Forms.dll /reference:System.Web.Extensions.dll "/win32icon:$trayIcon" "/out:$OutputPath" $source (Join-Path $PSScriptRoot 'UnifiedTrayContext.cs')
+& $compiler /nologo /target:winexe /optimize+ /reference:System.Drawing.dll /reference:System.Windows.Forms.dll /reference:System.Web.Extensions.dll "/win32icon:$trayIcon" "/out:$OutputPath" $source (Join-Path $PSScriptRoot 'UnifiedTrayContext.cs') (Join-Path $PSScriptRoot 'LinkStatusPresentation.cs') (Join-Path $PSScriptRoot 'LinkStatusForm.cs')
 if ($LASTEXITCODE -ne 0) { throw 'Tray build failed' }
 Write-Output $OutputPath

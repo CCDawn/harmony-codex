@@ -2,9 +2,52 @@ import fs from 'node:fs';
 import path from 'node:path';
 import http from 'node:http';
 import https from 'node:https';
+import os from 'node:os';
+import { execFile } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { generateTotp } from '../../src/totp.js';
+
+const RESOURCE_TIMEOUT_MS = 3000;
+const GiB = 1024 ** 3;
+
+// Only numeric memory counters leave this process. No process inventory or configuration is read.
+export async function readSystemResources({ platform = process.platform, execFileImpl = execFile,
+  freeMemory = os.freemem } = {}) {
+  if (platform !== 'win32') return { availablePhysicalBytes: freeMemory() };
+  const command = "$ErrorActionPreference='Stop'; $memory=Get-CimInstance -ClassName Win32_PerfFormattedData_PerfOS_Memory -Property CommitLimit,CommittedBytes,AvailableBytes; @{commitLimitBytes=[double]$memory.CommitLimit;commitAvailableBytes=([double]$memory.CommitLimit-[double]$memory.CommittedBytes);availablePhysicalBytes=[double]$memory.AvailableBytes}|ConvertTo-Json -Compress";
+  return new Promise((resolve, reject) => {
+    execFileImpl('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', command],
+      { windowsHide: true, timeout: RESOURCE_TIMEOUT_MS, maxBuffer: 4096, encoding: 'utf8' },
+      (error, stdout) => {
+        if (error) { reject(new Error('Resource probe unavailable')); return; }
+        try { resolve(JSON.parse(stdout.replace(/^\uFEFF/, '').trim())); }
+        catch { reject(new Error('Resource counters unavailable')); }
+      });
+  });
+}
+
+export async function inspectResources({ resourceProvider = readSystemResources,
+  timeoutMs = RESOURCE_TIMEOUT_MS } = {}) {
+  const unknown = { id: 'resources', title: '本机资源', state: 'unknown', message: '本机内存资源未确认，请稍后重试检测' };
+  let timer;
+  try {
+    const snapshot = await Promise.race([
+      Promise.resolve().then(resourceProvider),
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('Resource probe timed out')), Math.min(RESOURCE_TIMEOUT_MS, timeoutMs)); })
+    ]);
+    const { commitLimitBytes, commitAvailableBytes, availablePhysicalBytes } = snapshot || {};
+    const valid = value => typeof value === 'number' && Number.isFinite(value) && value >= 0;
+    if (!valid(availablePhysicalBytes)) return unknown;
+    const physical = `可用物理内存 ${(availablePhysicalBytes / GiB).toFixed(1)} GiB`;
+    if (!valid(commitLimitBytes) || commitLimitBytes === 0 || !valid(commitAvailableBytes)
+      || commitAvailableBytes > commitLimitBytes) return { ...unknown, message: `${physical}；内存提交额度未确认` };
+    const pressure = commitAvailableBytes < 2 * GiB || commitAvailableBytes / commitLimitBytes < 0.05;
+    return { id: 'resources', title: '本机资源', state: pressure ? 'waiting' : 'ready',
+      message: `${pressure ? '本机资源不足：' : ''}内存提交余量 ${(commitAvailableBytes / GiB).toFixed(1)} GiB（${(100 * commitAvailableBytes / commitLimitBytes).toFixed(1)}%），${physical}${pressure ? '；请减少并发或关闭不需要的应用' : ''}` };
+  } catch { return unknown; }
+  finally { clearTimeout(timer); }
+}
 
 // Read-only probes. Never return response bodies, credentials, assistant identifiers or raw errors.
 const FAST_PROBE_TIMEOUT_MS = 4000;
@@ -121,7 +164,7 @@ export async function inspectMobileLink({ baseUrl, headers = {}, getHeaders = ()
 
 // Connection-only probes never send an assistant message or start a voice call.
 export async function inspectGuardianExtras({ baseUrl, publicBaseUrl = '', getHeaders = () => ({}),
-  fetchImpl = fetch, localReady = false, timeoutMs = 6000, probeVoice = probeVoiceUpgrade } = {}) {
+  fetchImpl = fetch, localReady = false, timeoutMs = 6000, probeVoice = probeVoiceUpgrade, includeVoice = true } = {}) {
   const checks = [], faults = [];
   const voiceFault = (id, status, component, repairKind) => ({ id, component,
     kind: [401, 403].includes(status) ? 'auth' : [404, 405].includes(status) ? 'api_compatibility'
@@ -135,10 +178,11 @@ export async function inspectGuardianExtras({ baseUrl, publicBaseUrl = '', getHe
       return { status: response.status, ok: response.ok, body: response.ok ? await response.json() : null };
     } catch { return { status: 0, ok: false, body: null }; }
   }
-  const publicUrl = publicBaseUrl ? new URL(publicBaseUrl) : null;
+  let publicUrl = null;
+  try { publicUrl = publicBaseUrl ? new URL(publicBaseUrl) : null; } catch { /* Invalid configuration is reported below. */ }
   const validPublic = publicUrl && ['http:', 'https:'].includes(publicUrl.protocol)
     && !publicUrl.username && !publicUrl.password && !publicUrl.search && !publicUrl.hash;
-  if (publicUrl && !validPublic) {
+  if (publicBaseUrl && !validPublic) {
     faults.push({ id: 'public', kind: 'unknown', component: 'public', repairable: false });
     checks.push({ id: 'public', title: '手机公网入口', state: 'unknown', message: '公网入口配置需要检查' });
   } else if (validPublic) {
@@ -151,8 +195,10 @@ export async function inspectGuardianExtras({ baseUrl, publicBaseUrl = '', getHe
     if (!ready && localReady) faults.push({ id: 'public', kind: [401, 403].includes(publicRead.status) ? 'auth'
       : [0, 502, 503, 504].includes(publicRead.status) ? 'transport' : 'unknown',
       repairable: [0, 502, 503, 504].includes(publicRead.status), component: 'public' });
+  } else {
+    checks.push({ id: 'public', title: '手机公网入口', state: 'unknown', message: '未配置公网入口，手机网络状态以最近心跳为准' });
   }
-  if (localReady) {
+  if (includeVoice && localReady) {
     const voice = await read(baseUrl, '/voice/status');
     if (voice.ok && voice.body?.voice?.enabled === true) {
       const result = await probeVoice(baseUrl, await getHeaders(), timeoutMs);
@@ -171,6 +217,45 @@ export async function inspectGuardianExtras({ baseUrl, publicBaseUrl = '', getHe
     }
   }
   return { checks, faults };
+}
+
+export function inspectPhoneHeartbeat({ phone, now = Date.now(), recentMs = 120_000 } = {}) {
+  const lastSeenAt = typeof phone?.lastSeenAt === 'string' ? phone.lastSeenAt : '';
+  const at = Date.parse(lastSeenAt);
+  const age = now - at;
+  if (!Number.isFinite(at) || !Number.isFinite(age) || age < 0) {
+    return { id: 'phone_recent', title: '手机最近连接', state: 'unknown',
+      message: '尚无有效手机心跳；手机可能未打开应用，不能据此判断服务故障' };
+  }
+  const recent = age <= recentMs;
+  return { id: 'phone_recent', title: '手机最近连接', state: recent ? 'ready' : 'waiting',
+    message: recent ? '最近两分钟内收到手机心跳；当前操作仍需在手机确认'
+      : '手机心跳已过期；应用可能未打开或已进入后台，请打开手机应用复核' };
+}
+
+// Shared Status/guardian composition. Observational checks never authorize or veto recovery.
+export async function inspectMobileLinkStatus({ paused = false, guardianMode = false, voiceState,
+  phoneProvider = () => null, resourceProvider, now, ...probeOptions } = {}) {
+  const diagnostics = paused ? { checks: [], restartRequired: false }
+    : await inspectMobileLink({ ...probeOptions, collectSignals: guardianMode });
+  if (!paused) {
+    const localReady = ['bridge', 'desktop', 'sessions'].every(id => diagnostics.checks.some(check => check.id === id && check.state === 'ready'));
+    const [extras, resources] = await Promise.all([
+      inspectGuardianExtras({ ...probeOptions, timeoutMs: 6000, localReady, includeVoice: guardianMode }),
+      inspectResources({ resourceProvider })
+    ]);
+    let phone;
+    try { phone = await phoneProvider(); } catch { /* A missing heartbeat is not a repair reason. */ }
+    const phoneCheck = inspectPhoneHeartbeat({ phone, now: now ?? Date.now() });
+    diagnostics.checks.push(...extras.checks, phoneCheck, resources);
+    if (guardianMode) {
+      diagnostics.guardianSignals.faults.push(...extras.faults,
+        ...classifyVoiceTunnelFault({ voiceState, checks: diagnostics.checks }));
+      if (phoneCheck.state !== 'unknown') diagnostics.guardianSignals.phoneLastSeenAt = phone.lastSeenAt;
+    }
+  }
+  const voiceTunnel = { configured: !!voiceState && voiceState !== 'not-configured', running: voiceState === 'Running', state: voiceState };
+  return { ...diagnostics, ...summarizeMobileLink({ paused, checks: diagnostics.checks, voiceTunnel }) };
 }
 
 function probeVoiceUpgrade(baseUrl, headers, timeoutMs) {
@@ -195,14 +280,25 @@ function probeVoiceUpgrade(baseUrl, headers, timeoutMs) {
   });
 }
 
+export function classifyVoiceTunnelFault({ voiceState, checks = [] }) {
+  // Scheduler state describes the launcher, not an already running bound tunnel.
+  // A successful authenticated public upgrade takes precedence over that snapshot.
+  if (checks.some(check => check.id === 'voice_public' && check.state === 'ready')
+    || !voiceState || ['Running', 'not-configured', 'unverified'].includes(voiceState)) return [];
+  const repairable = ['Ready', 'Disabled', 'forward-failed', 'connection-failed'].includes(voiceState);
+  return [{ id: 'voice_tunnel', kind: repairable ? 'transport' : 'unknown', repairable, component: 'voice_tunnel' }];
+}
+
 export function summarizeMobileLink({ paused, checks, voiceTunnel }) {
   const result = checks.map(check => ({ ...check }));
   const voiceConfigured = !!voiceTunnel?.configured;
   const voiceState = voiceTunnel?.state;
-  const voiceFailed = voiceConfigured && !voiceTunnel?.running && voiceState !== 'unverified';
-  const voiceUnknown = voiceConfigured && !voiceTunnel?.running && voiceState === 'unverified';
-  result.push({ id: 'voice', title: '语音', state: paused || voiceUnknown ? 'unknown' : voiceFailed ? 'error' : 'unverified',
+  const voicePublicReady = checks.some(check => check.id === 'voice_public' && check.state === 'ready');
+  const voiceFailed = !voicePublicReady && voiceConfigured && !voiceTunnel?.running && voiceState !== 'unverified';
+  const voiceUnknown = !voicePublicReady && voiceConfigured && !voiceTunnel?.running && voiceState === 'unverified';
+  result.push({ id: 'voice', title: '语音', state: paused || voiceUnknown ? 'unknown' : voicePublicReady ? 'ready' : voiceFailed ? 'error' : 'unverified',
     message: paused ? '链路已停止，未检测语音'
+      : voicePublicReady ? '公网语音握手通过；实际通话和锁屏语音尚未验证'
       : !voiceConfigured ? '未配置独立语音隧道；实际通话尚未验证'
         : voiceState === 'forward-failed' ? '受管 SSH 远端端口转发被拒绝，可能有已有隧道占用；公网语音可用性需另行验证'
           : voiceState === 'connection-failed' ? 'SSH 隧道连接或转发失败，请查看隧道日志'
@@ -212,13 +308,19 @@ export function summarizeMobileLink({ paused, checks, voiceTunnel }) {
   const restartRequired = result.some(check => check.id === 'desktop' && check.state === 'blocked');
   const failures = result.filter(check => ['error', 'blocked'].includes(check.state));
   const unknown = result.filter(check => check.state === 'unknown');
-  const severity = paused ? 'stopped' : failures.length ? 'degraded' : unknown.length ? 'unknown' : 'unverified';
+  const resourcePressure = result.some(check => check.id === 'resources' && check.state === 'waiting');
+  const resourceUnknown = result.some(check => check.id === 'resources' && check.state === 'unknown');
+  const phoneWaiting = result.some(check => check.id === 'phone_recent' && ['waiting', 'unknown'].includes(check.state));
+  const severity = paused ? 'stopped' : failures.length || resourcePressure ? 'degraded' : unknown.length ? 'unknown' : 'unverified';
   return { severity, summary: paused ? '链路已停止' : failures.length
-    ? `连接需要处理：${failures.map(check => check.title).join('、')}`
-    : unknown.length ? '部分通道尚未检测' : '读取与连接检测通过；发送、通话和远程操作仍需验证',
+    ? `连接需要处理：${failures.map(check => check.title).join('、')}${resourcePressure ? '；本机资源不足' : ''}`
+    : resourcePressure ? '本机资源不足，请减少并发或关闭不需要的应用'
+      : resourceUnknown ? '连接检测已完成，本机内存资源未确认'
+        : phoneWaiting ? '读取与连接检测已完成，手机近期连接待确认'
+          : unknown.length ? '部分通道尚未检测' : '读取与连接检测通过；发送、通话和远程操作仍需验证',
     nextAction: paused ? 'start' : restartRequired ? 'desktop_restart_required'
       : result.some(check => check.id === 'voice' && check.state === 'error' && ['forward-failed','connection-failed'].includes(voiceState))
-        ? 'check_logs' : failures.length ? 'safe_repair' : 'none',
+        ? 'check_logs' : failures.length ? 'safe_repair' : resourcePressure ? 'check_resources' : 'none',
     checks: result };
 }
 
@@ -241,28 +343,22 @@ async function main() {
   const paused = option('--paused') === 'true';
   const voiceState = option('--voice-state');
   failureStage = 'probes';
-  const guardianMode = process.argv.includes('--guardian-json');
   const getHeaders = () => secret ? { ...headers, 'X-Codex-Bridge-OTP': generateTotp(secret) } : headers;
-  const diagnostics = paused ? { checks: [], restartRequired: false }
-    : await inspectMobileLink({ baseUrl: `http://127.0.0.1:${port}`, headers,
-      getHeaders, collectSignals: guardianMode });
-  const voiceTunnel = { configured: !!voiceState && voiceState !== 'not-configured', running: voiceState === 'Running', state: voiceState };
-  if (guardianMode && !paused) {
-    const localReady = ['bridge', 'desktop', 'sessions'].every(id => diagnostics.checks.some(check => check.id === id && check.state === 'ready'));
+  // Execution-time recheck for scoped recovery. It does not start a call, send
+  // microphone data, or depend on the assistant/desktop's current busy state.
+  if (process.argv.includes('--voice-repair-json')) {
     const extras = await inspectGuardianExtras({ baseUrl: `http://127.0.0.1:${port}`,
-      publicBaseUrl: value('DEFAULT_BRIDGE_URL'), getHeaders, localReady });
-    diagnostics.checks.push(...extras.checks);
-    diagnostics.guardianSignals.faults.push(...extras.faults);
-    try {
-      const phone = JSON.parse(fs.readFileSync(path.join(repo, 'logs/state/mobile-link-guardian-phone.json'), 'utf8'));
-      if (typeof phone.lastSeenAt === 'string' && Number.isFinite(Date.parse(phone.lastSeenAt))) diagnostics.guardianSignals.phoneLastSeenAt = phone.lastSeenAt;
-    } catch { /* No phone heartbeat is an unknown last mile, not a repair reason. */ }
-    if (voiceState && !['Running', 'not-configured', 'unverified'].includes(voiceState)) {
-      diagnostics.guardianSignals.faults.push({ id: 'voice_tunnel', kind: 'transport', repairable: true, component: 'voice' });
-    }
+      publicBaseUrl: value('DEFAULT_BRIDGE_URL'), getHeaders, localReady: true });
+    extras.faults.push(...classifyVoiceTunnelFault({ voiceState, checks: extras.checks }));
+    process.stdout.write(JSON.stringify({ checks: extras.checks, guardianSignals: { faults: extras.faults } }));
+    return;
   }
+  const guardianMode = process.argv.includes('--guardian-json');
+  const diagnostics = await inspectMobileLinkStatus({ paused, guardianMode, voiceState,
+    baseUrl: `http://127.0.0.1:${port}`, publicBaseUrl: value('DEFAULT_BRIDGE_URL'), headers, getHeaders,
+    phoneProvider: () => JSON.parse(fs.readFileSync(path.join(repo, 'logs/state/mobile-link-guardian-phone.json'), 'utf8')) });
   failureStage = 'output';
-  process.stdout.write(JSON.stringify({ ...diagnostics, ...summarizeMobileLink({ paused, checks: diagnostics.checks, voiceTunnel }) }));
+  process.stdout.write(JSON.stringify(diagnostics));
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

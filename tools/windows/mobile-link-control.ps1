@@ -374,9 +374,26 @@ function Complete-LinkFastStart {
   $bridgeGreen=$false
   $recoveryStarted=$false
   $startupExitRecorded=$false
+  $greenHealthMisses=0
   $phaseTick=0
   do {
-    $probe=Get-LinkFastProbe -SkipHealth:$bridgeGreen
+    # 绿灯锁定后每 5 轮（约 2s）做一次含 /health 的全量探测：bridge 在 green
+    # 之后、三绿之前死亡时，连续 8 次未恢复（约 16s，足够看门狗拉活）即按
+    # 降级收场，而不是持锁空转到 operation 死线。
+    $recheckHealth=$bridgeGreen -and (($phaseTick % 5) -eq 4)
+    $probe=Get-LinkFastProbe -SkipHealth:($bridgeGreen -and -not $recheckHealth)
+    if ($recheckHealth) {
+      if ($probe.healthOk) { $greenHealthMisses=0 }
+      else {
+        $greenHealthMisses++
+        if ($greenHealthMisses -ge 8) {
+          $script:fastStartStatus=New-LinkFastStatus -Probe (Get-LinkFastProbe)
+          $script:fastStartOutcome=Get-LinkStartupOutcome $script:fastStartStatus
+          Write-LinkEvent 'fast-start bridge-lost-after-green'
+          break
+        }
+      }
+    }
     if ($probe.healthOk -and -not $bridgeGreen) { $bridgeGreen=$true; Write-LinkEvent 'fast-start bridge-green' }
     if ($bridgeGreen -and -not $recoveryStarted -and -not $probe.desktopLive) {
       if (Get-Command Set-LinkOperationPhase -ErrorAction SilentlyContinue) { Set-LinkOperationPhase 'connecting_desktop' }
@@ -716,8 +733,11 @@ try {
     $standbyGo=$false
     while ([datetime]::UtcNow -lt $standbyDeadline) {
       if (Test-Path -LiteralPath $StandbyFile) {
-        $standbyGo=(([string](Get-Content -Raw -LiteralPath $StandbyFile -ErrorAction SilentlyContinue)) -replace '\s','') -eq 'go'
-        break
+        $standbyContent=((Get-Content -Raw -LiteralPath $StandbyFile -ErrorAction SilentlyContinue) -replace '\s','')
+        # 只认终值：空/半截内容是与托盘 WriteAllText 并发首读的瞬态，
+        # 继续轮询等终值，避免误判 abort 白吃一次托盘 25s 兜底。
+        if ($standbyContent -eq 'go') { $standbyGo=$true; break }
+        if ($standbyContent -eq 'abort') { break }
       }
       Start-Sleep -Milliseconds 100
     }

@@ -4,6 +4,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { URL } from 'node:url';
 import { EventBus } from './eventBus.js';
+import { resolveOutboxDispatchResult } from './outboxDeliveryResponse.js';
 import { readJsonBody, sendJson } from './json.js';
 import { TaskStore } from './taskStore.js';
 import { DiagnosticLogger } from './diagnosticLogger.js';
@@ -18,7 +19,8 @@ import { buildSlashIndex } from './slashIndex.js';
 import { capturePrimaryDesktopScreenshot } from './desktopScreenshot.js';
 import { DesktopLiveRecovery } from './desktopLiveRecovery.js';
 import { DesktopLiveDiagnostics } from './desktopLiveDiagnostics.js';
-import { SessionSettingsStore, normalizeModelId, normalizeReasoningEffort } from './sessionSettingsStore.js';
+import { probeDesktopCdpLiveness } from './codexDesktopCdpClient.js';
+import { SessionSettingsStore, normalizeModelId, normalizeReasoningEffort, normalizeServiceTier, resolveSessionSettings } from './sessionSettingsStore.js';
 import { effectiveCodexSettings, readCodexDefaultReasoningEffort } from './codexUserConfig.js';
 import { readAppServerCodexSettings, readDesktopCodexSettings } from './codexDesktopSettings.js';
 import { readDesktopVisibleReasoningEffort } from './desktopReasoningEffort.js';
@@ -27,7 +29,14 @@ import { collectLinkHealth, recoverHdcLink } from './linkHealth.js';
 import { DurableOutbox } from './durableOutbox.js';
 import { buildBridgeProtocolHandshake } from './bridgeProtocol.js';
 import { paginateTaskEvents } from './taskEventCursor.js';
+import { openTaskEventStream } from './taskEventStream.js';
+import { openSessionEventStream } from './sessionEventStream.js';
 import { createOutboxReceiptReconciler } from './outboxReceiptReconciler.js';
+import { InterruptJournal } from './interruptJournal.js';
+import { NativeContinueService, NativeContinueJournal } from './nativeContinueService.js';
+import { nativeContinueLatestTurn } from './nativeContinueEligibility.js';
+import { DesktopInteractionClient } from './desktopInteractionClient.js';
+import { RuntimeStatusStream } from './runtimeStatusStream.js';
 import {
   prepareRemoteSessionFile,
   publicRemoteFileMetadata,
@@ -58,6 +67,7 @@ import { createVoiceProcessSupervisor } from './voiceProcess.js';
 import { CompanionConversationService, handleCompanionRoute } from './companionConversationService.js';
 import { MobileLinkGuardianService } from './mobileLinkGuardianService.js';
 import { CompanionComputerService, handleCompanionComputerRoute } from './companionComputerService.js';
+import { createMobilePushRuntime, handleMobilePushRoute } from './mobilePushRuntime.js';
 
 export function createApp({ config, adapter }) {
   const eventBus = new EventBus();
@@ -91,7 +101,7 @@ export function createApp({ config, adapter }) {
     maxFailures: PAIRING_MAX_FAILURES_PER_WINDOW,
     resolveSourceKey: (request) => authGate.sourceKey(request)
   });
-  const sessions = config.sessions ?? new CodexSessionStore();
+  const sessions = config.sessions ?? new CodexSessionStore({ mobileImagesDir: config.mobileImagesDir });
   const desktopInteractions = config.desktopInteractions ?? new DesktopInteractionService();
   const companionService = config.companionService ?? new CompanionConversationService();
   const guardianService = config.guardianService ?? new MobileLinkGuardianService({ repoRoot: config.repoRoot, port: config.port });
@@ -105,6 +115,11 @@ export function createApp({ config, adapter }) {
     ?? (typeof adapter?.openDesktopThread === 'function'
       ? adapter.openDesktopThread.bind(adapter)
       : openCodexThreadDeeplink);
+  const desktopSettingsAdapter = adapter?.cdpDesktopAdapter ?? adapter;
+  const desktopSettingsClient = desktopSettingsAdapter?.client;
+  const desktopHistoryProjectionClient = appServerRuntimeMode(config) === 'desktop'
+    && typeof desktopSettingsClient?.request === 'function'
+    ? new DesktopInteractionClient(desktopSettingsClient) : null;
   const threadService = config.threadService ?? new CodexThreadService({
     sessions,
     projects: config.projects,
@@ -113,6 +128,10 @@ export function createApp({ config, adapter }) {
     eventBus,
     logger,
     desktopOpener,
+    desktopThreadRequest: appServerRuntimeMode(config) === 'desktop' && typeof desktopSettingsClient?.request === 'function'
+      ? desktopSettingsClient.request.bind(desktopSettingsClient) : null,
+    desktopSessionProjectionProvider: desktopHistoryProjectionClient
+      ? (threadId) => desktopHistoryProjectionClient.readRecentSessionProjection(threadId) : null,
     desktopThreadListProvider: typeof adapter?.listThreads === 'function'
       ? adapter.listThreads.bind(adapter)
       : null,
@@ -127,8 +146,30 @@ export function createApp({ config, adapter }) {
     approvalPolicy: config.appServerApprovalPolicy ?? config.approvalPolicy,
     allowIndependentAppServer: appServerRuntimeMode(config) !== 'desktop'
   });
+  const nativeContinue = config.nativeContinueService ?? new NativeContinueService({
+    client: desktopSettingsClient ? new DesktopInteractionClient(desktopSettingsClient) : null,
+    journal: config.nativeContinueJournal ?? new NativeContinueJournal(config.nativeContinueJournalPath
+      ?? path.join(config.repoRoot ?? process.cwd(), 'logs', 'state', 'native-continue.json'))
+  });
+  const runtimeStatusStream = new RuntimeStatusStream({
+    readSnapshot: () => threadService.getRuntimeSnapshot({ limit: 500 }),
+    subscribe: emit => {
+      if (typeof desktopSettingsAdapter?.subscribeRuntimeNotifications !== 'function') {
+        throw new Error('Desktop runtime notifications are unavailable');
+      }
+      return desktopSettingsAdapter.subscribeRuntimeNotifications(emit);
+    }
+  });
   const codexSettingsProvider = config.codexSettingsProvider
     ?? (() => readPrimaryCodexSettings({ threadService }));
+  const threadCodexSettingsProvider = config.threadCodexSettingsProvider
+    ?? (typeof desktopSettingsClient?.request === 'function'
+      ? async (threadId) => {
+          const result = await desktopSettingsClient.request('thread/read', { threadId, includeTurns: false });
+          const threadSettings = await desktopSettingsAdapter.getThreadSettings?.(threadId);
+          return { ...result, ...(threadSettings ? { threadSettings } : {}) };
+        }
+      : async (threadId) => ({ thread: { id: threadId }, threadSettings: await threadService.getThreadSettings?.(threadId) }));
   const desktopLiveRecovery = config.desktopLiveRecovery ?? new DesktopLiveRecovery({
     repoRoot: config.repoRoot ?? process.cwd(),
     bridgeUrl: config.localBridgeUrl ?? `http://127.0.0.1:${config.port ?? 8787}`
@@ -138,6 +179,8 @@ export function createApp({ config, adapter }) {
     : config.desktopLiveDiagnostics ?? new DesktopLiveDiagnostics({
         repoRoot: config.repoRoot ?? process.cwd()
       });
+  // 桌面在线判定的地面真相探测器：CDP DevTools 入口短超时内真实应答才算在线。
+  const desktopCdpLivenessProbe = config.desktopCdpLivenessProbe ?? probeDesktopCdpLiveness;
   const store = new TaskStore({
     projects: config.projects,
     adapter,
@@ -145,7 +188,9 @@ export function createApp({ config, adapter }) {
     logger,
     interruptReconciler: config.interruptReconciler === false
       ? null
-      : config.interruptReconciler ?? createThreadInterruptReconciler({ threadService }),
+      : config.interruptReconciler ?? createThreadInterruptReconciler({ threadService, desktopClient: desktopSettingsClient }),
+    interruptJournal: config.interruptJournal ?? (typeof desktopSettingsClient?.request === 'function'
+      ? new InterruptJournal(config.interruptJournalPath ?? path.join(config.repoRoot ?? process.cwd(), 'logs', 'state', 'conversation-stops.json')) : null),
     interruptReconcileTimeoutMs: config.interruptReconcileTimeoutMs,
     interruptReconcilePollMs: config.interruptReconcilePollMs,
     beforeRun: createBeforeRunDesktopVerification({
@@ -157,6 +202,10 @@ export function createApp({ config, adapter }) {
       config
     })
   });
+  const stopRecovery = store.restorePendingInterrupts();
+  void stopRecovery.catch(error => logger.write('bridge', 'error', 'conversation.stop.recovery_failed', {
+    message: error?.message ?? String(error)
+  }).catch(() => {}));
   const outbox = config.outboxEnabled !== true && !config.outbox
     ? null
     : config.outbox ?? new DurableOutbox({
@@ -181,6 +230,7 @@ export function createApp({ config, adapter }) {
           sessionSettings,
           defaultReasoningEffortProvider,
           codexSettingsProvider,
+          threadCodexSettingsProvider,
           threadService,
           desktopLiveRecovery,
           desktopLiveDiagnostics,
@@ -188,6 +238,17 @@ export function createApp({ config, adapter }) {
         })
       });
 
+  const stopOutboxReceiptWakeup = outbox ? eventBus.subscribeAll(event => {
+    if (event.type === 'codex.app_server.turn.started' || event.type === 'task.guidance.accepted') {
+      outbox.requestReceiptReconciliation?.();
+    }
+  }) : null;
+  const mobilePushRuntime = config.mobilePushRuntime ?? createMobilePushRuntime({
+    config, desktopAdapter: desktopSettingsAdapter, desktopInteractions, deviceRegistry, logger
+  });
+  void mobilePushRuntime.start().catch(() => logger.write('bridge', 'error', 'push.observer.start_failed', {
+    code: 'PUSH_OBSERVER_UNAVAILABLE'
+  }).catch(() => {}));
   const server = createServer(async (request, response) => {
     const startedAt = Date.now();
     const responseByteCounter = installResponseByteCounter(response);
@@ -198,7 +259,8 @@ export function createApp({ config, adapter }) {
           url: sanitizeRequestUrl(request.url)
         });
       }
-      await route({ request, response, config, store, outbox, eventBus, logger, sessions, desktopInteractions, companionService, companionComputerService, sessionSettings, defaultReasoningEffortProvider, codexSettingsProvider, accountUsageProvider, threadService, desktopLiveRecovery, desktopLiveDiagnostics, desktopOpener, authGate, deviceRegistry, pairingSessions, pairingEnrollLimiter, guardianService, voiceSupervisor: voiceProcess });
+      if (request.method === 'POST' && /^\/(tasks|api\/outbox|api\/codex\/(threads|runs))(?:\/|\?|$)/.test(request.url ?? '')) await stopRecovery;
+      await route({ request, response, config, store, outbox, eventBus, logger, sessions, desktopInteractions, companionService, companionComputerService, mobilePushRuntime, sessionSettings, defaultReasoningEffortProvider, codexSettingsProvider, threadCodexSettingsProvider, accountUsageProvider, threadService, nativeContinue, runtimeStatusStream, desktopLiveRecovery, desktopLiveDiagnostics, desktopCdpLivenessProbe, desktopOpener, authGate, deviceRegistry, pairingSessions, pairingEnrollLimiter, guardianService, voiceSupervisor: voiceProcess });
       if (shouldLogCompletedRequest(request)) {
         const responseBytes = responseByteCounter.bytes || responseContentLength(response);
         await logger.write('bridge', 'info', 'http.request.completed', {
@@ -240,25 +302,55 @@ export function createApp({ config, adapter }) {
       sendJson(response, error.statusCode ?? 500, payload);
     }
   });
-  server.on('close', () => outbox?.close());
+  server.on('close', () => { stopOutboxReceiptWakeup?.(); outbox?.close(); });
+  server.on('close', () => store.close());
   server.on('close', () => desktopInteractions.close?.());
+  server.on('close', () => mobilePushRuntime.close());
+  server.on('close', () => runtimeStatusStream.close());
   // 语音链路：受管 voice_server 子进程 + /voice 升级隧道（/voice/status 走普通路由鉴权）。
   const voiceProcess = createVoiceProcessSupervisor({ config, logger });
   attachVoiceUpgrade({ server, config, logger, authGate, supervisor: voiceProcess });
   server.on('close', () => voiceProcess.close());
   if (outbox) {
-    void outbox.initialize()
+    void stopRecovery.then(() => outbox.initialize())
       .then(() => outbox.dispatchReady())
       .catch((error) => logger.write('outbox', 'error', 'outbox.initialize.failed', {
         message: error?.message ?? String(error)
       }).catch(() => {}));
   }
 
-  return { server, store, outbox, deviceRegistry, eventBus, logger, threadService, voiceProcess };
+  return { server, store, outbox, deviceRegistry, eventBus, logger, threadService, voiceProcess,
+    dispose: () => runtimeStatusStream.close() };
 }
 
-function createThreadInterruptReconciler({ threadService }) {
+function createThreadInterruptReconciler({ threadService, desktopClient }) {
   return async ({ task, threadId, activeTurnId }) => {
+    if (typeof desktopClient?.request === 'function' && threadId) {
+      if (!activeTurnId) {
+        const detail = await desktopClient.request('thread/read', { threadId, includeTurns: false });
+        if (detail?.thread?.id !== threadId) return { status: 'unknown', reason: 'thread_identity_mismatch' };
+        const state = typeof detail.thread.status === 'string' ? detail.thread.status : detail.thread.status?.type;
+        return state === 'idle'
+          ? { status: 'idle', threadId, reason: 'official_no_active_turn' }
+          : { status: 'unknown', threadId, reason: 'official_thread_not_idle' };
+      }
+      let cursor;
+      const seen = new Set();
+      for (let index = 0; index < 10; index += 1) {
+        const page = await desktopClient.request('thread/turns/list', { threadId, limit: 50, itemsView: 'notLoaded', ...(cursor ? { cursor } : {}) });
+        if (!Array.isArray(page?.data)) throw new Error('Invalid official turn page');
+        const turn = page.data.find(value => value.id === activeTurnId);
+        if (turn) {
+          const status = normalizeRuntimeState(turn.status);
+          return { status: ['completed', 'interrupted', 'failed', 'running'].includes(status) ? status : 'unknown',
+            threadId, turnId: activeTurnId, observedAt: new Date().toISOString(), reason: 'official_turn_read' };
+        }
+        if (!page.nextCursor || seen.has(page.nextCursor)) break;
+        cursor = page.nextCursor;
+        seen.add(cursor);
+      }
+      return { status: 'unknown', threadId, turnId: activeTurnId, reason: 'official_turn_not_found' };
+    }
     if (!threadService || typeof threadService.getThread !== 'function' || !threadId) {
       return { status: 'unknown', reason: 'thread_service_unavailable' };
     }
@@ -595,13 +687,13 @@ function createBeforeRunDesktopVerification({ adapter, logger, desktopLiveRecove
   };
 }
 
-async function route({ request, response, config, store, outbox, eventBus, logger, sessions, desktopInteractions, companionService, companionComputerService, sessionSettings, defaultReasoningEffortProvider, codexSettingsProvider, accountUsageProvider, threadService, desktopLiveRecovery, desktopLiveDiagnostics, desktopOpener, authGate, deviceRegistry, pairingSessions, pairingEnrollLimiter, guardianService, voiceSupervisor }) {
+async function route({ request, response, config, store, outbox, eventBus, logger, sessions, desktopInteractions, companionService, companionComputerService, mobilePushRuntime, sessionSettings, defaultReasoningEffortProvider, codexSettingsProvider, threadCodexSettingsProvider, accountUsageProvider, threadService, nativeContinue, runtimeStatusStream, desktopLiveRecovery, desktopLiveDiagnostics, desktopCdpLivenessProbe, desktopOpener, authGate, deviceRegistry, pairingSessions, pairingEnrollLimiter, guardianService, voiceSupervisor }) {
   const url = new URL(request.url, 'http://127.0.0.1');
   const method = request.method ?? 'GET';
   if (method === 'OPTIONS') {
     response.writeHead(204, {
       'access-control-allow-origin': '*',
-      'access-control-allow-methods': 'GET,POST,PATCH,DELETE,OPTIONS',
+      'access-control-allow-methods': 'GET,POST,PUT,PATCH,DELETE,OPTIONS',
       'access-control-allow-headers': 'Content-Type,Authorization,X-Codex-Bridge-Token,X-Codex-Bridge-OTP',
       'access-control-max-age': '86400'
     });
@@ -624,6 +716,8 @@ async function route({ request, response, config, store, outbox, eventBus, logge
     return;
   }
   await authGate.requireAuth({ request, url });
+  if (await handleMobilePushRoute({ request, response, url, runtime: mobilePushRuntime,
+    readBody: readJsonObjectBody, sendJson })) return;
   if (method === 'GET' && url.pathname === '/api/desktop-interactions') {
     const requests = await desktopInteractions.list(url.searchParams.get('threadId') ?? '');
     sendJson(response, 200, { requests });
@@ -936,6 +1030,7 @@ async function route({ request, response, config, store, outbox, eventBus, logge
     }
     const { changed } = await deviceRegistry.revoke(deviceId);
     authGate.forgetDevice(deviceId);
+    await mobilePushRuntime.revokeDevice(deviceId);
     if (changed) {
       auditPairingEvent(logger, 'warn', 'bridge.device.revoked', {
         pathname: url.pathname,
@@ -954,12 +1049,20 @@ async function route({ request, response, config, store, outbox, eventBus, logge
   }
 
   if (method === 'GET' && url.pathname === '/desktop/script/status') {
+    const snapshot = desktopScriptBridge.snapshot({
+      authRequired: isBridgeAuthRequired(),
+      otpRequired: authGate.isTotpRequired(),
+      clientTokenEmbedded: false
+    });
+    // 「桌面在线」必须以 CDP 真实应答为准：脚本桥心跳可能来自仍在轮询的
+    // live-host，半死桌面外壳占住 9229 时心跳并不代表桌面可用。
+    const cdpLiveness = await probeDesktopCdpLivenessSafely(desktopCdpLivenessProbe);
     sendJson(response, 200, {
-      bridge: desktopScriptBridge.snapshot({
-        authRequired: isBridgeAuthRequired(),
-        otpRequired: authGate.isTotpRequired(),
-        clientTokenEmbedded: false
-      })
+      bridge: {
+        ...snapshot,
+        cdpLiveness,
+        online: snapshot.online === true && cdpLiveness.ok === true
+      }
     });
     return;
   }
@@ -1038,6 +1141,27 @@ async function route({ request, response, config, store, outbox, eventBus, logge
     return;
   }
 
+  if (method === 'GET' && url.pathname === '/api/codex/runtime-events') {
+    runtimeStatusStream.open(request, response);
+    return;
+  }
+
+  const nativeContinueStatusMatch = url.pathname.match(/^\/api\/codex\/threads\/([^/]+)\/continue-status$/);
+  if (method === 'GET' && nativeContinueStatusMatch) {
+    assertValidCodexSessionId(nativeContinueStatusMatch[1]);
+    sendJson(response, 200, await nativeContinue.getStatus(nativeContinueStatusMatch[1]));
+    return;
+  }
+  const nativeContinueMatch = url.pathname.match(/^\/api\/codex\/threads\/([^/]+)\/continue$/);
+  if (method === 'POST' && nativeContinueMatch) {
+    const threadId = nativeContinueMatch[1];
+    assertValidCodexSessionId(threadId);
+    const body = await readJsonObjectBody(request, 4096);
+    const result = await nativeContinue.continue(threadId, body);
+    sendJson(response, result.state === 'confirmed' ? 200 : result.state === 'uncertain' ? 202 : 409, result);
+    return;
+  }
+
   if (method === 'GET' && url.pathname === '/api/codex/threads') {
     const limit = url.searchParams.get('limit') ?? '50';
     const query = url.searchParams.get('q') ?? '';
@@ -1078,13 +1202,42 @@ async function route({ request, response, config, store, outbox, eventBus, logge
     return;
   }
 
+  const apiThreadEventsMatch = url.pathname.match(/^\/api\/codex\/threads\/([^/]+)\/events$/);
+  if (method === 'GET' && apiThreadEventsMatch) {
+    const threadId = apiThreadEventsMatch[1];
+    assertValidCodexSessionId(threadId);
+    const desktopAdapter = store.adapter?.cdpDesktopAdapter ?? store.adapter;
+    if (typeof desktopAdapter?.startNotificationPolling !== 'function'
+      || typeof desktopAdapter?.client?.request !== 'function') {
+      const error = new Error('Desktop session notifications are unavailable');
+      error.statusCode = 503;
+      throw error;
+    }
+    await openSessionEventStream({ request, response, threadId, adapter: desktopAdapter,
+      readRetainedNotifications: typeof desktopAdapter.client.readRetainedNotifications === 'function'
+        ? () => desktopAdapter.client.readRetainedNotifications(threadId) : async () => [],
+      readThread: async () => {
+        // The current official turn page contains its full partial items. Never
+        // serialize an unbounded, long-lived conversation for each text update.
+        const [page, context] = await Promise.all([
+          desktopAdapter.client.request('thread/turns/list', { threadId, limit: 1, itemsView: 'full' }),
+          nativeContinue.readContext(threadId).catch(() => null)
+        ]);
+        if (!Array.isArray(page?.data)) throw new Error('Invalid official turn page');
+        const thread = { ...(context ?? {}), id: threadId, turns: page.data.slice(0, 1) };
+        const continueBlockedReason = await nativeContinue.blockedReason(threadId, nativeContinueLatestTurn(thread)?.id ?? '');
+        return { thread: { ...thread, continueBlockedReason } };
+      } });
+    return;
+  }
+
   const apiThreadSyncMatch = url.pathname.match(/^\/api\/codex\/threads\/([^/]+)\/sync$/);
   if (method === 'GET' && apiThreadSyncMatch) {
     const limit = url.searchParams.get('limit') ?? '80';
     const after = url.searchParams.get('after') ?? '';
     const before = url.searchParams.get('before') ?? '';
     const thread = await threadService.syncThread(apiThreadSyncMatch[1], { limit, after, before });
-    sendJson(response, 200, { thread, session: thread });
+    sendJson(response, 200, url.searchParams.get('view') === 'session' ? { session: thread } : { thread, session: thread });
     return;
   }
 
@@ -1092,7 +1245,7 @@ async function route({ request, response, config, store, outbox, eventBus, logge
   if (method === 'GET' && apiThreadMatch) {
     const tail = url.searchParams.get('tail') ?? '120';
     const thread = await threadService.getThread(apiThreadMatch[1], { tail });
-    sendJson(response, 200, { thread, session: thread });
+    sendJson(response, 200, url.searchParams.get('view') === 'session' ? { session: thread } : { thread, session: thread });
     return;
   }
 
@@ -1151,8 +1304,7 @@ async function route({ request, response, config, store, outbox, eventBus, logge
         text: prompt,
         payload: body
       });
-      await outbox.dispatchReady();
-      sendOutboxResponse(response, outbox.get(accepted.id), url);
+      sendOutboxResponse(response, accepted, url, { store, threadService });
       return;
     }
     const dispatched = await dispatchNewThreadMessage({
@@ -1163,6 +1315,7 @@ async function route({ request, response, config, store, outbox, eventBus, logge
       sessionSettings,
       defaultReasoningEffortProvider,
       codexSettingsProvider,
+      threadCodexSettingsProvider,
       threadService,
       desktopLiveRecovery,
       desktopLiveDiagnostics
@@ -1201,10 +1354,7 @@ async function route({ request, response, config, store, outbox, eventBus, logge
       : action === 'cancel'
         ? await outbox.cancel(itemId)
         : await outbox.retry(itemId);
-    if (action === 'retry') {
-      await outbox.dispatchReady();
-    }
-    sendJson(response, 200, { item: serializeOutboxItem(outbox.get(item.id)) });
+    sendJson(response, 200, { item: serializeOutboxItem(item) });
     return;
   }
 
@@ -1212,11 +1362,12 @@ async function route({ request, response, config, store, outbox, eventBus, logge
   if (method === 'GET' && apiThreadSettingsMatch) {
     const threadId = apiThreadSettingsMatch[1];
     assertValidCodexSessionId(threadId);
+    const { settings, defaults } = await readResolvedThreadSettings({
+      sessionSettings, codexSettingsProvider, threadCodexSettingsProvider,
+      defaultReasoningEffortProvider, sessions, threadId
+    });
     sendJson(response, 200, {
-      settings: effectiveCodexSettings(
-        await sessionSettings.getSessionSettings(threadId),
-        await getThreadCodexDefaults({ codexSettingsProvider, defaultReasoningEffortProvider, sessions, threadId })
-      )
+      settings: effectiveCodexSettings(settings, defaults)
     });
     return;
   }
@@ -1225,26 +1376,36 @@ async function route({ request, response, config, store, outbox, eventBus, logge
     const threadId = apiThreadSettingsMatch[1];
     assertValidCodexSessionId(threadId);
     const body = await readJsonObjectBody(request);
+    const defaults = await getThreadCodexDefaults({
+      codexSettingsProvider, threadCodexSettingsProvider, defaultReasoningEffortProvider, sessions, threadId
+    });
     // Only fields present in the body are updated; an absent model must not
     // clear a stored pin when the phone only changes the reasoning effort.
     const patch = {};
     if (body.model !== undefined) {
       patch.model = body.model;
+      patch.modelBaseline = defaults.desktopSettings.model ?? null;
     }
     if (body.reasoningEffort !== undefined) {
       patch.reasoningEffort = body.reasoningEffort;
+      patch.reasoningEffortBaseline = defaults.desktopSettings.reasoningEffort ?? null;
     }
-    const settings = await sessionSettings.updateSessionSettings(threadId, patch);
+    if (body.serviceTier !== undefined) {
+      patch.serviceTier = body.serviceTier;
+      patch.serviceTierBaseline = defaults.desktopSettings.serviceTier ?? null;
+    }
+    let settings = await sessionSettings.updateSessionSettings(threadId, patch);
+    settings = typeof sessionSettings.reconcileSessionSettings === 'function'
+      ? await sessionSettings.reconcileSessionSettings(threadId, defaults.desktopSettings, settings)
+      : resolveSessionSettings(settings, defaults.desktopSettings);
     await logger.write('bridge', 'info', 'codex.thread.settings.updated', {
       threadId,
       model: settings.model || 'auto',
-      reasoningEffort: settings.reasoningEffort || 'auto'
+      reasoningEffort: settings.reasoningEffort || 'auto',
+      serviceTier: settings.serviceTier || 'auto'
     });
     sendJson(response, 200, {
-      settings: effectiveCodexSettings(
-        settings,
-        await getThreadCodexDefaults({ codexSettingsProvider, defaultReasoningEffortProvider, sessions, threadId })
-      )
+      settings: effectiveCodexSettings(settings, defaults)
     });
     return;
   }
@@ -1265,8 +1426,7 @@ async function route({ request, response, config, store, outbox, eventBus, logge
         text: prompt,
         payload: body
       });
-      await outbox.dispatchReady();
-      sendOutboxResponse(response, outbox.get(accepted.id), url);
+      sendOutboxResponse(response, accepted, url, { store, threadService });
       return;
     }
     const dispatched = await dispatchExistingThreadMessage({
@@ -1279,6 +1439,7 @@ async function route({ request, response, config, store, outbox, eventBus, logge
       sessionSettings,
       defaultReasoningEffortProvider,
       codexSettingsProvider,
+      threadCodexSettingsProvider,
       threadService,
       desktopLiveRecovery,
       desktopLiveDiagnostics,
@@ -1292,7 +1453,7 @@ async function route({ request, response, config, store, outbox, eventBus, logge
   if (method === 'GET' && apiRunMatch) {
     const queued = outbox?.get(apiRunMatch[1]);
     if (queued) {
-      sendOutboxResponse(response, queued, url);
+      sendOutboxResponse(response, queued, url, { store, threadService });
       return;
     }
     const task = store.getTask(apiRunMatch[1]);
@@ -1309,7 +1470,7 @@ async function route({ request, response, config, store, outbox, eventBus, logge
     const queued = outbox?.get(apiRunInterruptMatch[1]);
     if (queued && ['queued', 'failed', 'uncertain'].includes(queued.status)) {
       const canceled = await outbox.cancel(queued.id);
-      sendOutboxResponse(response, canceled, url);
+      sendOutboxResponse(response, canceled, url, { store, threadService });
       return;
     }
     const task = store.getTask(apiRunInterruptMatch[1]);
@@ -1343,6 +1504,7 @@ async function route({ request, response, config, store, outbox, eventBus, logge
       }
     }
     const task = store.interruptSessionTask(threadId);
+    await store.waitForInterruptPersistence(task.id);
     const confirmed = await maybeWaitForInterruptConfirmation(store, task, url);
     sendJson(response, 200, { run: serializeTask(confirmed, serializationOptions(url)) });
     return;
@@ -1351,10 +1513,10 @@ async function route({ request, response, config, store, outbox, eventBus, logge
   const apiRunEventsMatch = url.pathname.match(/^\/api\/codex\/runs\/([^/]+)\/events$/);
   if (method === 'GET' && apiRunEventsMatch) {
     if (store.getTask(apiRunEventsMatch[1])) {
-      streamEvents({ response, store, eventBus, taskId: apiRunEventsMatch[1] });
+      streamEvents({ request, response, store, eventBus, taskId: apiRunEventsMatch[1] });
       return;
     }
-    streamRunEvents({ response, eventBus, threadService, runId: apiRunEventsMatch[1] });
+    streamRunEvents({ request, response, eventBus, threadService, runId: apiRunEventsMatch[1] });
     return;
   }
 
@@ -1497,7 +1659,7 @@ async function route({ request, response, config, store, outbox, eventBus, logge
 
   const eventsMatch = url.pathname.match(/^\/tasks\/([^/]+)\/events$/);
   if (method === 'GET' && eventsMatch) {
-    streamEvents({ response, store, eventBus, taskId: eventsMatch[1] });
+    streamEvents({ request, response, store, eventBus, taskId: eventsMatch[1] });
     return;
   }
 
@@ -1561,6 +1723,7 @@ async function getDefaultCodexSettings({ codexSettingsProvider, defaultReasoning
     const providerReasoningEffort = normalizeReasoningEffort(settings?.reasoningEffort ?? '');
     return {
       model: normalizeModelId(settings?.model ?? ''),
+      serviceTier: normalizeServiceTier(settings?.serviceTier),
       reasoningEffort: providerReasoningEffort || fallbackReasoningEffort,
       source: String(settings?.source ?? settings?.modelCatalogSource ?? ''),
       modelCatalogRevision: String(settings?.modelCatalogRevision ?? ''),
@@ -1598,8 +1761,33 @@ async function getThreadDefaultReasoningEffort({ defaultReasoningEffortProvider,
   return getDefaultReasoningEffort(defaultReasoningEffortProvider);
 }
 
-async function getThreadCodexDefaults({ codexSettingsProvider, defaultReasoningEffortProvider, sessions, threadId }) {
-  const defaults = await getDefaultCodexSettings({ codexSettingsProvider, defaultReasoningEffortProvider });
+async function getThreadCodexDefaults({ codexSettingsProvider, threadCodexSettingsProvider, defaultReasoningEffortProvider, sessions, threadId, includeCatalog = true }) {
+  const defaults = includeCatalog
+    ? await getDefaultCodexSettings({ codexSettingsProvider, defaultReasoningEffortProvider })
+    : {};
+  const desktopSettings = {};
+  try {
+    const result = await threadCodexSettingsProvider?.(threadId);
+    // A focused desktop window can belong to a different conversation. Only
+    // the official response for this exact target can supersede a phone pin.
+    if (result?.thread?.id === threadId) {
+      try {
+        const model = normalizeModelId(result.thread.model);
+        if (model) desktopSettings.model = model;
+      } catch { /* An invalid field is unavailable, independently of effort. */ }
+      const officialSettings = result.threadSettings ?? result.thread;
+      if (Object.prototype.hasOwnProperty.call(officialSettings, 'serviceTier')) {
+        try { desktopSettings.serviceTier = normalizeServiceTier(officialSettings.serviceTier) || 'default'; } catch { /* Unknown tier is not evidence. */ }
+      }
+      try {
+        const effort = normalizeReasoningEffort(result.thread.reasoningEffort);
+        if (effort) desktopSettings.reasoningEffort = effort;
+      } catch { /* Keep pending settings when this field is unavailable. */ }
+    }
+  } catch {
+    // Database/global values can still supply display defaults, but cannot
+    // invalidate pending choices when the authoritative live read failed.
+  }
   let threadModel = '';
   let threadReasoningEffort = '';
   try {
@@ -1618,9 +1806,22 @@ async function getThreadCodexDefaults({ codexSettingsProvider, defaultReasoningE
   }
   return {
     ...defaults,
-    model: threadModel || defaults.model,
-    reasoningEffort: threadReasoningEffort || defaults.reasoningEffort
+    model: desktopSettings.model || threadModel || defaults.model,
+    reasoningEffort: desktopSettings.reasoningEffort || threadReasoningEffort || defaults.reasoningEffort,
+    serviceTier: desktopSettings.serviceTier || defaults.serviceTier,
+    serviceTierSource: desktopSettings.serviceTier ? 'thread' : 'desktop',
+    desktopSettings
   };
+}
+
+async function readResolvedThreadSettings(options) {
+  const { sessionSettings, threadId } = options;
+  const stored = await sessionSettings.getSessionSettings(threadId);
+  const defaults = await getThreadCodexDefaults(options);
+  const settings = typeof sessionSettings.reconcileSessionSettings === 'function'
+    ? await sessionSettings.reconcileSessionSettings(threadId, defaults.desktopSettings, stored)
+    : resolveSessionSettings(stored, defaults.desktopSettings);
+  return { settings, defaults };
 }
 
 async function readEffectiveDesktopReasoningEffort() {
@@ -1877,6 +2078,17 @@ function safeAttachmentFileName(value) {
 
 function timestampFilePart() {
   return new Date().toISOString().replace(/[:.]/g, '-');
+}
+
+async function probeDesktopCdpLivenessSafely(probe) {
+  if (typeof probe !== 'function') {
+    return { checked: false, ok: true };
+  }
+  try {
+    return await probe();
+  } catch (error) {
+    return { checked: true, ok: false, reason: error?.message ?? String(error) };
+  }
 }
 
 async function getDesktopLiveStatus(adapter, sessionId = '') {
@@ -2506,7 +2718,28 @@ async function decorateDesktopLiveStatusWithDiagnostics(status, diagnostics) {
   }
 }
 
+// 地面真相优先：上游已判 desktopLive=true 时，若诊断显示 CDP DevTools 入口
+// 没有真实应答（端口通但 CDP 无应答 / socket 残留），必须降级为不在线。
+function demoteDesktopLiveWhenCdpUnresponsive(status, diagnostics) {
+  if (status?.desktopLive !== true) {
+    return status;
+  }
+  const cdpLiveness = diagnostics?.cdpLiveness;
+  if (cdpLiveness?.checked !== true || cdpLiveness.ok === true) {
+    return status;
+  }
+  return {
+    ...status,
+    desktopLive: false,
+    status: 'unavailable',
+    message: '已按 CDP 真实应答复核在线判定：CDP 端口有监听但无应答，按桌面不在线处理。',
+    reason: cdpLiveness.reason ?? 'CDP 端口无真实应答',
+    demotedByCdpLiveness: true
+  };
+}
+
 function decorateDesktopLiveStatus(status, diagnostics = null) {
+  status = demoteDesktopLiveWhenCdpUnresponsive(status, diagnostics);
   const text = [
     status?.status,
     status?.message,
@@ -2542,6 +2775,7 @@ function decorateDesktopLiveStatus(status, diagnostics = null) {
     cdpPort: status?.cdpPort ?? diagnostics?.cdpPort ?? null,
     candidateCdpPorts: status?.candidateCdpPorts ?? diagnostics?.candidateCdpPorts ?? [],
     lastInjectedCdpPort: status?.lastInjectedCdpPort ?? diagnostics?.lastInjectedCdpPort ?? null,
+    cdpResponsive: status?.cdpResponsive ?? diagnostics?.cdpResponsive ?? null,
     diagnosticsError: status?.diagnosticsError ?? diagnostics?.error ?? '',
     mobileRecoverable,
     requiresDesktopCdp,
@@ -2564,6 +2798,7 @@ async function dispatchOutboxItem({
   sessionSettings,
   defaultReasoningEffortProvider,
   codexSettingsProvider,
+  threadCodexSettingsProvider,
   threadService,
   desktopLiveRecovery,
   desktopLiveDiagnostics,
@@ -2585,6 +2820,7 @@ async function dispatchOutboxItem({
         sessionSettings,
         defaultReasoningEffortProvider,
         codexSettingsProvider,
+        threadCodexSettingsProvider,
         threadService,
         desktopLiveRecovery,
         desktopLiveDiagnostics
@@ -2599,6 +2835,7 @@ async function dispatchOutboxItem({
         sessionSettings,
         defaultReasoningEffortProvider,
         codexSettingsProvider,
+        threadCodexSettingsProvider,
         threadService,
         desktopLiveRecovery,
         desktopLiveDiagnostics,
@@ -2612,6 +2849,9 @@ async function dispatchOutboxItem({
 async function canDispatchOutboxItem({ item, store, threadService }) {
   const activeStatuses = new Set(['queued', 'running', 'waiting_approval', 'recovering']);
   if (item.kind === 'existing_thread') {
+    if (store.isSessionInterruptPending(item.threadId)) {
+      return { allowed: false, reason: 'interrupt_pending' };
+    }
     const activeDesktopTask = store.findRunningTaskForSession(item.threadId);
     if (activeDesktopTask) {
       return typeof store.canSteerSessionTask === 'function'
@@ -2650,6 +2890,9 @@ async function canDispatchOutboxItem({ item, store, threadService }) {
       return typeof threadService?.canSteerThread === 'function'
         && threadService.canSteerThread(item.threadId);
     }
+    // For steer-capable adapters both active and idle official states allow
+    // dispatch here. The adapter still checks the target and turn at dispatch.
+    if (typeof store.adapter?.steer === 'function') return true;
     if (typeof threadService?.getThread === 'function') {
       try {
         const thread = await threadService.getThread(item.threadId, { tail: 1 });
@@ -2711,6 +2954,7 @@ async function dispatchNewThreadMessage({
   sessionSettings,
   defaultReasoningEffortProvider,
   codexSettingsProvider,
+  threadCodexSettingsProvider,
   threadService,
   desktopLiveRecovery,
   desktopLiveDiagnostics
@@ -2721,6 +2965,7 @@ async function dispatchNewThreadMessage({
   // to the bridge's drifting defaults. Explicit values still pass through.
   const effectiveModel = normalizeModelId(body.model ?? '');
   const effectiveReasoningEffort = normalizeReasoningEffort(body.reasoningEffort ?? '');
+  const serviceTier = normalizeServiceTier(body.serviceTier);
   const projectId = resolveProjectId(config, String(body.projectId ?? ''));
   const submissionId = String(body.submissionId ?? '');
   if (systemLinkExecutionMode(config) === 'app_server') {
@@ -2729,13 +2974,15 @@ async function dispatchNewThreadMessage({
       prompt,
       model: effectiveModel,
       reasoningEffort: effectiveReasoningEffort,
+      serviceTier,
       submissionId
     });
     const createdThreadId = result.thread?.id ?? result.run?.createdCodexSessionId ?? result.run?.createdThreadId ?? '';
-    if (createdThreadId && (body.reasoningEffort !== undefined || body.model !== undefined)) {
+    if (createdThreadId && (body.reasoningEffort !== undefined || body.model !== undefined || body.serviceTier !== undefined)) {
       await sessionSettings.updateSessionSettings(createdThreadId, {
         model: body.model,
-        reasoningEffort: body.reasoningEffort
+        reasoningEffort: body.reasoningEffort,
+        serviceTier: body.serviceTier
       });
     }
     return {
@@ -2761,6 +3008,7 @@ async function dispatchNewThreadMessage({
       submissionId,
       model: effectiveModel,
       reasoningEffort: effectiveReasoningEffort,
+      serviceTier,
       desktopRelaunch: 'missing'
     });
     await logger.write('bridge', 'info', 'codex.thread.start.desktop_relaunch.queued', {
@@ -2779,7 +3027,8 @@ async function dispatchNewThreadMessage({
     submissionSource: 'phone_new_thread',
     submissionId,
     model: effectiveModel,
-    reasoningEffort: effectiveReasoningEffort
+    reasoningEffort: effectiveReasoningEffort,
+    serviceTier
   });
   await logger.write('bridge', 'info', 'codex.thread.start.desktop_task.queued', {
     taskId: task.id,
@@ -2805,6 +3054,7 @@ async function dispatchExistingThreadMessage({
   sessionSettings,
   defaultReasoningEffortProvider,
   codexSettingsProvider,
+  threadCodexSettingsProvider,
   threadService,
   desktopLiveRecovery,
   desktopLiveDiagnostics,
@@ -2812,12 +3062,7 @@ async function dispatchExistingThreadMessage({
 }) {
   const projectId = resolveProjectId(config, String(body.projectId ?? ''));
   const prompt = String(body.text ?? body.prompt ?? '');
-  const storedSettings = await sessionSettings.getSessionSettings(threadId);
-  // "自动" arrives as an empty string: keep it empty end-to-end (no bridge
-  // defaults) so the desktop keeps its own model/effort choice. A phone-picked
-  // value or a pin stored via the settings endpoint still passes through.
-  const model = normalizeModelId(body.model ?? storedSettings.model ?? '');
-  const reasoningEffort = normalizeReasoningEffort(body.reasoningEffort ?? storedSettings.reasoningEffort ?? '');
+  assertValidCodexSessionId(threadId);
   const submissionId = String(body.submissionId ?? '');
   await logger.write('bridge', 'info', 'codex.thread.message.received', {
     threadId,
@@ -2826,7 +3071,6 @@ async function dispatchExistingThreadMessage({
     promptLength: prompt.length,
     runtimeMode: appServerRuntimeMode(config)
   });
-  assertValidCodexSessionId(threadId);
   const sessionFingerprint = requireSessionFingerprint(body.sessionFingerprint);
   const verified = await sessions.verifySessionTarget(threadId, sessionFingerprint);
   await logger.write('bridge', 'info', 'session.target.verified', {
@@ -2840,6 +3084,15 @@ async function dispatchExistingThreadMessage({
     submissionId,
     runtimeMode: appServerRuntimeMode(config)
   });
+  const { settings: storedSettings } = await readResolvedThreadSettings({
+    sessionSettings, codexSettingsProvider, threadCodexSettingsProvider,
+    defaultReasoningEffortProvider, sessions, threadId, includeCatalog: false
+  });
+  // Empty means follow desktop. Explicit API options still win; omitted
+  // phone options use only the pending choices that survived reconciliation.
+  const model = normalizeModelId(body.model ?? storedSettings.model ?? '');
+  const reasoningEffort = normalizeReasoningEffort(body.reasoningEffort ?? storedSettings.reasoningEffort ?? '');
+  const serviceTier = normalizeServiceTier(body.serviceTier !== undefined ? body.serviceTier : storedSettings.serviceTier);
   if (shouldUseAppServerForExistingThread(config, threadId)) {
     if (typeof threadService?.canSteerThread === 'function' && threadService.canSteerThread(threadId)) {
       try {
@@ -2874,6 +3127,7 @@ async function dispatchExistingThreadMessage({
       projectId,
       model,
       reasoningEffort,
+      serviceTier,
       submissionId
     });
     await logger.write('bridge', 'info', 'codex.thread.message.app_server.queued', {
@@ -2945,6 +3199,7 @@ async function dispatchExistingThreadMessage({
       submissionId,
       model,
       reasoningEffort,
+      serviceTier,
       desktopRelaunch: 'missing'
     });
     await logger.write('bridge', 'info', 'codex.thread.message.desktop_relaunch.queued', {
@@ -2963,6 +3218,7 @@ async function dispatchExistingThreadMessage({
       projectId,
       model,
       reasoningEffort,
+      serviceTier,
       submissionId,
       deliveryMode: 'desktop_fallback'
     });
@@ -2993,7 +3249,8 @@ async function dispatchExistingThreadMessage({
     submissionSource: 'phone_thread_message',
     submissionId,
     model,
-    reasoningEffort
+    reasoningEffort,
+    serviceTier
   });
   await logger.write('bridge', 'info', 'codex.thread.message.desktop_task.queued', {
     taskId: task.id,
@@ -3017,7 +3274,7 @@ function isSafeSteerFallbackError(error) {
     || error?.code === 'CODEX_STEER_NO_ACTIVE_TURN';
 }
 
-function sendOutboxResponse(response, item, url) {
+function sendOutboxResponse(response, item, url, sources) {
   if (!item) {
     const error = new Error('Unknown outbox item');
     error.statusCode = 404;
@@ -3025,10 +3282,11 @@ function sendOutboxResponse(response, item, url) {
   }
   const outbox = serializeOutboxItem(item);
   if (item.status === 'submitted' && item.result) {
-    const receiptOnly = !item.result.run || (item.result.deliveryPending === false
-      && String(item.result.run.prompt ?? '') !== item.text);
+    const result = resolveOutboxDispatchResult(item, sources);
+    const receiptOnly = !result.run || (result.deliveryPending === false
+      && String(result.run.prompt ?? '') !== item.text);
     sendJson(response, 202, {
-      ...serializeDispatchPayload(item.result, url),
+      ...serializeDispatchPayload(result, url),
       // A recovered official receipt proves delivery, not a recovered model run.
       // Keep the phone's run envelope and polling identity without replaying an
       // obsolete snapshot (including a steered run's earlier prompt) or claiming
@@ -3066,6 +3324,8 @@ function serializeOutboxItem(item) {
     order: item.order,
     attemptCount: item.attemptCount,
     retryable: item.retryable,
+    blockedBy: item.blockedBy || '',
+    blockedReason: item.blockedReason || '',
     error: item.error,
     nextAttemptAt: item.nextAttemptAt,
     lastAttemptAt: item.lastAttemptAt,
@@ -3082,6 +3342,8 @@ function serializeOutboxRun(item) {
     || (item.status === 'failed' && item.retryable);
   const status = item.status === 'submitted'
     ? 'submitted'
+    : item.status === 'held'
+    ? 'held'
     : item.status === 'canceled'
     ? 'interrupted'
     : queued
@@ -3095,7 +3357,9 @@ function serializeOutboxRun(item) {
     prompt: item.text,
     promptPreview: item.text.slice(0, 160),
     promptLength: item.text.length,
-    codexSessionId: item.threadId || (item.status === 'submitted' ? item.result?.threadId : null) || null,
+    codexSessionId: item.threadId || (item.status === 'submitted' ? item.result?.threadId
+      || item.result?.run?.codexSessionId || item.result?.run?.createdCodexSessionId
+      || item.result?.run?.threadId || item.result?.thread?.id : null) || null,
     submissionId: item.submissionId,
     status,
     createdAt: item.createdAt,
@@ -3114,7 +3378,7 @@ function serializeOutboxRun(item) {
       type: `outbox.${item.status}`,
       payload: {
         outboxId: item.id,
-        message: item.error || (item.status === 'dispatching' ? '正在确认这条消息是否进入官方会话' : ''),
+        message: item.error || item.blockedReason || (item.status === 'dispatching' ? '正在确认这条消息是否进入官方会话' : ''),
         attemptCount: item.attemptCount,
         retryable: item.retryable,
         nextAttemptAt: item.nextAttemptAt
@@ -3252,7 +3516,7 @@ const AUTH_LOOPBACK_REMOTE_ADDRESSES = new Set(['127.0.0.1', '::1', '::ffff:127.
 // 附带失败审计（logs/current-run/security.jsonl）与按来源限速（60 秒内失败 >10 次后 429）。
 // 二期新增设备分支：主控 token 未命中时按 SHA-256 查设备注册表，命中则强制该校验设备
 // 自带 totpSecret（不享受任何本地豁免）；认证结果挂到 request.codexAuth 供 master-only 路由检查。
-function createAuthGate({ logger, now = () => Date.now(), remoteAddressResolver = null, deviceRegistry = null }) {
+export function createAuthGate({ logger, now = () => Date.now(), remoteAddressResolver = null, deviceRegistry = null }) {
   const totp = createTotpVerifier({ secret: process.env.CODEX_BRIDGE_TOTP_SECRET ?? '', now });
   const recentFailures = new Map();
   // 每设备一个 verifier：滑动窗口的 highestAcceptedStep 是跨请求记忆，必须缓存复用，
@@ -3432,7 +3696,20 @@ function createAuthGate({ logger, now = () => Date.now(), remoteAddressResolver 
       return;
     }
 
-    if (isRateLimited(request)) {
+    const authorization = request.headers.authorization ?? '';
+    const bearer = authorization.startsWith('Bearer ') ? authorization.slice('Bearer '.length) : '';
+    const queryToken = url.searchParams.get('token') ?? '';
+    const headerToken = request.headers['x-codex-bridge-token'] ?? '';
+    const provided = Array.isArray(headerToken) ? headerToken[0] : headerToken;
+    const masterTokenMatches = tokenRequired && (bearer === token || queryToken === token || provided === token);
+    // The authenticated loopback health probe must remain usable when unrelated
+    // local consumers exhaust their failure budget; otherwise the guardian kills
+    // a responsive bridge. Wrong credentials and forwarded requests stay limited.
+    const authenticatedLocalHealth = masterTokenMatches && request.method === 'GET' && url.pathname === '/health'
+      && AUTH_LOOPBACK_REMOTE_ADDRESSES.has(String(request.socket?.remoteAddress ?? ''))
+      && request.headers['x-forwarded-for'] === undefined;
+
+    if (isRateLimited(request) && !authenticatedLocalHealth) {
       rejectAuth({
         request,
         url,
@@ -3444,13 +3721,7 @@ function createAuthGate({ logger, now = () => Date.now(), remoteAddressResolver 
     }
 
     if (tokenRequired) {
-      const authorization = request.headers.authorization ?? '';
-      const bearer = authorization.startsWith('Bearer ') ? authorization.slice('Bearer '.length) : '';
-      const queryToken = url.searchParams.get('token') ?? '';
-      const headerToken = request.headers['x-codex-bridge-token'] ?? '';
-      const provided = Array.isArray(headerToken) ? headerToken[0] : headerToken;
-
-      if (bearer !== token && queryToken !== token && provided !== token) {
+      if (!masterTokenMatches) {
         const device = await resolveDeviceAuth({ request, url, candidateTokens: [bearer, queryToken, provided] });
         if (!device) {
           rejectAuth({ request, url, category: 'token' });
@@ -3580,53 +3851,26 @@ function firstHeader(value) {
   return value;
 }
 
-function streamEvents({ response, store, eventBus, taskId }) {
+function streamEvents({ request, response, store, eventBus, taskId }) {
   const task = store.getTask(taskId);
   if (!task) {
     sendJson(response, 404, { error: 'Unknown task' });
     return;
   }
 
-  response.writeHead(200, {
-    'content-type': 'text/event-stream; charset=utf-8',
-    'cache-control': 'no-cache',
-    connection: 'keep-alive'
+  openTaskEventStream({
+    request, response, eventBus, sourceId: taskId,
+    getSnapshot: () => store.getTask(taskId)
   });
-
-  for (const event of task.events) {
-    writeSse(response, event);
-  }
-
-  const unsubscribe = eventBus.subscribe(taskId, (event) => {
-    writeSse(response, event);
-  });
-
-  response.on('close', unsubscribe);
 }
 
-function streamRunEvents({ response, eventBus, threadService, runId }) {
-  const run = threadService.getRun(runId);
-
-  response.writeHead(200, {
-    'content-type': 'text/event-stream; charset=utf-8',
-    'cache-control': 'no-cache',
-    connection: 'keep-alive'
+function streamRunEvents({ request, response, eventBus, threadService, runId }) {
+  // Preserve the existing 404 before committing streaming headers.
+  threadService.getRun(runId);
+  openTaskEventStream({
+    request, response, eventBus, sourceId: runId,
+    getSnapshot: () => threadService.getRun(runId)
   });
-
-  for (const event of run.events) {
-    writeSse(response, event);
-  }
-
-  const unsubscribe = eventBus.subscribe(runId, (event) => {
-    writeSse(response, event);
-  });
-
-  response.on('close', unsubscribe);
-}
-
-function writeSse(response, event) {
-  response.write(`event: ${event.type}\n`);
-  response.write(`data: ${JSON.stringify(event)}\n\n`);
 }
 
 function serializationOptions(url) {
@@ -3666,6 +3910,7 @@ function serializeTask(task, options = {}) {
       createdCodexSessionId: normalized.createdCodexSessionId,
       model: normalized.model,
       reasoningEffort: normalized.reasoningEffort,
+      serviceTier: normalized.serviceTier,
       status: normalized.status,
       createdAt: normalized.createdAt,
       updatedAt: normalized.updatedAt,
@@ -3707,6 +3952,7 @@ function serializeTask(task, options = {}) {
     createdCodexSessionId: normalized.createdCodexSessionId,
     model: normalized.model,
     reasoningEffort: normalized.reasoningEffort,
+      serviceTier: normalized.serviceTier,
     status: normalized.status,
     createdAt: normalized.createdAt,
     updatedAt: normalized.updatedAt,
@@ -3750,6 +3996,7 @@ function serializeTaskSummary(task) {
     createdCodexSessionId: normalized.createdCodexSessionId,
     model: normalized.model,
     reasoningEffort: normalized.reasoningEffort,
+      serviceTier: normalized.serviceTier,
     status: normalized.status,
     createdAt: normalized.createdAt,
     updatedAt: normalized.updatedAt,
@@ -3798,6 +4045,7 @@ function normalizeTaskLike(task) {
     createdCodexSessionId,
     model: normalizeModelId(task.model ?? ''),
     reasoningEffort: normalizeReasoningEffort(task.reasoningEffort ?? ''),
+    serviceTier: normalizeServiceTier(task.serviceTier),
     status,
     createdAt: String(task.createdAt ?? ''),
     updatedAt: String(task.updatedAt ?? ''),
@@ -3893,6 +4141,43 @@ function serializeEventPayload(payload) {
   const summary = {};
   for (const [key, value] of Object.entries(payload ?? {}).slice(0, 24)) {
     summary[key] = summarizePayloadValue(value);
+  }
+  // Event pages acknowledge seq just like SSE. Keep assistant text lossless so
+  // a compact page cannot consume a delta that a later SSE frame would repair.
+  // Copy only message fields; tool output and unrelated diagnostics stay small.
+  const stringFields = (source, keys) => Object.fromEntries(keys
+    .filter((key) => typeof source?.[key] === 'string')
+    .map((key) => [key, source[key]]));
+  const assistantItem = (item) => item
+    && ['agentMessage', 'agent_message'].includes(item.type)
+    && typeof item.text === 'string'
+    ? stringFields(item, ['id', 'type', 'text', 'phase'])
+    : null;
+  const params = payload?.params;
+  let streamParams;
+  if (payload?.method === 'item/agentMessage/delta' && typeof params?.delta === 'string') {
+    streamParams = { ...stringFields(params, ['threadId', 'turnId', 'itemId']), delta: params.delta };
+  } else if (payload?.method === 'item/completed') {
+    const item = assistantItem(params?.item);
+    if (item) streamParams = { ...stringFields(params, ['threadId', 'turnId', 'itemId']), item };
+  } else if (payload?.method === 'turn/completed' && Array.isArray(params?.turn?.items)) {
+    const items = params.turn.items.map(assistantItem).filter(Boolean);
+    if (items.length > 0) {
+      streamParams = {
+        ...stringFields(params, ['threadId', 'turnId']),
+        turn: { ...stringFields(params.turn, ['id', 'status']), items }
+      };
+    }
+  }
+  if (streamParams) {
+    summary.method = payload.method;
+    summary.params = streamParams;
+  } else if (payload?.type === 'item.completed') {
+    const item = assistantItem(payload.item);
+    if (item) {
+      summary.type = payload.type;
+      summary.item = item;
+    }
   }
   return {
     ...summary,

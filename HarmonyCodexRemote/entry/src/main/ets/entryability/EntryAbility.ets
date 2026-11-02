@@ -8,7 +8,9 @@ import {
   NOTIFICATION_SESSION_STORAGE_KEY
 } from '../services/AppNotificationService';
 import { AppBackgroundRuntimeService } from '../services/AppBackgroundRuntimeService';
+import { HuaweiPushRegistrationService } from '../services/HuaweiPushRegistrationService';
 
+const FOREGROUND_STORAGE_KEY = 'codexRemoteAppForeground';
 const WINDOW_WIDTH_STORAGE_KEY = 'codexRemoteWindowWidth';
 const WINDOW_HEIGHT_STORAGE_KEY = 'codexRemoteWindowHeight';
 const ACTIVE_SESSION_STORAGE_KEY = 'codexRemoteActiveSessionId';
@@ -29,7 +31,10 @@ export default class EntryAbility extends UIAbility {
   };
 
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
+    AppStorage.setOrCreate<number>('codexRemoteLastExitReason', launchParam.lastExitReason ?? AbilityConstant.LastExitReason.UNKNOWN);
     this.syncSystemDarkMode(this.context.config.colorMode);
+    AppStorage.setOrCreate<boolean>(FOREGROUND_STORAGE_KEY, false);
+    AppStorage.setOrCreate<boolean>('codexRemoteHdcRelayActive', false);
     AppStorage.setOrCreate<number>(WINDOW_WIDTH_STORAGE_KEY, 0);
     AppStorage.setOrCreate<number>(WINDOW_HEIGHT_STORAGE_KEY, 0);
     AppStorage.setOrCreate<string>(ACTIVE_SESSION_STORAGE_KEY, '');
@@ -47,13 +52,7 @@ export default class EntryAbility extends UIAbility {
     AppStorage.setOrCreate<string>(NOTIFICATION_EVENT_ID_STORAGE_KEY, '');
     AppStorage.setOrCreate<string>(NOTIFICATION_REVISION_STORAGE_KEY, '');
     this.applyNotificationTarget(want);
-    void AppBackgroundRuntimeService.ensureRunning(this.context, 'ability_create')
-      .then(() => {
-        console.info('[CodexRemote] Background runtime ready: ability_create');
-      })
-      .catch((error: Error) => {
-        console.error('[CodexRemote] Background runtime failed: ability_create: ' + error.message);
-      });
+    void HuaweiPushRegistrationService.attach(this);
     console.info('[CodexRemote] EntryAbility onCreate');
   }
 
@@ -66,19 +65,29 @@ export default class EntryAbility extends UIAbility {
   }
 
   onForeground(): void {
+    AppStorage.setOrCreate<boolean>(FOREGROUND_STORAGE_KEY, true);
     CompanionComputerLifecycle.setForeground(true);
-    void AppBackgroundRuntimeService.ensureRunning(this.context, 'ability_foreground')
+    if (AppStorage.get<boolean>('codexRemoteHdcRelayActive') === true) {
+      void AppBackgroundRuntimeService.ensureRunning(this.context, 'ability_foreground')
       .catch((error: Error) => {
         console.error('[CodexRemote] Background runtime failed: ability_foreground: ' + error.message);
       });
+    }
   }
 
   onBackground(): void {
+    AppStorage.setOrCreate<boolean>(FOREGROUND_STORAGE_KEY, false);
     CompanionComputerLifecycle.setForeground(false);
-    void AppBackgroundRuntimeService.ensureRunning(this.context, 'ability_background')
+    if (AppStorage.get<boolean>('codexRemoteHdcRelayActive') === true) {
+      void AppBackgroundRuntimeService.ensureRunning(this.context, 'ability_background')
       .catch((error: Error) => {
         console.error('[CodexRemote] Background runtime failed: ability_background: ' + error.message);
       });
+    }
+  }
+
+  onDestroy(): void {
+    HuaweiPushRegistrationService.detach();
   }
 
   onWindowStageCreate(windowStage: window.WindowStage): void {

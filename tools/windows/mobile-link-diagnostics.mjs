@@ -64,7 +64,11 @@ export async function inspectMobileLink({ baseUrl, headers = {}, getHeaders = ()
         if (collectSignals) {
           try {
             const body = await response.json();
-            if (['api_compatibility', 'auth', 'account', 'upstream'].includes(body?.failureClass)) failureClass = body.failureClass;
+            // A 5xx gateway failure can never authenticate: a body may carry a
+            // stale auth tag from a masked upstream error, so only trust body
+            // classes that stay consistent with the observed HTTP status.
+            if (['api_compatibility', 'auth', 'account', 'upstream'].includes(body?.failureClass)
+              && !(response.status >= 500 && body.failureClass === 'auth')) failureClass = body.failureClass;
           } catch { /* Gateway HTML is not diagnostic text. */ }
         }
         return { ok: false, httpStatus: response.status, ...(failureClass ? { failureClass } : {}) };

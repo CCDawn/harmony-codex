@@ -15,6 +15,7 @@ $stateDir=Join-Path $repo 'logs\state'
 $configPath=Join-Path $stateDir 'mobile-link-guardian-config.json'
 $statusPath=Join-Path $stateDir 'mobile-link-guardian-status.json'
 $runtimePath=Join-Path $stateDir 'mobile-link-guardian-runtime.json'
+$diagnosticsPath=Join-Path $stateDir 'mobile-link-guardian-diagnostics.json'
 $hostPath=(Get-Process -Id $PID).Path
 function Value($Object,[string]$Name,$Fallback=$null) {
   if ($null -eq $Object) { return $Fallback }
@@ -101,8 +102,97 @@ function Invoke-GuardianChild {
       }
     }
     if ($process.ExitCode -ne 0 -and $process.ExitCode -ne 2) { throw 'Guardian child failed' }
+    # A descendant that inherited this child's redirected pipes keeps them open
+    # past child exit; the pending ReadToEndAsync would then freeze this worker
+    # loop forever. Bound the drain and fail the round recognizably instead so
+    # the existing catch path records unconfirmed and the loop self-heals.
+    if (-not $stdout.Wait(5000) -or -not $stderr.Wait(5000)) { throw 'Guardian child output pipes still held by descendant' }
     ($stdout.Result | ConvertFrom-Json)
   } finally { $process.Dispose() }
+}
+function Test-GuardianBridgeQuick {
+  param([int]$Port)
+  # In-process cheap /health probe against the local bridge, mirroring the
+  # diagnostics child's own healthy check (ok=true with runtime.mode=desktop).
+  # The token comes from the same local bridge config that child reads and is
+  # only ever placed in the request header; it is never logged or persisted.
+  $headers=@{}
+  try {
+    $configFile=Join-Path $repo 'HarmonyCodexRemote\entry\src\main\ets\config\BridgeConfig.ets'
+    if([IO.File]::Exists($configFile)){
+      $tokenMatch=[regex]::Match([IO.File]::ReadAllText($configFile),'DEFAULT_BRIDGE_TOKEN:\s*string\s*=\s*[''"]([^''"]*)[''"]')
+      if($tokenMatch.Success -and $tokenMatch.Groups[1].Value){$headers['X-Codex-Bridge-Token']=$tokenMatch.Groups[1].Value}
+    }
+  } catch { }
+  try {
+    $health=Invoke-RestMethod -Uri ('http://127.0.0.1:{0}/health' -f $Port) -Headers $headers -TimeoutSec 3
+    [bool]((Value $health 'ok' $false) -eq $true -and [string](Value (Value $health 'runtime' $null) 'mode' '') -eq 'desktop')
+  } catch { $false }
+}
+function Get-GuardianBridgeBudget {
+  param($Runtime)
+  $budgets=Value $Runtime 'componentBudgets' $null
+  if(-not $budgets){
+    $budgets=[pscustomobject]@{}
+    Add-Member -InputObject $Runtime -NotePropertyName componentBudgets -NotePropertyValue $budgets -Force
+  }
+  $bridge=Value $budgets 'bridge' $null
+  if(-not $bridge){
+    $bridge=[pscustomobject]@{failures=0;attempts=0;cooldownUntil=$null}
+    Add-Member -InputObject $budgets -NotePropertyName bridge -NotePropertyValue $bridge -Force
+  }
+  $bridge
+}
+function Get-GuardianInstant($Value) {
+  # ConvertFrom-Json hands cooldown stamps back as UTC datetimes; a [string]
+  # round-trip would lose the Kind and reinterpret the wall clock as local
+  # time. Parse the original value directly instead.
+  if($null -eq $Value){ return [datetimeoffset]::MinValue }
+  if($Value -is [datetimeoffset]){ return $Value }
+  if($Value -is [datetime]){
+    if($Value.Kind -eq [DateTimeKind]::Local){ return [datetimeoffset]::new($Value) }
+    return [datetimeoffset]::new([datetime]::SpecifyKind($Value,[DateTimeKind]::Utc))
+  }
+  return [datetimeoffset]::Parse([string]$Value,[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::RoundtripKind)
+}
+function Test-GuardianBridgeFastRepair {
+  # Mirror of the policy per-component walk for bridge: an active cooldown
+  # blocks the round, three consumed attempts enter a five minute cooldown, and
+  # a served cooldown opens a fresh window. Advances the bridge budget in place
+  # (failures/attempts +1 per existing semantics) and returns $true only when
+  # this round must run the fast restart_services repair.
+  param($Runtime)
+  $bridge=Get-GuardianBridgeBudget -Runtime $Runtime
+  $attempts=[int](Value $bridge 'attempts' 0)
+  $cooldown=Value $bridge 'cooldownUntil' $null
+  if($null -ne $cooldown){
+    $cooling=$false
+    try { $cooling=[datetimeoffset]::UtcNow.UtcTicks -lt (Get-GuardianInstant $cooldown).UtcTicks } catch { $cooling=$false }
+    if($cooling){ return $false }
+  }
+  if($attempts -ge 3){
+    if($cooldown){
+      $bridge.attempts=0; $bridge.failures=1; $bridge.cooldownUntil=$null
+    } else {
+      $bridge.cooldownUntil=[datetime]::UtcNow.AddMinutes(5).ToString('o')
+      return $false
+    }
+  }
+  $bridge.failures=[int](Value $bridge 'failures' 0)+1
+  $bridge.attempts=[int](Value $bridge 'attempts' 0)+1
+  return $true
+}
+function Test-GuardianManualFaultPresent {
+  # A persisted manual fault (repairable:false, e.g. companion auth) cannot be
+  # fixed by any restart, so the fast path must stand down and let the policy
+  # surface needs_attention instead of running another restart_services round.
+  $snapshot=Read-GuardianJson $diagnosticsPath $null
+  $signals=Value $snapshot 'guardianSignals' $null
+  $faults=Value $signals 'faults' @()
+  foreach($fault in @($faults)) {
+    if($null -ne $fault -and (Value $fault 'repairable' $true) -ne $true) { return $true }
+  }
+  return $false
 }
 function Ensure-GuardianWorker {
   if ((Value (Get-GuardianConfig) 'enabled' $false) -ne $true) { return }
@@ -170,10 +260,80 @@ try {
       $script:workerStatus=$saved
       try {
         $diagnostics=[pscustomobject]@{checks=@();guardianSignals=@{faults=@()}}
+        $probed=$false
+        $fastBridgeRepair=$false
+        if ((Value $config 'enabled' $false) -eq $true -and -not (Test-MobileLinkPaused $repo)) {
+          # Cheap in-process bridge probe before spawning the full diagnostic
+          # child. Two consecutive failures with an un-cooled bridge budget
+          # short-circuit the reconnect round that cannot help the bridge. The
+          # streak persists through the worker-owned runtime field so a
+          # restarted worker keeps counting.
+          $probed=$true
+          $probeHealthy=Test-GuardianBridgeQuick -Port $BridgePort
+          $bridgeProbeFailures=if($probeHealthy){0}else{[int](Value $runtime 'bridgeQuickStreak' 0)+1}
+          # A persisted manual fault (repairable:false) means restarts cannot
+          # help this window; gate the fast path so the policy round decides.
+          if(-not $probeHealthy -and $bridgeProbeFailures -ge 2 -and -not (Test-GuardianManualFaultPresent)){ $fastBridgeRepair=Test-GuardianBridgeFastRepair -Runtime $runtime }
+        }
+        if ($fastBridgeRepair) {
+          # Worker-owned bridge round: the budget advanced above, so commit the
+          # state before the repair child. Policy is skipped this round so the
+          # same fault window cannot be repaired twice; the full diagnostic
+          # still runs below for the snapshot and the other components.
+          $fastConfig=Get-GuardianConfig
+          if ((Value $fastConfig 'enabled' $false) -eq $true -and -not (Test-MobileLinkPaused $repo)) {
+            $runtime | Add-Member -NotePropertyName bridgeQuickStreak -NotePropertyValue 0 -Force
+            $runtime | Add-Member -NotePropertyName configUpdatedAt -NotePropertyValue (Value $fastConfig 'updatedAt') -Force
+            # Mirror the policy aggregates over the component budgets so the
+            # next slow round inherits consistent public counters.
+            $maxFailures=0;$maxAttempts=0;$earliestCooldown=$null;$earliestTick=[long]::MaxValue
+            $fastBudgets=Value $runtime 'componentBudgets' $null
+            if($fastBudgets){ foreach($entry in $fastBudgets.PSObject.Properties){
+              $value=[int](Value $entry.Value 'attempts' 0); if($value -gt $maxAttempts){$maxAttempts=$value}
+              $value=[int](Value $entry.Value 'failures' 0); if($value -gt $maxFailures){$maxFailures=$value}
+              $cooldown=Value $entry.Value 'cooldownUntil' $null
+              if($null -ne $cooldown){ try {
+                $tick=(Get-GuardianInstant $cooldown).UtcTicks
+                if($tick -lt $earliestTick){$earliestCooldown=$cooldown;$earliestTick=$tick}
+              } catch { } } } }
+            $runtime | Add-Member -NotePropertyName failures -NotePropertyValue $maxFailures -Force
+            $runtime | Add-Member -NotePropertyName attempts -NotePropertyValue $maxAttempts -Force
+            $runtime | Add-Member -NotePropertyName cooldownUntil -NotePropertyValue $earliestCooldown -Force
+            Write-GuardianJson $runtimePath $runtime
+            $status=$saved
+            $status.phase='repairing'; $status.summary='正在恢复本地桥接服务'
+            $status.lastRepairAt=[datetime]::UtcNow.ToString('o')
+            $status.heartbeatAt=$status.lastRepairAt
+            $status.nextCheckAt=[datetime]::UtcNow.AddSeconds(15).ToString('o')
+            $status.attempts=$maxAttempts
+            $script:workerStatus=$status
+            Write-GuardianJson $statusPath $status
+            $outcome='requested';$message='已执行恢复，等待下一次独立检测确认'
+            try {
+              $result=Invoke-GuardianChild -Executable $hostPath -Arguments @('-NoProfile','-ExecutionPolicy','Bypass','-File',(Join-Path $PSScriptRoot 'mobile-link-control.ps1'),'-Action','GuardianRepair','-GuardianStage','restart_services','-GuardianComponents','bridge','-BridgePort',"$BridgePort") -TimeoutSeconds 270
+              if ((Value $result 'skipped' $false) -eq $true) {$outcome='skipped';$message='守护已关闭或链路已停止，取消待执行恢复'}
+            } catch {$outcome='unconfirmed';$message='恢复未确认完成，将按下一次检测结果处理'}
+            $status.history=@(@(@($status.history)+@(@{at=[datetime]::UtcNow.ToString('o');action='restart_services';outcome=$outcome;message=$message})) | Select-Object -Last 20)
+            $status.heartbeatAt=[datetime]::UtcNow.ToString('o')
+            $started=[datetime]::UtcNow
+            $status.nextCheckAt=$started.AddSeconds(15).ToString('o')
+            $status.summary=$message
+            Write-GuardianJson $statusPath $status
+          } else { $fastBridgeRepair=$false }
+        }
         if ((Value $config 'enabled' $false) -eq $true -and -not (Test-MobileLinkPaused $repo)) {
           $voice=Get-MobileVoiceTunnelStatus $repo
           $diagnostics=Invoke-GuardianChild -Executable (Get-Command node -ErrorAction Stop).Source -Arguments @((Join-Path $PSScriptRoot 'mobile-link-diagnostics.mjs'),'--port',"$BridgePort",'--paused','false','--voice-state',([string](Value $voice 'state' 'unverified')),'--guardian-json') -TimeoutSeconds 60
+          # Persist the successful child output verbatim plus checkedAt (the
+          # only worker-added field) for read-only consumers. A failed,
+          # timed-out or unparseable round leaves the previous snapshot in
+          # place so it can age out; it is never deleted here.
+          $snapshot=$diagnostics | Select-Object -Property *
+          Add-Member -InputObject $snapshot -NotePropertyName checkedAt -NotePropertyValue ([datetime]::UtcNow.ToString('o')) -Force
+          Write-GuardianJson $diagnosticsPath $snapshot
         }
+        if ($probed -and -not $fastBridgeRepair) { $runtime | Add-Member -NotePropertyName bridgeQuickStreak -NotePropertyValue ([int]$bridgeProbeFailures) -Force }
+        if (-not $fastBridgeRepair) {
         $config=Get-GuardianConfig
         $input=@{config=$config;state=$runtime;diagnostics=$diagnostics;paused=(Test-MobileLinkPaused $repo);now=[datetime]::UtcNow.ToString('o')} | ConvertTo-Json -Depth 12 -Compress
         $decision=Invoke-GuardianChild -Executable (Get-Command node -ErrorAction Stop).Source -Arguments @((Join-Path $PSScriptRoot 'mobile-link-guardian-policy.mjs')) -InputJson $input -TimeoutSeconds 10
@@ -196,6 +356,7 @@ try {
           $status.nextCheckAt=$started.AddSeconds(15).ToString('o')
           $status.summary=$message
           Write-GuardianJson $statusPath $status
+        }
         }
       } catch {
         $status=Get-GuardianStatus

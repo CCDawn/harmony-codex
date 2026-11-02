@@ -1,0 +1,24 @@
+{
+  "ready": true,
+  "microphoneUsed": false,
+  "events": [
+    {
+      "type": "progress",
+      "stage": "assistant",
+      "elapsedMs": 390
+    },
+    {
+      "type": "progress",
+      "stage": "media",
+      "elapsedMs": 60765
+    },
+    {
+      "type": "ready",
+      "elapsedMs": 60765
+    },
+    {
+      "type": "closed",
+      "elapsedMs": 60922
+    }
+  ]
+}

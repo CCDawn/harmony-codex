@@ -1,0 +1,146 @@
+[
+  {
+    "time": "2026-10-09T15:05:18.574Z",
+    "inputBytes": 147200,
+    "inputAgeSeconds": 0.0,
+    "peer": "connected"
+  },
+  {
+    "time": "2026-10-09T15:05:23.574Z",
+    "inputBytes": 307200,
+    "inputAgeSeconds": 0.0,
+    "peer": "connected"
+  },
+  {
+    "time": "2026-10-09T15:05:28.567Z",
+    "inputBytes": 467200,
+    "inputAgeSeconds": 0.0,
+    "peer": "connected"
+  },
+  {
+    "time": "2026-10-09T15:05:33.577Z",
+    "inputBytes": 627200,
+    "inputAgeSeconds": 0.0,
+    "peer": "connected"
+  },
+  {
+    "time": "2026-10-09T15:05:38.577Z",
+    "inputBytes": 787200,
+    "inputAgeSeconds": 0.0,
+    "peer": "connected"
+  },
+  {
+    "time": "2026-10-09T15:05:43.576Z",
+    "inputBytes": 947200,
+    "inputAgeSeconds": 0.0,
+    "peer": "connected"
+  },
+  {
+    "time": "2026-10-09T15:05:48.575Z",
+    "inputBytes": 1107200,
+    "inputAgeSeconds": 0.0,
+    "peer": "connected"
+  },
+  {
+    "time": "2026-10-09T15:05:53.577Z",
+    "inputBytes": 1200000,
+    "inputAgeSeconds": 2.1,
+    "peer": "connected"
+  },
+  {
+    "time": "2026-10-09T15:05:58.577Z",
+    "inputBytes": 1200000,
+    "inputAgeSeconds": 7.1,
+    "peer": "connected"
+  },
+  {
+    "time": "2026-10-09T15:06:03.584Z",
+    "inputBytes": 1200000,
+    "inputAgeSeconds": 12.2,
+    "peer": "connected"
+  },
+  {
+    "time": "2026-10-09T15:06:08.583Z",
+    "inputBytes": 1200000,
+    "inputAgeSeconds": 17.2,
+    "peer": "connected"
+  },
+  {
+    "time": "2026-10-09T15:06:13.566Z",
+    "inputBytes": 1200000,
+    "inputAgeSeconds": 22.1,
+    "peer": "connected"
+  },
+  {
+    "time": "2026-10-09T15:06:18.590Z",
+    "inputBytes": 1200000,
+    "inputAgeSeconds": 27.2,
+    "peer": "connected"
+  },
+  {
+    "time": "2026-10-09T15:06:23.589Z",
+    "inputBytes": 1200000,
+    "inputAgeSeconds": 32.2,
+    "peer": "connected"
+  },
+  {
+    "time": "2026-10-09T15:06:28.582Z",
+    "inputBytes": 1200000,
+    "inputAgeSeconds": 37.2,
+    "peer": "connected"
+  },
+  {
+    "time": "2026-10-09T15:06:33.568Z",
+    "inputBytes": 1200000,
+    "inputAgeSeconds": 42.1,
+    "peer": "connected"
+  },
+  {
+    "time": "2026-10-09T15:06:38.578Z",
+    "inputBytes": 1334400,
+    "inputAgeSeconds": 0.0,
+    "peer": "connected"
+  },
+  {
+    "time": "2026-10-09T15:06:43.574Z",
+    "inputBytes": 1484800,
+    "inputAgeSeconds": 0.0,
+    "peer": "connected"
+  },
+  {
+    "time": "2026-10-09T15:06:48.572Z",
+    "inputBytes": 1654400,
+    "inputAgeSeconds": 0.0,
+    "peer": "connected"
+  },
+  {
+    "time": "2026-10-09T15:06:53.572Z",
+    "inputBytes": 1811200,
+    "inputAgeSeconds": 0.1,
+    "peer": "connected"
+  },
+  {
+    "time": "2026-10-09T15:06:58.566Z",
+    "inputBytes": 1974400,
+    "inputAgeSeconds": 0.0,
+    "peer": "connected"
+  },
+  {
+    "time": "2026-10-09T15:07:03.577Z",
+    "inputBytes": 2131200,
+    "inputAgeSeconds": 0.1,
+    "peer": "connected"
+  },
+  {
+    "time": "2026-10-09T15:07:08.576Z",
+    "inputBytes": 2294400,
+    "inputAgeSeconds": 0.0,
+    "peer": "connected"
+  },
+  {
+    "time": "2026-10-09T15:07:13.580Z",
+    "inputBytes": 2454400,
+    "inputAgeSeconds": 0.0,
+    "peer": "connected"
+  }
+]

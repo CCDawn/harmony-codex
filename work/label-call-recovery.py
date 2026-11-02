@@ -1,0 +1,6 @@
+from pathlib import Path
+p=Path('src/companionCallLifecycle.js');s=p.read_text(encoding='utf-8').replace('      await this.stop(); // Failure retains the receipt and prevents creation.', '''      try { await this.stop(); }
+      catch (error) { error.operation = 'reconcile'; throw error; } // Receipt stays pending.''');p.write_text(s,encoding='utf-8')
+p=Path('voice/companion_rpc.mjs');s=p.read_text(encoding='utf-8').replace('error: message })','error: message, operation: error?.operation === \'reconcile\' ? \'reconcile\' : request?.method })');p.write_text(s,encoding='utf-8')
+p=Path('voice/companion_session.py');s=p.read_text(encoding='utf-8').replace('operation = method if method in {"discover", "history", "start", "attach", "stop"} else "unknown"','operation = "reconcile" if response.get("operation") == "reconcile" else (\n                    method if method in {"discover", "history", "start", "attach", "stop"} else "unknown")');p.write_text(s,encoding='utf-8')
+p=Path('test/companionCallLifecycle.test.js');s=p.read_text(encoding='utf-8').replace('await assert.rejects(lifecycle.start({}),{status:502});','await assert.rejects(lifecycle.start({}),{status:502,operation:\'reconcile\'});');p.write_text(s,encoding='utf-8')

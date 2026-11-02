@@ -1,0 +1,22 @@
+{
+  "ready": false,
+  "microphoneUsed": false,
+  "events": [
+    {
+      "type": "progress",
+      "stage": "assistant",
+      "elapsedMs": 687
+    },
+    {
+      "type": "error",
+      "failureStage": "assistant",
+      "errorCode": "timeout",
+      "operation": "start",
+      "elapsedMs": 56656
+    },
+    {
+      "type": "closed",
+      "elapsedMs": 56687
+    }
+  ]
+}

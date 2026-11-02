@@ -4,58 +4,96 @@ import test from 'node:test';
 import { DesktopInteractionClient } from '../src/desktopInteractionClient.js';
 
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
-function harness(conversation = { requests: [], turns: [] }, { legacy = false } = {}) {
+function harness(conversation = { requests: [], turns: [] }, { legacy = true, modern = false } = {}) {
+  const mounted = legacy || modern;
   const calls = [];
   let generation = 1;
   let opens = 0;
   let fetches = 0;
   let sharedSource = 'function read(){let r=local.appServerManagers;let s=q$?.appServerManagers};export{q$ as fN}';
   let confirmReplies = true;
+  let emitResolution = true, listener = null, disposed = 0, subscribeHook = () => {}, breakRemote = () => {};
   let afterReply = () => {};
   const makeManager = () => {
     const current = generation;
     const assertCurrent = () => { if (current !== generation) throw new Error('retired'); };
     const manager = { getHostId() { return 'local'; },
       async getConversation(threadId) { assertCurrent(); assert.equal(threadId, 'thread-1'); return conversation; } };
+    manager.subscribe = options => {
+      assert.equal(options.type, 'notification');
+      assert.equal(options.key.hostId, 'local');
+      assert.equal(options.methods, 'serverRequest/resolved');
+      listener = options.listener;
+      const remote = { onRpcBroken(callback) { breakRemote = callback; }, [Symbol.dispose]() { disposed++; listener = null; } };
+      const pending = Promise.resolve(remote);
+      pending.onRpcBroken = () => {};
+      pending[Symbol.dispose] = () => { disposed++; };
+      subscribeHook(options);
+      return pending;
+    };
     for (const method of ['replyWithCommandExecutionApprovalDecision', 'replyWithFileChangeApprovalDecision',
       'replyWithPermissionsRequestApprovalResponse', 'replyWithUserInputResponse', 'sendFollowUpMessage']) {
       manager[method] = async (...args) => {
         assertCurrent(); calls.push({ method, args });
         if (confirmReplies && method === 'sendFollowUpMessage') {
           conversation.turns.push({ turnId: 'follow-up', items: [{ type: 'userMessage', content: [{ type: 'text', text: args[1].prompt }] }] });
-        } else if (confirmReplies) conversation.requests = conversation.requests.filter(request => request.id !== args[1]);
+        } else if (confirmReplies) {
+          conversation.requests = conversation.requests.filter(request => request.id !== args[1]);
+          if (emitResolution) listener?.({ method: 'serverRequest/resolved', params: { threadId: args[0], requestId: args[1] } });
+        }
         afterReply(method, args);
       };
     }
     return manager;
   };
-  const runtime = { appServerManagers: legacy ? undefined : { async open(hostId) {
+  const runtime = { appServerManagers: mounted ? undefined : { async open(hostId) {
     assert.equal(hostId, 'local');
     opens += 1;
     return { status: 'ready', manager: makeManager() };
   } } };
   const window = {};
   const managerFamily = {};
+  const questionStateFamily = {};
   let legacyManager = makeManager();
-  const binding = { get: () => legacyManager };
+  const wrapped = { hostId: 'local', get rpc() { return legacyManager; } };
+  const binding = { get: () => modern ? { status: 'ready', client: wrapped } : legacyManager };
   let owner = { familyBindings: new Map([[managerFamily, new Map([['local', { value: binding }]])]]) };
   const provider = { tag: 10, memoizedProps: { value: new Map([[Symbol('app'), owner]]) } };
-  if (legacy) {
+  if (legacy && !modern) {
     sharedSource += ';class Registry{getForHostId(h){return this.scope.get(hosts).includes(h)?this.scope.get(family$,h):null}};export{family$ as liveFamily}';
+    window.__codexRoot = { _internalRoot: { current: { child: provider } } };
+  }
+  if (modern) {
+    sharedSource = 'import{liveFamily as family$}from"./app-initial-123abc.js";function publish(scope,host,rpc){scope.set(family$,host,{status:`ready`,client:{hostId:host,rpc:rpc}})}';
     window.__codexRoot = { _internalRoot: { current: { child: provider } } };
   }
   const document = { scripts: [{ type: 'module', src: 'app://-/assets/index.js' }] };
   const fetch = async url => {
     fetches += 1;
-    return { text: async () => url.endsWith('index.js') ? 'import "./app-shared-123abc.js";' : sharedSource };
+    return { text: async () => url.endsWith('index.js') ? (modern ? 'import "./renderer-app-server-managers-123abc.js";' : 'import "./app-shared-123abc.js";') : url.includes('app-initial-') ? 'export{family as liveFamily};' : sharedSource };
   };
   const client = { hostId: 'local', async ensureConnected() {}, async evaluate(expression) {
     const run = new AsyncFunction('window', 'document', 'fetch', 'importModule', 'URL', 'crypto',
-      'return ' + expression.replace('await import(assetUrl)', 'await importModule(assetUrl)'));
-    return run(window, document, fetch, async () => ({ fN: runtime, liveFamily: managerFamily }), URL, { randomUUID });
+      'return ' + expression.replaceAll('await import(assetUrl)', 'await importModule(assetUrl)'));
+    return run(window, document, fetch, async () => ({ fN: runtime, liveFamily: managerFamily, questionState: questionStateFamily }), URL, { randomUUID });
   } };
   return { api: new DesktopInteractionClient(client), client, calls, conversation,
-    retire() { generation += 1; if (legacy) legacyManager = makeManager(); },
+    retire() { generation += 1; if (mounted) legacyManager = makeManager(); },
+    addMountedBinding(manager, hostId = 'local') {
+      const otherClient = { hostId, rpc: manager };
+      const otherOwner = { familyBindings: new Map([[managerFamily, new Map([[hostId, { value: { get: () => modern ? { status: 'ready', client: otherClient } : manager } }]])]]) };
+      provider.memoizedProps.value.set(Symbol('other'), otherOwner);
+    },
+    addLargeMountedTree() {
+      let fiber = provider;
+      for (let index = 0; index < 100001; index++) fiber = fiber.sibling = {};
+    },
+    mountQuestionState(value) {
+      sharedSource += ';function skip(){scope.set(questionFamily$,key,{...prior,isSkipped:!0})};export{questionFamily$ as questionState}';
+      const scope = { hostId: 'local', threadId: 'thread-1', entityKey: 'turn:turn-1',
+        itemId: JSON.stringify(['request_user_input_async', 'item-1', 0]) };
+      owner.familyBindings.set(questionStateFamily, new Map([[JSON.stringify(scope), { value: { get: () => value } }]]));
+    },
     removeLegacyFamily() { owner.familyBindings.clear(); },
     replaceLegacyProvider() {
       owner = { familyBindings: new Map([[managerFamily, new Map([['local', { value: binding }]])]]) };
@@ -67,11 +105,90 @@ function harness(conversation = { requests: [], turns: [] }, { legacy = false } 
     set sharedSource(value) { sharedSource = value; },
     set confirmReplies(value) { confirmReplies = value; },
     set afterReply(value) { afterReply = value; },
+    set emitResolution(value) { emitResolution = value; },
+    set subscribeHook(value) { subscribeHook = value; },
+    notify(event) { listener?.(event); },
+    breakRpc() { breakRemote(); },
+    get disposed() { return disposed; },
     get fetches() { return fetches; }, get opens() { return opens; } };
 }
 function native(method, id = 17) {
   return { id, method, params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'item-1', reason: 'Review this operation' } };
 }
+
+test('current bundle with imported host facade and no registry getter reuses the unique mounted manager', async () => {
+  const h = harness({ requests: [native('item/commandExecution/requestApproval')], turns: [] }, { modern: true });
+  const [ticket] = await h.api.listRequests('thread-1');
+  assert.equal(ticket.id, 17);
+  assert.equal(h.opens, 0);
+  assert.equal(h.calls.length, 0);
+  const [same] = await h.api.listRequests('thread-1');
+  assert.equal(same.__desktopGeneration, ticket.__desktopGeneration);
+});
+
+test('mounted fallback refuses ambiguity, wrong host and incomplete manager contracts', async () => {
+  for (const change of [h => h.addMountedBinding({ ...h.legacyManager }),
+    h => { h.legacyManager.getHostId = () => 'foreign'; },
+    h => { delete h.legacyManager.replyWithPermissionsRequestApprovalResponse; }]) {
+    const h = harness(undefined, { modern: true });
+    change(h);
+    await assert.rejects(h.api.listRequests('thread-1'), { code: 'DESKTOP_INTERACTIONS_UNAVAILABLE', statusCode: 503 });
+    assert.equal(h.opens, 0);
+    assert.equal(h.calls.length, 0);
+  }
+});
+
+test('mounted fallback ignores foreign host bindings and invalidates replaced owner generations', async () => {
+  for (const replace of [h => h.retire(), h => h.replaceLegacyProvider()]) {
+    const h = harness({ requests: [native('item/commandExecution/requestApproval')], turns: [] }, { modern: true });
+    h.addMountedBinding({ ...h.legacyManager }, 'foreign');
+    const [old] = await h.api.listRequests('thread-1');
+    replace(h);
+    await assert.rejects(h.api.respond('thread-1', old, { decision: 'accept' }), { code: 'DESKTOP_REQUEST_STALE' });
+    const [fresh] = await h.api.listRequests('thread-1');
+    assert.notEqual(fresh.__desktopGeneration, old.__desktopGeneration);
+    assert.equal(h.opens, 0);
+    assert.equal(h.calls.length, 0);
+  }
+});
+
+test('current bundle fallback preserves the mounted desktop skip and submission state of async questions', async () => {
+  const h = harness({ requests: [], turns: [{ turnId: 'turn-1', status: 'inProgress', items: [
+    { id: 'item-1', type: 'agentMessage', questions: [{ title: 'Choose' }] }
+  ] }] }, { modern: true });
+  const official = { turnId: 'turn-1', isSkipped: true };
+  h.mountQuestionState(official);
+  assert.deepEqual(await h.api.listRequests('thread-1'), []);
+  official.isSkipped = false;
+  assert.equal((await h.api.listRequests('thread-1')).length, 1);
+  official.lastSubmission = {};
+  assert.deepEqual(await h.api.listRequests('thread-1'), []);
+  assert.equal(h.opens, 0);
+  assert.equal(h.calls.length, 0);
+});
+
+test('client failure stages are fixed metadata and never contain renderer or transport details', async () => {
+  const h = harness(undefined, { modern: true });
+  h.removeLegacyFamily();
+  await assert.rejects(h.api.listRequests('thread-1'), { code: 'DESKTOP_INTERACTIONS_UNAVAILABLE', stage: 'mounted-manager' });
+  h.client.evaluate = async () => ({ __desktopInteractionError: true, code: 'PRIVATE_BODY', stage: 'PRIVATE_SOURCE' });
+  await assert.rejects(h.api.listRequests('thread-1'), error => {
+    assert.equal(error.code, 'DESKTOP_INTERACTIONS_UNAVAILABLE');
+    assert.equal(error.stage, 'renderer');
+    assert.doesNotMatch(JSON.stringify(error), /PRIVATE/);
+    return true;
+  });
+  h.client.ensureConnected = async () => { throw new Error('PRIVATE_TRANSPORT'); };
+  await assert.rejects(h.api.listRequests('thread-1'), { code: 'DESKTOP_INTERACTIONS_UNAVAILABLE', stage: 'transport' });
+});
+
+test('mounted discovery checks uniqueness throughout a tree larger than 100000 nodes', async () => {
+  const h = harness(undefined, { modern: true });
+  h.addLargeMountedTree();
+  assert.deepEqual(await h.api.listRequests('thread-1'), []);
+  assert.equal(h.opens, 0);
+  assert.equal(h.calls.length, 0);
+});
 
 test('undefined native service uses the existing legacy UI manager without opening a host', async () => {
   const h = harness({ requests: [native('item/commandExecution/requestApproval')], turns: [] }, { legacy: true });
@@ -135,7 +252,64 @@ test('native requests are projected without conversation text and replies unpack
     { permissions: { fileSystem: { write: ['/repo'] } }, scope: 'turn' }, { answers: { question: { answers: ['A'] } } }];
   for (let i = 0; i < snapshot.length; i += 1) await h.api.respond('thread-1', snapshot[i], results[i]);
   assert.deepEqual(h.calls.map(call => call.args[2]), ['accept', 'decline', results[2], results[3]]);
-  assert.equal(h.opens, 1);
+  assert.equal(h.opens, 0);
+});
+
+test('native response requires the matching server resolution event, not optimistic request removal', async () => {
+  const h = harness({ requests: [native('item/tool/requestUserInput')], turns: [] });
+  h.emitResolution = false;
+  h.afterReply = (_method, args) => {
+    h.notify({ method: 'serverRequest/resolved', params: { threadId: 'other', requestId: args[1] } });
+    h.notify({ method: 'serverRequest/resolved', params: { threadId: args[0], requestId: String(args[1]) } });
+  };
+  const [ticket] = await h.api.listRequests('thread-1');
+  await assert.rejects(h.api.respond('thread-1', ticket, { answers: {} }), { code: 'DESKTOP_RESPONSE_UNCONFIRMED' });
+  assert.equal(h.calls.length, 1);
+  assert.equal(h.conversation.requests.length, 0);
+  assert.equal(h.disposed, 2);
+});
+
+test('a broken native subscription cannot report success or replay a submitted answer', async () => {
+  const h = harness({ requests: [native('item/tool/requestUserInput')], turns: [] });
+  h.emitResolution = false;
+  h.afterReply = () => h.breakRpc();
+  const [ticket] = await h.api.listRequests('thread-1');
+  await assert.rejects(h.api.respond('thread-1', ticket, { answers: {} }), { code: 'DESKTOP_RESPONSE_UNCONFIRMED' });
+  assert.equal(h.calls.length, 1);
+  assert.equal(h.disposed, 2);
+});
+
+test('a request changed during subscription handshake cannot be written', async () => {
+  const h = harness({ requests: [native('item/tool/requestUserInput')], turns: [] });
+  h.subscribeHook = () => { h.conversation.requests[0].params.reason = 'changed'; };
+  const [ticket] = structuredClone(await h.api.listRequests('thread-1'));
+  await assert.rejects(h.api.respond('thread-1', ticket, { answers: {} }), { code: 'DESKTOP_REQUEST_STALE' });
+  assert.equal(h.calls.length, 0);
+  assert.equal(h.disposed, 2);
+});
+
+test('native resolution matches method, exact thread and typed request id, and disposes the subscription', async () => {
+  const h = harness({ requests: [native('item/tool/requestUserInput')], turns: [] });
+  h.confirmReplies = false;
+  h.afterReply = (_method, args) => {
+    h.notify({ method: 'serverRequest/resolved', params: { threadId: 'other', requestId: args[1] } });
+    h.notify({ method: 'serverRequest/resolved', params: { threadId: args[0], requestId: String(args[1]) } });
+    h.notify({ method: 'other', params: { threadId: args[0], requestId: args[1] } });
+    h.notify({ method: 'serverRequest/resolved', params: { threadId: args[0], requestId: args[1] } });
+  };
+  const [ticket] = await h.api.listRequests('thread-1');
+  assert.deepEqual(await h.api.respond('thread-1', ticket, { answers: {} }), { ok: true, requestId: 17 });
+  assert.equal(h.disposed, 2);
+});
+
+test('a resolution seen before dispatch makes the ticket stale without writing', async () => {
+  const h = harness({ requests: [native('item/tool/requestUserInput')], turns: [] });
+  h.subscribeHook = options => options.listener({ method: 'serverRequest/resolved',
+    params: { threadId: 'thread-1', requestId: 17 } });
+  const [ticket] = await h.api.listRequests('thread-1');
+  await assert.rejects(h.api.respond('thread-1', ticket, { answers: {} }), { code: 'DESKTOP_REQUEST_STALE' });
+  assert.equal(h.calls.length, 0);
+  assert.equal(h.disposed, 2);
 });
 
 test('removed, changed, completed and differently typed request ids cannot authorize a reply', async () => {
@@ -237,12 +411,12 @@ test('validated runtime parsing is cached and failed parsing can recover', async
   const h = harness();
   h.sharedSource = 'function oldDesktop(){}';
   await assert.rejects(h.api.listRequests('thread-1'), { code: 'DESKTOP_INTERACTIONS_UNAVAILABLE' });
-  h.sharedSource = 'function read(){let r=local.appServerManagers;let s=q$?.appServerManagers};export{q$ as fN}';
+  h.sharedSource = 'class Registry{getForHostId(h){return this.scope.get(hosts).includes(h)?this.scope.get(family$,h):null}};export{family$ as liveFamily}';
   assert.deepEqual(await h.api.listRequests('thread-1'), []);
   const fetches = h.fetches;
   await Promise.all([h.api.listRequests('thread-1'), h.api.listRequests('thread-1')]);
   assert.equal(h.fetches, fetches);
-  assert.equal(h.opens, 1);
+  assert.equal(h.opens, 0);
 });
 
 test('async tickets remain stable when another message adds questions to the same turn', async () => {

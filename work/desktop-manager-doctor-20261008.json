@@ -1,0 +1,66 @@
+{
+    "ok":  false,
+    "generatedAt":  "2026-10-08T14:19:04.4001806+08:00",
+    "repoRoot":  "C:\\Users\\Administrator\\Documents\\Codex\\2026-09-08\\https-github-com-ccdawn-codex-harmony-2\\work\\codex-harmony-local-1.0.14",
+    "bridgeUrl":  "https://jiaolong-16pro.tail6b2a30.ts.net",
+    "checks":  [
+                   {
+                       "id":  "node",
+                       "status":  "ok",
+                       "message":  "node v24.15.0",
+                       "details":  {
+                                       "path":  "C:\\Users\\Administrator\\AppData\\Local\\BossAI\\runtimes\\node-v24.15.0-win-x64\\node.exe"
+                                   }
+                   },
+                   {
+                       "id":  "npm",
+                       "status":  "ok",
+                       "message":  "npm 11.12.1",
+                       "details":  {
+                                       "path":  "C:\\Users\\Administrator\\AppData\\Local\\BossAI\\runtimes\\node-v24.15.0-win-x64\\npm.ps1"
+                                   }
+                   },
+                   {
+                       "id":  "package",
+                       "status":  "ok",
+                       "message":  "package.json found",
+                       "details":  null
+                   },
+                   {
+                       "id":  "bridge",
+                       "status":  "warn",
+                       "message":  "bridge health unavailable: 远程服务器返回错误: (401) 未经授权。",
+                       "details":  {
+                                       "url":  "https://jiaolong-16pro.tail6b2a30.ts.net/health"
+                                   }
+                   },
+                   {
+                       "id":  "sessions",
+                       "status":  "warn",
+                       "message":  "session API unavailable: 远程服务器返回错误: (401) 未经授权。",
+                       "details":  null
+                   },
+                   {
+                       "id":  "cdp",
+                       "status":  "warn",
+                       "message":  "CDP not reachable through bridge or direct probe: 远程服务器返回错误: (401) 未经授权。",
+                       "details":  null
+                   },
+                   {
+                       "id":  "hdc",
+                       "status":  "warn",
+                       "message":  "hdc list targets completed",
+                       "details":  {
+                                       "output":  "[Empty]\n",
+                                       "exitCode":  0,
+                                       "target":  "default"
+                                   }
+                   },
+                   {
+                       "id":  "relay-config",
+                       "status":  "ok",
+                       "message":  "relay config present for 47.98.197.156:19078",
+                       "details":  null
+                   }
+               ]
+}

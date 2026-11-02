@@ -220,7 +220,7 @@ export class DesktopScriptBridge extends EventEmitter {
       return [];
     }
     if (this.pendingCommands.length > 0) {
-      return this.pendingCommands.splice(0, 20);
+      return this.takePendingCommands();
     }
     const pollKey = this.scriptId ?? normalizeString(scriptId) ?? 'default';
     const previousPoll = this.activePolls.get(pollKey);
@@ -234,7 +234,7 @@ export class DesktopScriptBridge extends EventEmitter {
       }, this.pollTimeoutMs);
       const onCommands = () => {
         cleanup();
-        resolve(this.pendingCommands.splice(0, 20));
+        resolve(this.takePendingCommands());
       };
       const cleanup = () => {
         clearTimeout(timeout);
@@ -251,6 +251,32 @@ export class DesktopScriptBridge extends EventEmitter {
         }
       });
       this.on('commands', onCommands);
+    });
+  }
+
+  takePendingCommands() {
+    const commands = this.pendingCommands.splice(0, 20);
+    return commands.filter((command) => {
+      if (command.type !== 'mcp-request') return true;
+      const pending = this.pendingResponses.get(command.request.id);
+      if (!pending) return false;
+      try {
+        if (pending.shouldStop?.()) {
+          const error = new Error('用户已请求停止当前会话。');
+          error.code = 'CODEX_USER_STOP_REQUESTED';
+          error.deliveryAttempted = false;
+          error.safeToFallback = false;
+          throw error;
+        }
+        pending.onDispatch?.();
+        pending.dispatched = true;
+        return true;
+      } catch (error) {
+        clearTimeout(pending.timeout);
+        this.pendingResponses.delete(command.request.id);
+        pending.reject(error);
+        return false;
+      }
     });
   }
 
@@ -352,7 +378,7 @@ export class DesktopScriptBridge extends EventEmitter {
     }
   }
 
-  request(method, params = {}) {
+  request(method, params = {}, options = {}) {
     if (!this.isOnline()) {
       throw new Error('桌面脚本桥未连接');
     }
@@ -372,13 +398,15 @@ export class DesktopScriptBridge extends EventEmitter {
       hostId: this.hostId,
       request
     };
-    this.pendingCommands.push(command);
-    this.emit('commands');
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
+        const pending = this.pendingResponses.get(request.id);
         this.pendingResponses.delete(request.id);
+        const index = this.pendingCommands.findIndex((item) => item.request?.id === request.id);
+        if (index >= 0) this.pendingCommands.splice(index, 1);
         const error = new Error(`等待桌面脚本桥 app-server 响应超时：${method}`);
         error.code = 'DESKTOP_SCRIPT_APP_SERVER_TIMEOUT';
+        error.deliveryAttempted = pending?.dispatched === true;
         error.method = method;
         error.requestId = request.id;
         error.scriptId = this.scriptId;
@@ -386,7 +414,10 @@ export class DesktopScriptBridge extends EventEmitter {
         this.markCommandFailure(error);
         reject(error);
       }, this.requestTimeoutMs);
-      this.pendingResponses.set(request.id, { resolve, reject, timeout });
+      this.pendingResponses.set(request.id, { resolve, reject, timeout, shouldStop: options.shouldStop,
+        onDispatch: options.onDispatch, dispatched: false });
+      this.pendingCommands.push(command);
+      this.emit('commands');
     });
   }
 

@@ -28,6 +28,9 @@ function state(overrides = {}) {
     sessionMessage: '未发送草稿', selectedSession: { id: 'thread-A' }, scrollOffset: 730,
     voiceCallStatus: 'active', voiceCallMuted: true, checks: 0,
     normalizedBridgeUrl() { return this.bridgeUrl; },
+    // These tests isolate configuration ordering; real draft navigation is covered separately.
+    preserveCurrentSessionDraft: () => true, restoreCurrentSessionDraft() {},
+    stopSessionEventStream() {}, syncSessionEventStream() {},
     refreshPairingUiState() {}, checkPairingConnection() { this.checks++; },
     ...overrides
   };
@@ -121,7 +124,8 @@ test('periodic discovery reuses the profile cache instead of querying on every m
 });
 
 test('pairing navigation preserves the current conversation, draft, scroll and mute state', () => {
-  const s = state();
+  const calls = [];
+  const s = state({ stopSessionEventStream() { calls.push('stop'); }, syncSessionEventStream() { calls.push('sync'); } });
   const selected = s.selectedSession;
   method('openConfigurationPage', 'page').call(s, 'pairing');
   assert.equal(s.activeTab, 'pairing');
@@ -131,6 +135,7 @@ test('pairing navigation preserves the current conversation, draft, scroll and m
   s.pairingDraftUrl = 'https://unsaved.example';
   s.pairingDraftToken = 'unsaved-token';
   method('closeConfigurationPage').call(s);
+  assert.deepEqual(calls, ['stop', 'sync']);
   assert.equal(s.activeTab, 'sessions');
   assert.equal(s.bridgeUrl, 'https://old.example');
   assert.equal(s.bridgeToken, 'old-token');
@@ -292,8 +297,12 @@ test('conversation search matches title or project without changing canonical se
 
 test('composer grows for multiline drafts and caps its height without shrinking for large text', () => {
   const height = method('sessionComposerTextAreaHeight');
-  const state = { sessionMessage: '', scaledLineHeight: value => value };
+  const state = { sessionMessage: '', scaledLineHeight: value => value, scaledFontSize: value => value,
+    isLandscapeSessionLayout: () => false, sessionWindowWidthVp: () => 420, sessionSidebarUserCollapsed: true };
   const compact = height.call(state);
+  assert.equal(compact, 44);
+  state.sessionMessage = '单行长消息'.repeat(20);
+  assert.ok(height.call(state) > compact, 'wrapped text also grows');
   state.sessionMessage = 'one\ntwo\nthree';
   assert.ok(height.call(state) > compact);
   state.sessionMessage = 'a\nb\nc\nd';
@@ -302,4 +311,63 @@ test('composer grows for multiline drafts and caps its height without shrinking 
   assert.equal(height.call(state), capped);
   state.scaledLineHeight = value => value * 1.3;
   assert.ok(height.call(state) > capped);
+});
+
+test('startup connection negotiation failure displays an error instead of an empty conversation list', async () => {
+  const failure = '连接不上服务器';
+  const refresh = method('refreshDashboard', 'force = false', {
+    BridgeClient: { async getRuntimeStatus() { throw new Error(failure); } }
+  });
+  const s = state({ isRefreshingDashboard: false, refreshDesktopInteractions: async () => {},
+    lastRuntimeContractRefreshAt: 0, isNewSessionDraft: false, selectedSession: null,
+    normalizedBridgeUrl: () => 'https://bridge.example', sessions: [], sessionsLoadError: '',
+    sessionsFailureDiagnosticsAvailable: true, sessionsFailureDetailsExpanded: true,
+    dashboardFailureCount: 0, errorText: err => err.message, log() {},
+    publishConnectionNotification: async () => {},
+    sessionConnectionFailure: () => ({ title: '无法读取会话' }) });
+  await refresh.call(s);
+  assert.equal(s.sessionsLoadError, failure);
+  assert.equal(s.sessionsFailureDiagnosticsAvailable, false);
+  assert.equal(s.sessionsFailureDetailsExpanded, false);
+  assert.equal(s.message, '无法读取会话');
+  assert.equal(s.isRefreshingDashboard, false);
+});
+
+test('a failed dashboard negotiation preserves loaded conversations and specific session diagnostics', async () => {
+  const refresh = method('refreshDashboard', 'force = false', {
+    BridgeClient: { async getRuntimeStatus() { throw new Error('temporary network failure'); } }
+  });
+  for (const sessions of [[], [{ id: 'retained' }]]) {
+    const s = state({ isRefreshingDashboard: false, refreshDesktopInteractions: async () => {},
+      lastRuntimeContractRefreshAt: 0, isNewSessionDraft: false, selectedSession: null,
+      normalizedBridgeUrl: () => 'https://bridge.example', sessions,
+      sessionsLoadError: 'specific session diagnostic', sessionsFailureDiagnosticsAvailable: true,
+      dashboardFailureCount: 0, errorText: err => err.message, log() {},
+      publishConnectionNotification: async () => {} });
+    await refresh.call(s);
+    assert.equal(s.sessions, sessions);
+    assert.equal(s.sessionsLoadError, 'specific session diagnostic');
+    assert.equal(s.sessionsFailureDiagnosticsAvailable, true);
+  }
+});
+
+
+test('phone transcript identity and first timestamp survive finalization, storage status and retry', async () => {
+  const prepare = method('preparePhoneTranscriptEntry', 'entry, identity', {
+    CompanionTranscriptStore: { normalizeBridgeOrigin: value => value }
+  });
+  const s = state({ voiceCallTranscripts: [], companionEntries: [], pendingVoiceTranscriptIds: {},
+    nextPhoneTranscriptSequence: 0, voiceCallBridgeUrlSnapshot: 'https://bridge.example' });
+  const identity = { profileId: 'profile', roomId: 'room', callId: 'call' };
+  const first = prepare.call(s, { itemId: 'turn', role: 'user', text: '说话', final: false }, identity);
+  assert.ok(Number.isFinite(first.createdAt));
+  s.voiceCallTranscripts = [{ ...first, createdAt: 1234 }];
+  const final = prepare.call(s, { itemId: 'turn', role: 'user', text: '说话完成', final: true }, identity);
+  assert.equal(final.createdAt, 1234);
+  const status = method('phoneTranscriptWithStatus', 'entry, status');
+  assert.equal(status.call(s, final, 'saved').createdAt, 1234);
+  const retry = method('retryPhoneTranscriptSave', 'entry');
+  s.updatePhoneTranscriptStorageStatus = () => {};
+  s.persistPhoneTranscript = async entry => { assert.equal(entry.createdAt, 1234); };
+  await retry.call(s, final);
 });

@@ -1,3 +1,4 @@
+import { serviceTierParams } from './sessionSettingsStore.js';
 import { CodexDesktopCdpClient, isRetryableCdpTransportError } from './codexDesktopCdpClient.js';
 import { classifyCodexClientNotice, formatCodexClientNoticeText } from './codexClientNotices.js';
 import { extractLocalImageInputs } from './codexTurnInput.js';
@@ -83,7 +84,9 @@ export class CodexDesktopCdpAdapter {
       10
     );
     this.notificationSubscriptions = new Map();
+    this.threadSettings = new Map();
     this.pendingTurnStarts = new Map();
+    this.pendingTurnThreadIds = new Map();
     this.nextNotificationSubscriptionId = 1;
     this.notificationPoller = null;
     this.notificationDrainQueue = Promise.resolve();
@@ -196,9 +199,10 @@ export class CodexDesktopCdpAdapter {
     };
   }
 
-  async run({ task, project, emit }) {
+  async run({ task, project, emit, shouldStop = () => false }) {
     const turnStart = Promise.withResolvers();
     this.pendingTurnStarts.set(task.id, turnStart.promise);
+    this.pendingTurnThreadIds.set(task.id, task.codexSessionId || task.createdCodexSessionId || '');
     const notifications = [];
     let notificationPolling = null;
     let turnSubmitted = false;
@@ -211,6 +215,7 @@ export class CodexDesktopCdpAdapter {
             resumed: true
           };
       const thread = prepared.thread;
+      this.pendingTurnThreadIds.set(task.id, thread.id);
       const sessionFileCursor = task.codexSessionId
         ? await this.captureSessionFileCursor(task, emit)
         : null;
@@ -241,6 +246,7 @@ export class CodexDesktopCdpAdapter {
 
       const maxAttempts = Math.max(1, this.promptMissingRetryCount);
       for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+        throwIfUserStopRequested(shouldStop);
         if (attempt > 1) {
           await this.waitForPostSubmitCompactionToSettle({
             threadId: thread.id,
@@ -249,8 +255,14 @@ export class CodexDesktopCdpAdapter {
             emit
           });
         }
+        throwIfUserStopRequested(shouldStop);
 
+        const submittedBeforeAttempt = turnSubmitted;
         try {
+          // Persist intent before invoking either write. A lost acknowledgement
+          // must never be mistaken for an input that was not submitted.
+          emit('codex.delivery.attempted', { attempt, threadId: thread.id });
+          throwIfUserStopRequested(shouldStop);
           turnSubmitted = true;
           let turnResponse;
           if (attempt === 1 && prepared.activeTurnId) {
@@ -258,15 +270,17 @@ export class CodexDesktopCdpAdapter {
               const steered = await this.steer({
                 task: { ...task, activeCodexTurnId: prepared.activeTurnId },
                 prompt: task.prompt,
-                emit
+                emit,
+                shouldStop
               });
               turnResponse = { turn: { id: steered.turnId, status: 'inProgress' } };
             } catch (error) {
               if (error?.code !== 'CODEX_STEER_NO_ACTIVE_TURN') throw error;
-              turnResponse = await this.startTurn(thread, task);
+              throwIfUserStopRequested(shouldStop);
+              turnResponse = await this.startTurn(thread, task, shouldStop);
             }
           } else {
-            turnResponse = await this.startTurn(thread, task);
+            turnResponse = await this.startTurn(thread, task, shouldStop);
           }
           turnStart.resolve(turnResponse.turn?.id ?? '');
 
@@ -293,7 +307,9 @@ export class CodexDesktopCdpAdapter {
             emit
           });
         } catch (error) {
+          if (error?.deliveryAttempted === false && !submittedBeforeAttempt) turnSubmitted = false;
           turnStart.resolve('');
+          if (isPhoneMessageNotPersistedError(error)) throwIfUserStopRequested(shouldStop);
           if (sessionFileCursor && isRecoverablePostSubmitAckError(error)) {
             const accepted = await this.waitForPromptPersistenceAfterAckLoss({
               cursor: sessionFileCursor,
@@ -335,15 +351,18 @@ export class CodexDesktopCdpAdapter {
       }
       throw createPromptMissingAfterTurnEndError('interrupted');
     } catch (error) {
-      throw this.markSafeToFallback(error, turnSubmitted);
+      const failure = this.markSafeToFallback(error, turnSubmitted);
+      emit('codex.delivery.failed', { deliveryAttempted: turnSubmitted });
+      throw failure;
     } finally {
       turnStart.resolve('');
       this.pendingTurnStarts.delete(task.id);
+      this.pendingTurnThreadIds.delete(task.id);
       notificationPolling?.stop?.();
     }
   }
 
-  async steer({ task, prompt, emit }) {
+  async steer({ task, prompt, emit, shouldStop = () => false }) {
     const threadId = task.codexSessionId || task.createdCodexSessionId;
     const turnId = task.activeCodexTurnId || await this.findActiveTurnId(threadId, emit);
     if (!threadId || !turnId) {
@@ -361,11 +380,12 @@ export class CodexDesktopCdpAdapter {
     }, ...extractLocalImageInputs(text)];
     let response;
     try {
+      throwIfUserStopRequested(shouldStop);
       response = await this.client.request('turn/steer', {
         threadId,
         input,
         expectedTurnId: turnId
-      });
+      }, { shouldStop });
     } catch (error) {
       if (/^no active turn to steer[.!]?$/i.test(String(error?.message ?? '').trim())) {
         error.code = 'CODEX_STEER_NO_ACTIVE_TURN';
@@ -427,15 +447,19 @@ export class CodexDesktopCdpAdapter {
     await sleep(delayMs);
   }
 
-  async interrupt({ task, emit }) {
+  async interrupt({ task, emit, interruptScope = 'task', pendingTaskId = '', beforeInterruptWrite = async () => {}, onPendingStartResolved = async () => {} }) {
     // A locally submitted turn already has an acknowledgement in flight. Reading
     // history here races resume/start and can block even after that ack arrives.
-    const pendingTurnId = await this.pendingTurnStarts.get(task.id);
     const threadId = task.codexSessionId || task.createdCodexSessionId;
+    const ownerId = interruptScope === 'thread' ? pendingTaskId : task.id;
+    const ownerThreadId = this.pendingTurnThreadIds.get(ownerId);
+    const pendingTurnId = ownerThreadId && ownerThreadId !== threadId
+      ? '' : await this.pendingTurnStarts.get(ownerId);
+    if (interruptScope === 'thread' && pendingTurnId) await onPendingStartResolved({ threadId, turnId: pendingTurnId });
     const acknowledgedTurnId = task.activeCodexTurnId || pendingTurnId;
-    const resolved = acknowledgedTurnId
-      ? { turnId: acknowledgedTurnId, terminal: null }
-      : await this.resolveInterruptTarget(threadId, emit);
+    const resolved = interruptScope === 'thread'
+      ? await this.resolveInterruptTarget(threadId, emit, pendingTurnId)
+      : { turnId: acknowledgedTurnId, terminal: null };
     const turnId = resolved.turnId;
     if (!threadId || !turnId) {
       const error = new Error('当前回合还未进入可中断阶段，请稍后重试。');
@@ -464,6 +488,7 @@ export class CodexDesktopCdpAdapter {
         response: null
       };
     }
+    await beforeInterruptWrite({ threadId, turnId });
     const response = await this.client.request('turn/interrupt', {
       threadId,
       turnId
@@ -510,8 +535,16 @@ export class CodexDesktopCdpAdapter {
     };
   }
 
-  async resolveInterruptTarget(threadId, emit) {
+  async resolveInterruptTarget(threadId, emit, pendingTurnId = '') {
     const snapshot = await this.readLatestInterruptableTurn(threadId, emit);
+    if (pendingTurnId && (!snapshot?.turnId || (snapshot.terminal && snapshot.turnId !== pendingTurnId))) {
+      emit('codex.app_server.turn.active_found_for_interrupt', {
+        threadId,
+        turnId: pendingTurnId,
+        source: 'pending_turn_start_ack'
+      });
+      return { turnId: pendingTurnId, terminal: null };
+    }
     if (snapshot?.turnId) {
       return snapshot;
     }
@@ -651,8 +684,9 @@ export class CodexDesktopCdpAdapter {
   }
 
   markSafeToFallback(error, turnSubmitted) {
-    if (!turnSubmitted && error && typeof error === 'object') {
-      error.safeToFallback = true;
+    if (error && typeof error === 'object') {
+      error.deliveryAttempted = turnSubmitted;
+      error.safeToFallback = !turnSubmitted && error.code !== 'CODEX_USER_STOP_REQUESTED';
     }
     return error;
   }
@@ -690,6 +724,19 @@ export class CodexDesktopCdpAdapter {
         }
       }
     };
+  }
+
+  subscribeRuntimeNotifications(emit) {
+    const id = `runtime-subscription-${this.nextNotificationSubscriptionId++}`;
+    this.notificationSubscriptions.set(id, { id, scope: 'runtime', emit });
+    this.ensureSharedNotificationPolling();
+    let stopped = false;
+    return { stop: () => {
+      if (stopped) return;
+      stopped = true;
+      this.notificationSubscriptions.delete(id);
+      if (this.notificationSubscriptions.size === 0) this.stopSharedNotificationPolling();
+    } };
   }
 
   ensureSharedNotificationPolling() {
@@ -773,36 +820,49 @@ export class CodexDesktopCdpAdapter {
     }
   }
 
+  async getThreadSettings(threadId) {
+    if (typeof this.client.drainNotifications === 'function') {
+      try { this.dispatchDesktopNotifications(await this.drainDesktopNotifications()); } catch { /* Retain the last official event. */ }
+    }
+    return this.threadSettings.get(threadId) ?? null;
+  }
+
   dispatchDesktopNotifications(items) {
-    if (!Array.isArray(items) || items.length === 0 || this.notificationSubscriptions.size === 0) {
+    if (!Array.isArray(items) || items.length === 0) {
       return;
     }
     const subscriptions = Array.from(this.notificationSubscriptions.values());
     for (const notification of items) {
       const threadId = notification.params?.threadId;
+      if (notification.method === 'thread/settings/updated' && threadId && notification.params?.threadSettings) {
+        this.threadSettings.set(threadId, { ...notification.params.threadSettings });
+      }
       for (const subscription of subscriptions) {
-        if (subscription.threadId !== threadId) {
+        if (subscription.scope !== 'runtime' && subscription.threadId !== threadId) {
           continue;
         }
         const message = {
           method: notification.method,
-          params: notification.params
+          params: notification.params,
+          ...(typeof notification.notificationId === 'string' ? { notificationId: notification.notificationId, at: notification.at } : {})
         };
-        subscription.notifications.push(message);
-        subscription.emit('codex.desktop_live.notification', sanitize(message));
+        subscription.notifications?.push(message);
+        // A disconnected or faulty observer must not interrupt another thread's
+        // delivery or make the shared poller redeliver an already-drained batch.
+        try { subscription.emit('codex.desktop_live.notification', sanitize(message)); } catch { /* Observer-owned failure. */ }
       }
     }
   }
 
   emitSharedNotificationFailure(message, failures) {
     for (const subscription of this.notificationSubscriptions.values()) {
-      subscription.emit('codex.desktop_live.poll_failed', {
+      try { subscription.emit('codex.desktop_live.poll_failed', {
         message,
         failures,
         diagnosticOnly: true,
         shared: true,
         subscriberCount: this.notificationSubscriptions.size
-      });
+      }); } catch { /* Observer-owned failure. */ }
     }
   }
 
@@ -1250,7 +1310,7 @@ export class CodexDesktopCdpAdapter {
 
   async readFinalThreadState({ thread, task, completed, sessionFileCursor, emit }) {
     try {
-      const detail = await this.readRecentThread(thread.id, { itemsView: 'full' });
+      const detail = await this.readRecentThread(thread.id, { itemsView: 'full', limit: 1 });
       emit('codex.app_server.thread.read', summarizeThreadForEvent(detail));
       const finalTurn = findTurn(detail.thread, completed.turn?.id) ?? completed.turn;
       if (turnHasPromptUserMessage(finalTurn, task.prompt)) {
@@ -1326,6 +1386,7 @@ export class CodexDesktopCdpAdapter {
     }
     try {
       const cleared = await this.drainDesktopNotifications();
+      this.dispatchDesktopNotifications(cleared);
       const ignoredCount = Array.isArray(cleared)
         ? cleared.filter((notification) => notification.params?.threadId !== threadId).length
         : 0;
@@ -1429,7 +1490,7 @@ export class CodexDesktopCdpAdapter {
       experimentalRawEvents: false,
       dynamicTools: null,
       persistExtendedHistory: true,
-      serviceTier: null
+      ...serviceTierParams(task.serviceTier)
     });
     emit('codex.app_server.thread.started', summarizeThreadForEvent(response));
     return response.thread;
@@ -1484,42 +1545,52 @@ export class CodexDesktopCdpAdapter {
     };
   }
 
-  async startTurn(thread, task) {
-    return this.client.request('turn/start', {
+  async startTurn(thread, task, shouldStop = () => false) {
+    try {
+      const response = await this.client.request('turn/start', {
       threadId: thread.id,
       input: [{
         type: 'text',
         text: task.prompt,
         text_elements: []
-      }],
+      }, ...extractLocalImageInputs(task.prompt)],
       cwd: null,
       approvalPolicy: this.approvalPolicy,
       sandboxPolicy: sandboxPolicyFromMode(this.sandbox),
       model: this.taskModel(task),
       effort: normalizeReasoningEffort(task.reasoningEffort),
-      serviceTier: null,
+      ...serviceTierParams(task.serviceTier),
       summary: null,
       personality: null,
       outputSchema: null
-    });
+      }, { shouldStop, onDispatch: () => { task.turnStartInFlight = true; } });
+      if (response?.turn?.id) task.turnStartInFlight = false;
+      return response;
+    } catch (error) {
+      if (error?.deliveryAttempted === false) task.turnStartInFlight = false;
+      throw error;
+    }
   }
 
   async resumeThread(task, project, emit, verified = {}) {
     try {
       const response = await withThreadResumeAckTimeout(this.client.request('thread/resume', {
         threadId: task.codexSessionId,
+        // Resume still subscribes this connection; only the unneeded history
+        // payload is omitted. History is loaded through the paginated APIs.
+        excludeTurns: true,
         cwd: null,
         approvalPolicy: this.approvalPolicy,
         sandbox: this.sandbox,
         model: this.taskModel(task),
         modelProvider: null,
         config: null,
-        serviceTier: null
+        ...serviceTierParams(task.serviceTier)
       }), this.resumeAckTimeoutMs);
       emit('codex.app_server.thread.resumed', summarizeThreadForEvent(response));
       return response.thread;
     } catch (error) {
-      if (!isRecoverableResumeError(error)) {
+      if (!isRecoverableResumeError(error, { readOnlyRecovery: true })) {
         throw error;
       }
       emit(isDesktopScriptTimeout(error)
@@ -1543,7 +1614,7 @@ export class CodexDesktopCdpAdapter {
           return detail.thread;
         }
       } catch (readError) {
-        if (!isRecoverableResumeError(readError)) {
+        if (!isRecoverableResumeError(readError, { readOnlyRecovery: true })) {
           throw readError;
         }
         emit(isDesktopScriptTimeout(readError)
@@ -1632,11 +1703,14 @@ function isDesktopScriptTimeout(error) {
   return /等待桌面脚本桥.*响应超时/.test(String(error.message ?? ''));
 }
 
-function isRecoverableResumeError(error) {
+function isRecoverableResumeError(error, { readOnlyRecovery = false } = {}) {
   if (isDesktopScriptTimeout(error)) {
     return true;
   }
   const message = String(error?.message ?? '');
+  if (readOnlyRecovery && /Codex 桌面 CDP 请求超时/.test(message)) {
+    return true;
+  }
   return /Codex 桌面 CDP (连接错误|连接已关闭|未连接)|连接 Codex 桌面 CDP (失败|超时)/.test(message);
 }
 
@@ -1743,6 +1817,14 @@ function createPromptMissingAfterTurnEndError(status, options = {}) {
   error.phoneMessageNotPersisted = true;
   error.compactionSignal = options.compactionSignal ?? 'post_submit_prewrite_interrupted';
   return error;
+}
+
+function throwIfUserStopRequested(shouldStop) {
+  if (shouldStop()) {
+    const error = new Error('用户已请求停止当前会话。');
+    error.code = 'CODEX_USER_STOP_REQUESTED';
+    throw error;
+  }
 }
 
 function isPhoneMessageNotPersistedError(error) {
@@ -2126,6 +2208,7 @@ function desktopThreadRuntimeState(thread) {
   return {
     threadId: String(thread?.id ?? thread?.threadId ?? '').trim(),
     state,
+    nativeState: rawStatus,
     updatedAt: desktopThreadUpdatedAt(thread?.updatedAt ?? thread?.updated_at),
     source: 'desktop-app-server',
     activeTurnId: String(thread?.activeTurnId ?? thread?.turnId ?? '').trim(),

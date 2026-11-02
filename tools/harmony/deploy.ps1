@@ -894,6 +894,12 @@ function Set-BridgeUrl {
   }
   $escapedBridgeTotpSecret = $bridgeTotpSecretValue.Trim().Replace('\', '\\').Replace("'", "\'")
   $repoRootForProject = Split-Path -Parent $ProjectRoot
+  $controlRoot = [IO.Path]::GetFullPath($repoRootForProject).TrimEnd('\','/').ToLowerInvariant()
+  $controlHasher = [Security.Cryptography.SHA256]::Create()
+  try { $controlTargetId = 'desktop-'+([BitConverter]::ToString($controlHasher.ComputeHash([Text.Encoding]::UTF8.GetBytes($controlRoot))).Replace('-','').ToLowerInvariant().Substring(0,16)) }
+  finally { $controlHasher.Dispose() }
+  $controlConfigPath = Join-Path $ProjectRoot 'entry\src\main\ets\config\ControlConfig.ets'
+  [IO.File]::WriteAllText($controlConfigPath, "// Provisioned for this desktop checkout.`nexport const DEFAULT_CONTROL_TARGET_ID: string = '$controlTargetId';`n", [Text.UTF8Encoding]::new($false))
   $relayConfigPath = Join-Path $repoRootForProject 'tools\harmony\hdc-relay.local.psd1'
   $relayConfig = @{}
   if (Test-Path -LiteralPath $relayConfigPath) {

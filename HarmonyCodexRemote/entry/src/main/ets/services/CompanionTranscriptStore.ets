@@ -80,7 +80,17 @@ export class CompanionTranscriptStore {
         localAssistantId: partition.assistantId.trim(),
         localRoomId: partition.roomId.trim()
       };
-      const index = entries.findIndex((current: VoiceTranscriptEntry) => current.itemId === normalized.itemId);
+      const index = entries.findIndex((current: VoiceTranscriptEntry) => current.itemId === normalized.itemId
+        && current.role === normalized.role);
+      const previousEntry: VoiceTranscriptEntry | undefined = index >= 0 ? entries[index] : undefined;
+      const createdAt = previousEntry?.createdAt ?? entry.createdAt;
+      if (createdAt !== undefined && Number.isFinite(createdAt) && createdAt >= 0) {
+        normalized.createdAt = createdAt;
+      }
+      const requestId = previousEntry?.requestId ?? entry.requestId;
+      if (requestId !== undefined) {
+        normalized.requestId = requestId;
+      }
       if (index >= 0) {
         entries[index] = normalized;
       } else {
@@ -170,7 +180,7 @@ export class CompanionTranscriptStore {
         || entry.phoneTranscript !== true || typeof entry.callId !== 'string' || entry.callId.length === 0) {
         throw new Error('手机转写缓存内容异常，原始数据已保留');
       }
-      entries.push({
+      const restored: VoiceTranscriptEntry = {
         itemId: entry.itemId,
         role: entry.role,
         text: entry.text,
@@ -181,7 +191,14 @@ export class CompanionTranscriptStore {
         localBridgeOrigin: expectedOrigin,
         localAssistantId: partition.assistantId.trim(),
         localRoomId: partition.roomId.trim()
-      });
+      };
+      if (typeof entry.createdAt === 'number' && Number.isFinite(entry.createdAt) && entry.createdAt >= 0) {
+        restored.createdAt = entry.createdAt;
+      }
+      if (typeof entry.requestId === 'string' && entry.requestId.length > 0) {
+        restored.requestId = entry.requestId;
+      }
+      entries.push(restored);
     });
     return entries;
   }

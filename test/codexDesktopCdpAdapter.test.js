@@ -2,6 +2,57 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { CodexDesktopCdpAdapter } from '../src/codexDesktopCdpAdapter.js';
 
+test('CDP request timeout during resume recovers with a read without retrying the resume write', async () => {
+  const requests = [];
+  const adapter = new CodexDesktopCdpAdapter({ client: { async request(method, params) {
+    requests.push({ method, params });
+    if (method === 'thread/resume') throw new Error('Codex 桌面 CDP 请求超时：Runtime.evaluate');
+    return { thread: { id: 'thread', cwd: '.' } };
+  } } });
+  try {
+    assert.equal((await adapter.resumeThread({ codexSessionId: 'thread' }, {}, () => {})).id, 'thread');
+    assert.deepEqual(requests.map(request => request.method), ['thread/resume', 'thread/read']);
+    assert.equal(requests[1].params.includeTurns, false);
+  } finally { adapter.close(); }
+});
+
+test('CDP request timeouts for resume and fallback read can use an already verified session', async () => {
+  const requests = [];
+  const adapter = new CodexDesktopCdpAdapter({ client: { async request(method) {
+    requests.push(method);
+    throw new Error('Codex 桌面 CDP 请求超时：Runtime.evaluate');
+  } } });
+  try {
+    const result = await adapter.resumeThread({ codexSessionId: 'thread' }, { root: '.' }, () => {}, { verified: true });
+    assert.equal(result.id, 'thread');
+    assert.deepEqual(requests, ['thread/resume', 'thread/read']);
+  } finally { adapter.close(); }
+});
+
+test('CDP write request timeout does not enter read-only recovery or automatically resubmit', async () => {
+  let writes = 0;
+  let persistenceRecovery = 0;
+  const adapter = new CodexDesktopCdpAdapter({ client: { async request(method) {
+    assert.equal(method, 'turn/start');
+    writes++;
+    throw new Error('Codex 桌面 CDP 请求超时：Runtime.evaluate');
+  } } });
+  adapter.prepareExistingThread = async () => ({ thread: { id: 'thread' }, resumed: false });
+  adapter.captureSessionFileCursor = async () => ({ offset: 1 });
+  adapter.clearDesktopNotificationNoise = async () => ({ ok: true });
+  adapter.startNotificationPolling = () => ({ stop() {} });
+  adapter.waitForPromptPersistenceAfterAckLoss = async () => { persistenceRecovery++; return false; };
+  try {
+    await assert.rejects(adapter.run({ task: { id: 'task', codexSessionId: 'thread', prompt: 'input' }, project: {}, emit() {} }), error => {
+      assert.equal(error.deliveryAttempted, true);
+      assert.equal(error.safeToFallback, false);
+      return /CDP 请求超时/.test(error.message);
+    });
+    assert.equal(writes, 1);
+    assert.equal(persistenceRecovery, 0);
+  } finally { adapter.close(); }
+});
+
 test('active desktop thread preparation uses recent turns without loading full history', async () => {
   const adapter = new CodexDesktopCdpAdapter({ client: {
     async request(method, params) {
@@ -799,6 +850,7 @@ test('CodexDesktopCdpAdapter waits briefly for an active turn before interruptin
       id: 'task-wait-interrupt',
       codexSessionId: '019e-wait-thread'
     },
+    interruptScope: 'thread',
     emit: (type, payload) => events.push({ type, payload })
   });
 
@@ -830,6 +882,7 @@ test('CodexDesktopCdpAdapter interrupts a running thread even when active turn a
       codexSessionId: '019e-ackless-thread',
       activeCodexTurnId: ''
     },
+    interruptScope: 'thread',
     emit: (type, payload) => events.push({ type, payload })
   });
 

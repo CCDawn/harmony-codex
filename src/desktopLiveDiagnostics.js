@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { probeDesktopCdpLiveness } from './codexDesktopCdpClient.js';
 
 export class DesktopLiveDiagnostics {
   constructor(options = {}) {
@@ -9,6 +10,11 @@ export class DesktopLiveDiagnostics {
     this.timeoutMs = Number.parseInt(options.timeoutMs ?? process.env.CODEX_DESKTOP_DIAGNOSTICS_TIMEOUT_MS ?? '4000', 10);
     this.ttlMs = Number.parseInt(options.ttlMs ?? process.env.CODEX_DESKTOP_DIAGNOSTICS_TTL_MS ?? '2500', 10);
     this.powershell = options.powershell ?? 'powershell.exe';
+    this.cdpLivenessProbe = options.cdpLivenessProbe ?? probeDesktopCdpLiveness;
+    this.cdpLivenessTimeoutMs = Number.parseInt(
+      options.cdpLivenessTimeoutMs ?? process.env.CODEX_DESKTOP_CDP_LIVENESS_TIMEOUT_MS ?? '1500',
+      10
+    );
     this.cache = null;
   }
 
@@ -24,10 +30,26 @@ export class DesktopLiveDiagnostics {
     const snapshot = {
       processes,
       statusFile,
+      cdpLiveness: await this.readCdpLiveness(processes, statusFile),
       inspectedAt: new Date().toISOString()
     };
     this.cache = { at: now, value: snapshot };
     return classifyDiagnostics(snapshot, status);
+  }
+
+  // 在线判定的地面真相：CDP DevTools 入口必须真实应答。TCP 可达（半死外壳
+  // 占住监听 socket）或脚本桥心跳残留都不能再支撑 desktopLive=true。
+  async readCdpLiveness(processes, statusFile) {
+    if (typeof this.cdpLivenessProbe !== 'function') {
+      return null;
+    }
+    const ports = collectCandidateCdpPorts(Array.isArray(processes) ? processes : [], statusFile);
+    const timeoutMs = Number.isFinite(this.cdpLivenessTimeoutMs) ? this.cdpLivenessTimeoutMs : undefined;
+    try {
+      return await this.cdpLivenessProbe(ports.length > 0 ? { ports, timeoutMs } : { timeoutMs });
+    } catch (error) {
+      return { checked: true, ok: false, reason: `CDP 真实应答探测失败：${error?.message ?? String(error)}` };
+    }
   }
 
   async readProcesses() {
@@ -93,6 +115,8 @@ export function classifyDiagnostics(snapshot = {}, status = {}) {
       : codexCdpPorts.length < codexProcesses.length
         ? 'mixed'
         : 'cdp';
+  const cdpLiveness = snapshot.cdpLiveness ?? null;
+  const cdpResponsive = cdpLiveness?.checked === true ? cdpLiveness.ok === true : null;
   const base = {
     available: true,
     inspectedAt: snapshot.inspectedAt ?? new Date().toISOString(),
@@ -104,8 +128,37 @@ export function classifyDiagnostics(snapshot = {}, status = {}) {
     liveHostProcessId: liveHostProcesses[0]?.processId ?? null,
     cdpPort: codexCdpPorts[0] ?? liveHostCdpPorts[0] ?? (Number.isFinite(statusFilePort) ? statusFilePort : null),
     candidateCdpPorts,
-    lastInjectedCdpPort: Number.isFinite(statusFilePort) ? statusFilePort : null
+    lastInjectedCdpPort: Number.isFinite(statusFilePort) ? statusFilePort : null,
+    cdpResponsive,
+    cdpLiveness
   };
+
+  // 地面真相优先：上游宣称 desktopLive=true 时，若 CDP DevTools 入口没有真实
+  // 应答（半死外壳占端口、socket 残留），必须推翻在线判定，不能直接判 none。
+  if (status?.desktopLive === true && cdpLiveness?.checked === true && cdpLiveness.ok !== true) {
+    if (desktopProcessMode === 'missing') {
+      return {
+        ...base,
+        failureClass: 'codex_not_running',
+        requiresDesktopCdp: true,
+        mobileRecoverable: false
+      };
+    }
+    if (desktopProcessMode === 'plain') {
+      return {
+        ...base,
+        failureClass: 'codex_plain_no_cdp',
+        requiresDesktopCdp: true,
+        mobileRecoverable: false
+      };
+    }
+    return {
+      ...base,
+      failureClass: 'desktop_cdp_unavailable',
+      requiresDesktopCdp: false,
+      mobileRecoverable: true
+    };
+  }
 
   if (status?.desktopLive === true) {
     return {
@@ -173,6 +226,17 @@ function isCodexProcess(processInfo) {
 
 function isLiveHostProcess(processInfo) {
   return /start-desktop-cdp-live-host\.mjs/i.test(String(processInfo?.commandLine ?? ''));
+}
+
+function collectCandidateCdpPorts(processes, statusFile) {
+  const codexProcesses = processes.filter((processInfo) => isCodexProcess(processInfo));
+  const liveHostProcesses = processes.filter((processInfo) => isLiveHostProcess(processInfo));
+  const statusFilePort = Number.parseInt(String(statusFile?.cdpPort ?? ''), 10);
+  return uniqueNumbers([
+    ...codexProcesses.map((processInfo) => extractRemoteDebuggingPort(processInfo.commandLine)),
+    ...liveHostProcesses.map((processInfo) => extractLiveHostCdpPort(processInfo.commandLine)),
+    Number.isFinite(statusFilePort) ? statusFilePort : 0
+  ]);
 }
 
 function extractRemoteDebuggingPort(commandLine) {

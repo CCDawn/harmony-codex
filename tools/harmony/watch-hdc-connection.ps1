@@ -45,6 +45,63 @@ if (-not (Test-Path -LiteralPath $hdcPath)) {
   throw "HDC 不存在: $hdcPath"
 }
 
+# Probe-outcome bookkeeping for the last Invoke-HdcCommand call. A hung hdc
+# must never stall a watchdog round, so every hdc call runs under a hard
+# timeout and a timeout is recorded as a probe failure.
+$script:hdcLastTimedOut = $false
+$script:hdcLastExitCode = $null
+$script:hdcLastProcessId = $null
+
+function Stop-HdcProcessTree {
+  param([Parameter(Mandatory = $true)][int]$ProcessId)
+
+  $taskkill = Get-Command taskkill.exe -ErrorAction SilentlyContinue
+  if ($taskkill) {
+    $killer = Start-Process -FilePath $taskkill.Source -ArgumentList ('/PID {0} /T /F' -f $ProcessId) -WindowStyle Hidden -PassThru
+    $null = $killer.WaitForExit(5000)
+    if (-not $killer.HasExited) {
+      try { Stop-Process -Id $killer.Id -Force -ErrorAction SilentlyContinue } catch { }
+    }
+    return
+  }
+  try { Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue } catch { }
+}
+
+function Invoke-HdcCommand {
+  param(
+    [Parameter(Mandatory = $true)][string]$HdcPath,
+    [Parameter(Mandatory = $true)][string[]]$Arguments,
+    [int]$TimeoutMs = 15000
+  )
+
+  $stdoutPath = Join-Path ([IO.Path]::GetTempPath()) ("hdc-watchdog-stdout-{0}.tmp" -f [guid]::NewGuid().ToString('N'))
+  $stderrPath = Join-Path ([IO.Path]::GetTempPath()) ("hdc-watchdog-stderr-{0}.tmp" -f [guid]::NewGuid().ToString('N'))
+  $quotedArguments = @($Arguments | ForEach-Object { if ("$_" -match '\s') { '"{0}"' -f $_ } else { [string]$_ } })
+  try {
+    $proc = Start-Process -FilePath $HdcPath -ArgumentList ($quotedArguments -join ' ') -NoNewWindow -PassThru -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
+    $script:hdcLastProcessId = [int]$proc.Id
+    if (-not $proc.WaitForExit($TimeoutMs)) {
+      Write-Host "$(Get-Date -Format o) hdc command timed out after $([math]::Round($TimeoutMs / 1000))s, killing process tree: $($Arguments -join ' ')" -ForegroundColor Yellow
+      Stop-HdcProcessTree -ProcessId ([int]$proc.Id)
+      $script:hdcLastTimedOut = $true
+      $script:hdcLastExitCode = $null
+      return @()
+    }
+    $null = $proc.WaitForExit()
+    $script:hdcLastTimedOut = $false
+    $script:hdcLastExitCode = $proc.ExitCode
+    $lines = @()
+    foreach ($redirectPath in @($stdoutPath, $stderrPath)) {
+      if (Test-Path -LiteralPath $redirectPath) {
+        $lines += @(Get-Content -LiteralPath $redirectPath -ErrorAction SilentlyContinue)
+      }
+    }
+    return $lines
+  } finally {
+    Remove-Item -LiteralPath @($stdoutPath, $stderrPath) -Force -ErrorAction SilentlyContinue
+  }
+}
+
 function Get-RelayState {
   $url = "http://${relayHost}:${relayPort}/__relay/state?token=$([uri]::EscapeDataString($relayToken))"
   return (Invoke-RestMethod -UseBasicParsing -Uri $url -TimeoutSec 5).state
@@ -63,7 +120,10 @@ function Get-StateArray {
 }
 
 function Test-HdcConnected {
-  $targets = @(& $hdcPath list targets -v 2>&1)
+  $targets = @(Invoke-HdcCommand -HdcPath $hdcPath -Arguments @('list', 'targets', '-v'))
+  if ($script:hdcLastTimedOut) {
+    return $false
+  }
   foreach ($line in $targets) {
     if ($line -match [regex]::Escape($target) -and $line -match '\bConnected\b') {
       return $true
@@ -76,12 +136,18 @@ function Test-HdcShellReady {
   if (-not (Test-HdcConnected)) {
     return $false
   }
-  $probe = @(& $hdcPath -t $target shell echo codex-hdc-ready 2>&1)
-  return ($LASTEXITCODE -eq 0 -and (($probe -join "`n") -match 'codex-hdc-ready'))
+  $probe = @(Invoke-HdcCommand -HdcPath $hdcPath -Arguments @('-t', $target, 'shell', 'echo', 'codex-hdc-ready'))
+  if ($script:hdcLastTimedOut) {
+    return $false
+  }
+  return ($script:hdcLastExitCode -eq 0 -and (($probe -join "`n") -match 'codex-hdc-ready'))
 }
 
 function Test-HdcOffline {
-  $targets = @(& $hdcPath list targets -v 2>&1)
+  $targets = @(Invoke-HdcCommand -HdcPath $hdcPath -Arguments @('list', 'targets', '-v'))
+  if ($script:hdcLastTimedOut) {
+    return $false
+  }
   foreach ($line in $targets) {
     if ($line -match [regex]::Escape($target) -and $line -match '\bOffline\b') {
       return $true
@@ -178,12 +244,12 @@ function Connect-HdcTarget {
 
   if (Test-HdcOffline) {
     Write-Host "$(Get-Date -Format o) target is offline, restart hdc server before reconnect" -ForegroundColor Yellow
-    & $hdcPath kill -r | Out-Host
+    @(Invoke-HdcCommand -HdcPath $hdcPath -Arguments @('kill', '-r')) | Out-Host
     Start-Sleep -Seconds 1
   }
 
   Write-Host "$(Get-Date -Format o) $Reason, tconn $target" -ForegroundColor Cyan
-  $output = @(& $hdcPath tconn $target 2>&1)
+  $output = @(Invoke-HdcCommand -HdcPath $hdcPath -Arguments @('tconn', $target))
   $output | Out-Host
   if (($output -join "`n") -match 'Connect OK|Target is connected') {
     Start-Sleep -Milliseconds 500
@@ -199,7 +265,7 @@ function Connect-HdcTarget {
   $script:reconnectFailures += 1
   if ($script:reconnectFailures -ge 3) {
     Write-Host "$(Get-Date -Format o) repeated tconn/shell failure, restart hdc server and local proxy" -ForegroundColor Yellow
-    & $hdcPath kill -r | Out-Host
+    @(Invoke-HdcCommand -HdcPath $hdcPath -Arguments @('kill', '-r')) | Out-Host
     Restart-LocalProxy
     $script:reconnectFailures = 0
     return
@@ -221,11 +287,11 @@ while ($true) {
     $activeHdc = Get-StateArray -State $state -Name 'activeHdc'
     $hasActiveHdc = $activeHdc -contains $deviceId
     $connected = Test-HdcShellReady
-    if (-not $connected -and (Test-HdcConnected)) {
+    if (-not $connected -and ($script:hdcLastTimedOut -or (Test-HdcConnected))) {
       $reconnectFailures += 1
       Write-Host "$(Get-Date -Format o) hdc target listed connected but shell probe failed: count=$reconnectFailures" -ForegroundColor Yellow
       if ($reconnectFailures -ge 2) {
-        & $hdcPath kill -r | Out-Host
+        @(Invoke-HdcCommand -HdcPath $hdcPath -Arguments @('kill', '-r')) | Out-Host
         Restart-LocalProxy
         Connect-HdcTarget -Reason 'stale connected target'
       }
@@ -247,7 +313,7 @@ while ($true) {
       }
       if (((Get-Date) - $pendingPcSince).TotalSeconds -gt 25) {
         Write-Host "$(Get-Date -Format o) pc pending too long, restart local proxy and hdc server" -ForegroundColor Yellow
-        & $hdcPath kill -r | Out-Host
+        @(Invoke-HdcCommand -HdcPath $hdcPath -Arguments @('kill', '-r')) | Out-Host
         Restart-LocalProxy
         $pendingPcSince = Get-Date
       }

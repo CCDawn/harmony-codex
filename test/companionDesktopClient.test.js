@@ -75,9 +75,23 @@ test('room history preserves full text, orders messages, and excludes deleted an
     {id:'call',content:{text:null,attachments:[{type:'call'}]}},
     {id:'a',role:'user',created_at:'2026-10-04T01:00:01Z',content:{text:'first\nline'}}
   ]), [
-    {itemId:'room:a',role:'user',text:'first\nline',final:true},
-    {itemId:'room:b',role:'assistant',text:'second',final:true}
+    {itemId:'room:a',role:'user',text:'first\nline',final:true,createdAt:Date.parse('2026-10-04T01:00:01Z')},
+    {itemId:'room:b',role:'assistant',text:'second',final:true,createdAt:Date.parse('2026-10-04T01:00:02Z')}
   ]);
+});
+
+test('history preserves only valid official request UUIDs and timestamp values', () => {
+  const requestId = '12345678-1234-4123-8123-123456789abc';
+  const [entry] = historyEntries([{ id: 'official', role: 'user', request_id: requestId.toUpperCase(),
+    created_at: '2026-10-19T08:00:00.123456+08:00', content: { text: 'unchanged' } }]);
+  assert.equal(entry.requestId, requestId);
+  assert.equal(entry.createdAt, 1792368000123);
+  for (const created_at of [undefined, null, '', 0, '0', 'not-a-date', '2026-02-30T00:00:00Z', '2026-10-19']) {
+    const [invalid] = historyEntries([{ id: requestId, role: 'user', requestId,
+      idempotency_token: requestId, request_id: 'not-a-uuid', created_at, content: { text: 'unchanged' } }]);
+    assert.equal(Object.hasOwn(invalid, 'requestId'), false, 'never infer a request UUID from another field');
+    assert.equal(Object.hasOwn(invalid, 'createdAt'), false, String(created_at));
+  }
 });
 
 test('a desktop account or selected assistant change cannot silently retarget a call', async () => {

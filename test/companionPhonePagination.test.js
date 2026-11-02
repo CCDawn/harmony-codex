@@ -8,11 +8,14 @@ const source = fs.readFileSync(new URL('../HarmonyCodexRemote/entry/src/main/ets
 const methods = source.slice(source.indexOf('  private stopCompanionPolling(): void {'),
   source.indexOf('  private registerVoiceCallCallbacks(): void {'));
 
+const timelineSource = fs.readFileSync(new URL('../HarmonyCodexRemote/entry/src/main/ets/services/CompanionTimeline.ets', import.meta.url), 'utf8').replace(/^import .*;\s*$/gm, '');
+const { mergeCompanionHistory } = await import('data:text/javascript;base64,' + Buffer.from(stripTypeScriptTypes(timelineSource)).toString('base64'));
+
 function setup() {
   let finishLatest;
   const latest = new Promise(resolve => { finishLatest = resolve; });
   const calls = [];
-  const context = vm.createContext({ clearInterval, getContext: () => ({}),
+  const context = vm.createContext({ clearInterval, mergeCompanionHistory, getContext: () => ({}),
     CompanionTextService: {
       partitionKey(partition) { return `${partition.bridgeUrl}|${partition.profileId}|${partition.roomId}`; },
       load() { return []; }, messages() { return []; }, reconcile() { return false; }

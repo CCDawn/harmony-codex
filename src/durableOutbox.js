@@ -1,9 +1,15 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
+import { compactOutboxResult } from './outboxResult.js';
+
+export { compactOutboxResult } from './outboxResult.js';
 
 const ACTIVE_STATUSES = new Set(['queued', 'failed', 'dispatching', 'uncertain']);
 const EDITABLE_STATUSES = new Set(['queued', 'failed']);
+const DEFAULT_STALE_AFTER_MS = 24 * 60 * 60 * 1000;
+const STALE_HOLD_ERROR = '历史消息超过24小时，已暂停自动发送；请核对后重试';
 
 export class DurableOutbox {
   constructor({
@@ -18,6 +24,7 @@ export class DurableOutbox {
     baseDelayMs = 1_500,
     maxDelayMs = 60_000,
     blockedDelayMs = 1_500,
+    staleAfterMs = DEFAULT_STALE_AFTER_MS,
     maxItems = 500,
     schedule = true
   }) {
@@ -40,12 +47,19 @@ export class DurableOutbox {
     this.baseDelayMs = Math.max(100, Number(baseDelayMs) || 1_500);
     this.maxDelayMs = Math.max(this.baseDelayMs, Number(maxDelayMs) || 60_000);
     this.blockedDelayMs = Math.max(250, Number(blockedDelayMs) || 1_500);
+    this.staleAfterMs = Math.max(1, Number(staleAfterMs) || DEFAULT_STALE_AFTER_MS);
     this.maxItems = Math.max(50, Number(maxItems) || 500);
     this.scheduleEnabled = schedule !== false;
     this.items = [];
     this.initialized = null;
     this.persistPromise = Promise.resolve();
     this.dispatchPromise = null;
+    this.pendingDispatchItemIds = new Set();
+    this.reconcilePromise = null;
+    this.receiptReconciliationRequested = false;
+    this.receiptWakeScheduled = false;
+    this.receiptWakeRunning = false;
+    this.closed = false;
     this.blockedDecisionByItemId = new Map();
     this.timer = null;
   }
@@ -74,7 +88,7 @@ export class DurableOutbox {
       }
     }
     const restored = Array.isArray(parsed?.items) ? parsed.items : [];
-    let changed = false;
+    let changed = restored.some(item => item?.result && item.result.outboxSnapshotVersion !== 1);
     this.items = restored
       .map((item) => normalizePersistedItem(item))
       .filter(Boolean)
@@ -86,28 +100,87 @@ export class DurableOutbox {
         return {
           ...item,
           status: 'uncertain',
+          revision: item.revision + 1,
           error: 'Bridge 在提交过程中重启，发送结果需要确认后才能重试',
           retryable: false,
           nextAttemptAt: '',
           updatedAt: isoAt(this.now())
         };
       });
-    this.prune();
+    changed = this.holdStaleItems() || changed;
+    // Loading/migrating a legacy file must not discard terminal receipts. The
+    // ordinary enqueue retention policy still applies when accepting new work.
     if (changed) {
       await this.persist();
     }
-    await this.reconcileUncertainItems();
-    this.scheduleNext();
+    // Receipt reads can depend on an unresponsive desktop. Load and persist the
+    // recovered state first; the existing dispatch scheduler reconciles it.
+    this.scheduleNext(this.items.some(item => item.status === 'uncertain' || item.status === 'held') ? 0 : null);
   }
 
   async reconcileUncertainItems() {
+    if (!this.reconcile) return [];
+    if (this.reconcilePromise) return await this.reconcilePromise;
+    this.receiptReconciliationRequested = false;
+    this.reconcilePromise = this.reconcileUncertainItemsOnce().finally(() => {
+      this.reconcilePromise = null;
+      this.queueReceiptReconciliation();
+    });
+    return await this.reconcilePromise;
+  }
+
+  requestReceiptReconciliation() {
+    if (this.closed || !this.reconcile) return;
+    this.receiptReconciliationRequested = true;
+    this.queueReceiptReconciliation();
+  }
+
+  queueReceiptReconciliation() {
+    if (this.closed || !this.scheduleEnabled || !this.receiptReconciliationRequested
+      || this.receiptWakeScheduled || this.receiptWakeRunning || this.reconcilePromise) return;
+    this.receiptWakeScheduled = true;
+    // Coalesce a synchronous event storm, independently of dispatchPromise:
+    // another session's slow dispatch must not delay a received ACK.
+    queueMicrotask(() => {
+      this.receiptWakeScheduled = false;
+      if (this.closed || !this.receiptReconciliationRequested) return;
+      this.receiptReconciliationRequested = false;
+      this.receiptWakeRunning = true;
+      let initialized = false;
+      void (async () => {
+        await this.initialize();
+        initialized = true;
+        if (!this.closed) await this.reconcileUncertainItems();
+      })().catch(error => {
+        // A migration/save failure must not spin initialize() in microtasks.
+        // Existing scheduler timers or a later receipt notification can retry.
+        this.receiptReconciliationRequested = false;
+        return this.log('error', 'outbox.reconcile.failed', {
+          message: String(error?.message ?? error)
+        });
+      }).catch(() => {}).finally(() => {
+        this.receiptWakeRunning = false;
+        this.queueReceiptReconciliation();
+        if (initialized) this.scheduleNext();
+      });
+    });
+  }
+
+  async reconcileUncertainItemsOnce() {
     if (!this.reconcile) {
       return [];
     }
     const reconciled = [];
-    for (const item of this.items.filter((candidate) => candidate.status === 'uncertain'
-      || (candidate.status === 'dispatching' && candidate.resultId))) {
-      const revision = { status: item.status, updatedAt: item.updatedAt, lastAttemptAt: item.lastAttemptAt };
+    for (const item of this.items.slice()) {
+      // A retried entry can still carry the preceding attempt's receipt id.
+      // Its new dispatch must bind its result before that id can be reconciled.
+      if (this.pendingDispatchItemIds.has(item.id)) continue;
+      // Earlier history reads can yield while a later item is canceled or retried.
+      if (item.status !== 'uncertain' && item.status !== 'held'
+        && !(item.status === 'dispatching' && item.resultId)) {
+        continue;
+      }
+      const revision = item.revision;
       let receipt = null;
       try {
         receipt = await this.reconcile(clone(item));
@@ -120,16 +193,27 @@ export class DurableOutbox {
       }
       // A user can cancel or retry while the official history read is in flight.
       // Its stale result must not resurrect a canceled queue entry.
-      if (item.status !== revision.status || item.updatedAt !== revision.updatedAt
-        || item.lastAttemptAt !== revision.lastAttemptAt) {
+      if (item.revision !== revision) {
+        continue;
+      }
+      // A hold is reversible only by a user or positive delivery evidence.
+      if (item.status === 'held' && receipt?.status !== 'submitted') {
         continue;
       }
       if (receipt?.status === 'failed' || receipt?.status === 'uncertain') {
         item.status = receipt.status;
+        if (receipt.result) item.result = compactOutboxResult(receipt.result, item);
         item.error = receipt.error || '未确认消息进入官方会话，请核对后重试';
-        item.retryable = false;
-        item.nextAttemptAt = '';
+        // Only positive pre-delivery evidence permits automatic retry. A lost
+        // write acknowledgement must remain uncertain, even if a task failed.
+        item.retryable = receipt.status === 'failed' && receipt.retryable === true
+          && receipt.evidence === 'delivery_not_attempted';
+        if (item.retryable) item.attemptCount += 1;
+        item.nextAttemptAt = item.retryable
+          ? isoAt(this.now() + retryDelayMs(item.attemptCount, this)) : '';
         item.updatedAt = isoAt(this.now());
+        bumpRevision(item);
+        await this.persist();
         reconciled.push(clone(item));
         continue;
       }
@@ -137,21 +221,47 @@ export class DurableOutbox {
         await this.log('info', 'outbox.item.reconcile_unknown', summarize(item));
         continue;
       }
-      item.status = 'submitted';
-      item.result = normalizeResult(receipt.result ?? item.result);
-      item.resultId = String(item.result?.id ?? item.result?.run?.id ?? item.resultId ?? '');
-      item.error = '';
-      item.retryable = false;
-      item.nextAttemptAt = '';
-      item.submittedAt = isoAt(this.now());
-      item.updatedAt = item.submittedAt;
+      this.settleSubmitted(item, receipt);
+      await this.persist();
       reconciled.push(clone(item));
       await this.log('info', 'outbox.item.reconciled', summarize(item));
     }
-    if (reconciled.length > 0) {
-      await this.persist();
-    }
     return reconciled;
+  }
+
+  holdStaleItems() {
+    const now = this.now();
+    let changed = false;
+    for (const item of this.items) {
+      const ageFrom = staleAgeFrom(item);
+      if (!Number.isFinite(ageFrom) || now - ageFrom <= this.staleAfterMs) {
+        continue;
+      }
+      item.status = 'held';
+      item.error = STALE_HOLD_ERROR;
+      item.retryable = false;
+      item.nextAttemptAt = '';
+      item.blockedBy = '';
+      item.blockedReason = '';
+      item.updatedAt = isoAt(now);
+      bumpRevision(item);
+      changed = true;
+    }
+    return changed;
+  }
+
+  settleSubmitted(item, receipt) {
+    item.status = 'submitted';
+    item.result = compactOutboxResult(receipt.result ?? item.result, item);
+    item.resultId = String(item.result?.id ?? item.result?.run?.id ?? item.resultId ?? '');
+    item.error = '';
+    item.retryable = false;
+    item.nextAttemptAt = '';
+    item.blockedBy = '';
+    item.blockedReason = '';
+    item.submittedAt = isoAt(this.now());
+    item.updatedAt = item.submittedAt;
+    bumpRevision(item);
   }
 
   async enqueue(input) {
@@ -159,6 +269,10 @@ export class DurableOutbox {
     const normalized = normalizeNewItem(input, this.now());
     const existing = this.items.find((item) => item.dedupeKey === normalized.dedupeKey);
     if (existing) {
+      if (existing.text !== normalized.text || existing.projectId !== normalized.projectId
+        || !isDeepStrictEqual(existing.payload, normalized.payload)) {
+        throw Object.assign(statusError('提交标识已用于其他消息。', 409), { code: 'CODEX_SUBMISSION_ID_CONFLICT' });
+      }
       if (
         existing.status === 'submitted'
         && this.canRequeueSubmitted
@@ -172,6 +286,7 @@ export class DurableOutbox {
         existing.nextAttemptAt = '';
         existing.submittedAt = '';
         existing.updatedAt = isoAt(this.now());
+        bumpRevision(existing);
         await this.persist();
         await this.log('warn', 'outbox.item.requeued_after_safe_failure', summarize(existing));
         this.scheduleNext(0);
@@ -191,7 +306,7 @@ export class DurableOutbox {
     const normalizedThreadId = String(threadId ?? '').trim();
     return this.items
       .filter((item) => !normalizedThreadId || item.threadId === normalizedThreadId)
-      .filter((item) => includeTerminal || ACTIVE_STATUSES.has(item.status))
+      .filter((item) => includeTerminal || ACTIVE_STATUSES.has(item.status) || item.status === 'held')
       .sort(compareOutboxItems)
       .map(clone);
   }
@@ -228,6 +343,7 @@ export class DurableOutbox {
     item.retryable = true;
     item.nextAttemptAt = '';
     item.updatedAt = isoAt(this.now());
+    bumpRevision(item);
     await this.persist();
     await this.log('info', 'outbox.item.updated', summarize(item));
     this.scheduleNext(0);
@@ -256,6 +372,8 @@ export class DurableOutbox {
     target.order = order;
     item.updatedAt = isoAt(this.now());
     target.updatedAt = item.updatedAt;
+    bumpRevision(item);
+    bumpRevision(target);
     await this.persist();
     await this.log('info', 'outbox.item.moved', { ...summarize(item), direction });
     return clone(item);
@@ -264,7 +382,7 @@ export class DurableOutbox {
   async cancel(id) {
     await this.initialize();
     const item = this.requireItem(id);
-    if (!ACTIVE_STATUSES.has(item.status) || item.status === 'dispatching') {
+    if ((!ACTIVE_STATUSES.has(item.status) && item.status !== 'held') || item.status === 'dispatching') {
       throw statusError('当前排队消息不能取消', 409);
     }
     item.status = 'canceled';
@@ -272,6 +390,7 @@ export class DurableOutbox {
     item.retryable = false;
     item.nextAttemptAt = '';
     item.updatedAt = isoAt(this.now());
+    bumpRevision(item);
     await this.persist();
     await this.log('info', 'outbox.item.canceled', summarize(item));
     this.scheduleNext(0);
@@ -281,14 +400,35 @@ export class DurableOutbox {
   async retry(id) {
     await this.initialize();
     const item = this.requireItem(id);
-    if (!['failed', 'uncertain'].includes(item.status)) {
-      throw statusError('只有失败或待确认的消息可以重试', 409);
+    if (!['failed', 'uncertain', 'held'].includes(item.status)) {
+      throw statusError('只有失败、待确认或已暂停的消息可以重试', 409);
+    }
+    if (this.reconcile) {
+      const revision = item.revision;
+      let receipt = null;
+      try {
+        receipt = await this.reconcile(clone(item));
+      } catch (error) {
+        await this.log('warn', 'outbox.item.reconcile_failed', {
+          ...summarize(item), error: error?.message ?? String(error)
+        });
+      }
+      if (item.revision !== revision) {
+        return clone(item);
+      }
+      if (receipt?.status === 'submitted') {
+        this.settleSubmitted(item, receipt);
+        await this.persist();
+        this.scheduleNext(0);
+        return clone(item);
+      }
     }
     item.status = 'queued';
     item.error = '';
     item.retryable = true;
     item.nextAttemptAt = '';
     item.updatedAt = isoAt(this.now());
+    bumpRevision(item);
     await this.persist();
     await this.log('warn', 'outbox.item.retry_requested', summarize(item));
     this.scheduleNext(0);
@@ -309,6 +449,8 @@ export class DurableOutbox {
   }
 
   close() {
+    this.closed = true;
+    this.receiptReconciliationRequested = false;
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = null;
@@ -316,6 +458,9 @@ export class DurableOutbox {
   }
 
   async dispatchReadyOnce() {
+    if (this.holdStaleItems()) {
+      await this.persist();
+    }
     await this.reconcileUncertainItems();
     const now = this.now();
     const firstByLane = new Map();
@@ -323,7 +468,7 @@ export class DurableOutbox {
       if (!isReady(item, now) || firstByLane.has(item.laneKey)) {
         continue;
       }
-      const earlierActive = this.items.some((candidate) => (
+      const earlierActive = this.items.find((candidate) => (
         candidate.laneKey === item.laneKey
         && candidate.order < item.order
         && ACTIVE_STATUSES.has(candidate.status)
@@ -331,6 +476,22 @@ export class DurableOutbox {
         && candidate.status !== 'canceled'
         && candidate.status !== 'submitted'
       ));
+      if (earlierActive) {
+        const reason = earlierActive.status === 'uncertain'
+          ? '前一条消息的发送结果待确认，确认后继续发送'
+          : '等待前一条消息完成发送';
+        const changed = item.blockedBy !== earlierActive.id || item.blockedReason !== reason;
+        item.blockedBy = earlierActive.id;
+        item.blockedReason = reason;
+        item.nextAttemptAt = isoAt(now + this.blockedDelayMs);
+        bumpRevision(item);
+        if (changed) {
+          await this.persist();
+          await this.log('info', 'submission.blocked', {
+            ...summarize(item), reason: 'earlier_submission', blockedBy: earlierActive.id
+          });
+        }
+      }
       if (!earlierActive) {
         firstByLane.set(item.laneKey, item);
       }
@@ -342,11 +503,14 @@ export class DurableOutbox {
   }
 
   async dispatchOne(item) {
+    if (!isReady(item, this.now())) return null;
+    const revision = item.revision;
     if (this.canDispatch) {
       const decision = normalizeDispatchDecision(await this.canDispatch(clone(item)));
+      if (item.revision !== revision || !isReady(item, this.now())) return null;
       if (!decision.allowed) {
         item.nextAttemptAt = isoAt(this.now() + this.blockedDelayMs);
-        item.updatedAt = isoAt(this.now());
+        bumpRevision(item);
         await this.persist();
         const previousReason = this.blockedDecisionByItemId.get(item.id);
         if (previousReason !== decision.reason) {
@@ -369,47 +533,67 @@ export class DurableOutbox {
           ...summarize(item),
           previousReason
         });
+        if (item.revision !== revision || !isReady(item, this.now())) return null;
       }
     }
+    item.blockedBy = '';
+    item.blockedReason = '';
     item.status = 'dispatching';
     item.lastAttemptAt = isoAt(this.now());
     item.nextAttemptAt = '';
     item.updatedAt = item.lastAttemptAt;
-    await this.persist();
-    await this.log('info', 'outbox.item.dispatching', summarize(item));
+    bumpRevision(item);
+    const dispatchRevision = item.revision;
+    this.pendingDispatchItemIds.add(item.id);
     try {
-      const result = await this.dispatch(clone(item));
-      item.status = result?.deliveryPending === true ? 'dispatching' : 'submitted';
-      item.result = normalizeResult(result);
-      item.resultId = String(result?.id ?? result?.run?.id ?? '');
-      item.error = '';
-      item.retryable = false;
-      item.nextAttemptAt = '';
-      item.submittedAt = item.status === 'submitted' ? isoAt(this.now()) : '';
-      item.updatedAt = isoAt(this.now());
       await this.persist();
-      await this.log('info', item.status === 'submitted' ? 'outbox.item.submitted' : 'outbox.item.awaiting_receipt', summarize(item));
-      return clone(item);
-    } catch (error) {
-      item.attemptCount += 1;
-      item.status = error?.deliveryUncertain === true ? 'uncertain' : 'failed';
-      if (error?.deliveryUncertain === true) {
-        item.resultId = String(error.deliveryTaskId ?? '');
-        item.result = { deliveryPending: true, run: { id: item.resultId } };
+      await this.log('info', 'outbox.item.dispatching', summarize(item));
+      if (item.revision !== dispatchRevision) return null;
+      try {
+        const result = await this.dispatch(clone(item));
+        if (item.revision !== dispatchRevision) return clone(item);
+        item.status = result?.deliveryPending === true ? 'dispatching' : 'submitted';
+        item.result = compactOutboxResult(result, item);
+        item.resultId = String(result?.id ?? result?.run?.id ?? '');
+        item.error = '';
+        item.retryable = false;
+        item.nextAttemptAt = '';
+        item.submittedAt = item.status === 'submitted' ? isoAt(this.now()) : '';
+        item.updatedAt = isoAt(this.now());
+        bumpRevision(item);
+        this.pendingDispatchItemIds.delete(item.id);
+        await this.persist();
+        // The native ACK can be published before dispatch returns its task id.
+        // Always check once after binding it, even if that notification was early.
+        if (result?.deliveryPending === true) this.requestReceiptReconciliation();
+        await this.log('info', item.status === 'submitted' ? 'outbox.item.submitted' : 'outbox.item.awaiting_receipt', summarize(item));
+        return clone(item);
+      } catch (error) {
+        if (item.revision !== dispatchRevision) return clone(item);
+        item.attemptCount += 1;
+        item.status = error?.deliveryUncertain === true ? 'uncertain' : 'failed';
+        if (error?.deliveryUncertain === true) {
+          item.resultId = String(error.deliveryTaskId ?? '');
+          item.result = compactOutboxResult({ deliveryPending: true, run: { id: item.resultId } }, item);
+        }
+        item.error = error?.message ?? String(error);
+        item.retryable = error?.deliveryUncertain !== true && isRetryableOutboxError(error);
+        item.nextAttemptAt = item.retryable
+          ? isoAt(this.now() + retryDelayMs(item.attemptCount, this))
+          : '';
+        item.updatedAt = isoAt(this.now());
+        bumpRevision(item);
+        this.pendingDispatchItemIds.delete(item.id);
+        await this.persist();
+        await this.log(item.retryable ? 'warn' : 'error', 'outbox.item.failed', {
+          ...summarize(item),
+          retryable: item.retryable,
+          error: item.error
+        });
+        return clone(item);
       }
-      item.error = error?.message ?? String(error);
-      item.retryable = error?.deliveryUncertain !== true && isRetryableOutboxError(error);
-      item.nextAttemptAt = item.retryable
-        ? isoAt(this.now() + retryDelayMs(item.attemptCount, this))
-        : '';
-      item.updatedAt = isoAt(this.now());
-      await this.persist();
-      await this.log(item.retryable ? 'warn' : 'error', 'outbox.item.failed', {
-        ...summarize(item),
-        retryable: item.retryable,
-        error: item.error
-      });
-      return clone(item);
+    } finally {
+      this.pendingDispatchItemIds.delete(item.id);
     }
   }
 
@@ -425,9 +609,9 @@ export class DurableOutbox {
     if (this.items.length <= this.maxItems) {
       return;
     }
-    const active = this.items.filter((item) => ACTIVE_STATUSES.has(item.status));
+    const active = this.items.filter((item) => ACTIVE_STATUSES.has(item.status) || item.status === 'held');
     const terminal = this.items
-      .filter((item) => !ACTIVE_STATUSES.has(item.status))
+      .filter((item) => !ACTIVE_STATUSES.has(item.status) && item.status !== 'held')
       .sort((left, right) => String(right.updatedAt).localeCompare(String(left.updatedAt)));
     this.items = [...active, ...terminal.slice(0, Math.max(0, this.maxItems - active.length))];
   }
@@ -461,7 +645,7 @@ export class DurableOutbox {
   }
 
   scheduleNext(delayOverride = null) {
-    if (!this.scheduleEnabled) {
+    if (!this.scheduleEnabled || this.closed) {
       return;
     }
     if (this.timer) {
@@ -480,6 +664,13 @@ export class DurableOutbox {
     if (this.items.some(item => item.status === 'uncertain'
       && now - Date.parse(item.lastAttemptAt) < 300_000)) {
       nextAt = Math.min(Number.isFinite(nextAt) ? nextAt : Infinity, now + 5000);
+    }
+    for (const item of this.items) {
+      const ageFrom = staleAgeFrom(item);
+      if (Number.isFinite(ageFrom)) {
+        nextAt = Math.min(Number.isFinite(nextAt) ? nextAt : Infinity,
+          ageFrom + this.staleAfterMs + 1);
+      }
     }
     if (!Number.isFinite(nextAt) && delayOverride === null) {
       return;
@@ -552,6 +743,7 @@ function normalizeNewItem(input, now) {
     text,
     payload: { ...normalizePayload(input?.payload), text },
     status: 'queued',
+    revision: 0,
     order: 0,
     attemptCount: 0,
     retryable: true,
@@ -591,6 +783,7 @@ function normalizePersistedItem(item) {
     text,
     payload: { ...normalizePayload(item.payload), text },
     status: normalizeStatus(item.status),
+    revision: Math.max(0, Number(item.revision) || 0),
     order: Number.isFinite(Number(item.order)) ? Number(item.order) : 0,
     attemptCount: Math.max(0, Number(item.attemptCount) || 0),
     retryable: item.retryable !== false,
@@ -599,7 +792,7 @@ function normalizePersistedItem(item) {
     lastAttemptAt: String(item.lastAttemptAt ?? ''),
     submittedAt: String(item.submittedAt ?? ''),
     resultId: String(item.resultId ?? ''),
-    result: normalizeResult(item.result),
+    result: compactOutboxResult(item.result, item),
     createdAt: String(item.createdAt ?? new Date().toISOString()),
     updatedAt: String(item.updatedAt ?? item.createdAt ?? new Date().toISOString())
   };
@@ -607,7 +800,7 @@ function normalizePersistedItem(item) {
 
 function normalizeStatus(status) {
   const value = String(status ?? '').trim();
-  return ['queued', 'failed', 'dispatching', 'uncertain', 'submitted', 'canceled'].includes(value)
+  return ['queued', 'failed', 'dispatching', 'uncertain', 'held', 'submitted', 'canceled'].includes(value)
     ? value
     : 'queued';
 }
@@ -636,13 +829,6 @@ function normalizeDispatchDecision(value) {
   };
 }
 
-function normalizeResult(result) {
-  if (!result || typeof result !== 'object') {
-    return null;
-  }
-  return clone(result);
-}
-
 function nextLaneOrder(items, laneKey) {
   return items
     .filter((item) => item.laneKey === laneKey)
@@ -666,6 +852,24 @@ function isReady(item, now) {
   return item.status === 'failed'
     && item.retryable
     && (!item.nextAttemptAt || Date.parse(item.nextAttemptAt) <= now);
+}
+
+function staleAgeFrom(item) {
+  const createdAt = Date.parse(item.createdAt);
+  if (item.status === 'uncertain') {
+    const attemptedAt = Date.parse(item.lastAttemptAt);
+    return Number.isFinite(attemptedAt) ? attemptedAt : createdAt;
+  }
+  if (item.status === 'queued') {
+    const updatedAt = Date.parse(item.updatedAt);
+    return Math.max(Number.isFinite(createdAt) ? createdAt : -Infinity,
+      Number.isFinite(updatedAt) ? updatedAt : -Infinity);
+  }
+  return NaN;
+}
+
+function bumpRevision(item) {
+  item.revision += 1;
 }
 
 function retryDelayMs(attemptCount, options) {

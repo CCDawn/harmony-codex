@@ -6,6 +6,7 @@ import { extractCodexProjects } from './codexProjects.js';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const workspaceRoot = resolveWorkspaceRoot();
+const localHuaweiPushAccount = path.join(projectRoot, 'tools/harmony/huawei-push.service-account.local.json');
 
 export function resolveWorkspaceRoot(env = process.env) {
   return env.CODEX_BRIDGE_WORKSPACE
@@ -67,6 +68,11 @@ export const config = {
     Number.parseInt(process.env.CODEX_BRIDGE_REMOTE_FILE_MAX_BYTES ?? `${25 * 1024 * 1024}`, 10)
   ),
   appServerRuntimeMode: process.env.CODEX_BRIDGE_RUNTIME_MODE ?? 'desktop',
+  huaweiPushServiceAccountPath: process.env.CODEX_HUAWEI_PUSH_SERVICE_ACCOUNT
+    ? path.resolve(process.env.CODEX_HUAWEI_PUSH_SERVICE_ACCOUNT)
+    : fs.existsSync(localHuaweiPushAccount) ? localHuaweiPushAccount : '',
+  huaweiPushCategory: process.env.CODEX_HUAWEI_PUSH_CATEGORY ?? 'WORK',
+  huaweiPushTestMessage: process.env.CODEX_HUAWEI_PUSH_TEST_MESSAGE !== '0',
   appServerCanaryThreadIds: String(process.env.CODEX_BRIDGE_APP_SERVER_CANARY_THREADS ?? '')
     .split(',')
     .map((value) => value.trim())

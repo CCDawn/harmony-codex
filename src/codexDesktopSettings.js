@@ -1,6 +1,6 @@
 import { CodexDesktopCdpClient } from './codexDesktopCdpClient.js';
-import { readCodexDefaultModel, readCodexDefaultReasoningEffort } from './codexUserConfig.js';
-import { normalizeModelId, normalizeReasoningEffort } from './sessionSettingsStore.js';
+import { readCodexDefaultModel, readCodexDefaultReasoningEffort, readCodexDefaultServiceTier } from './codexUserConfig.js';
+import { normalizeModelId, normalizeReasoningEffort, normalizeServiceTier } from './sessionSettingsStore.js';
 
 export async function readDesktopCodexSettings(options = {}) {
   const fallback = await readConfigFileDefaults(options);
@@ -39,13 +39,15 @@ export async function readAppServerCodexSettings(threadService, options = {}) {
 }
 
 async function readConfigFileDefaults(options) {
-  const [model, reasoningEffort] = await Promise.all([
+  const [model, reasoningEffort, serviceTier] = await Promise.all([
     readCodexDefaultModel(options),
-    readCodexDefaultReasoningEffort(options)
+    readCodexDefaultReasoningEffort(options),
+    readCodexDefaultServiceTier(options)
   ]);
   return {
     model,
     reasoningEffort,
+    serviceTier,
     source: 'config_file',
     models: model ? [{
       id: model,
@@ -71,6 +73,7 @@ async function readCodexSettingsFromClient(client, fallback, options) {
   return {
     model: safeNormalizeModelId(config.model ?? fallback.model),
     reasoningEffort: safeNormalizeReasoningEffort(config.model_reasoning_effort ?? fallback.reasoningEffort),
+    serviceTier: normalizeServiceTier(config.service_tier) || 'default',
     source: options.source,
     models: Array.isArray(modelResult?.data) ? modelResult.data : []
   };

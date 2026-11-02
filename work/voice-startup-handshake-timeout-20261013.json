@@ -1,0 +1,6 @@
+{
+  "ready": false,
+  "microphoneUsed": false,
+  "events": [],
+  "failureType": "TimeoutError"
+}

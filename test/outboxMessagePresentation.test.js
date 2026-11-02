@@ -1,0 +1,34 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import vm from 'node:vm';
+import {stripTypeScriptTypes} from 'node:module';
+import test from 'node:test';
+const path='HarmonyCodexRemote/entry/src/main/ets/services/OutboxMessagePresentation.ets';
+const code=fs.readFileSync(path,'utf8').replace(/^import .*;\s*$/gm,'').replaceAll('export ','');
+const c=vm.createContext({});vm.runInContext(stripTypeScriptTypes(code+'\nglobalThis.api={outboxMessageLabel,restoreOutboxMessages};'),c);
+const {outboxMessageLabel:label,restoreOutboxMessages:restore}=c.api;
+const msg={id:'local',submissionId:'send',sessionId:'thread',taskId:'outbox_1',state:'submitted',text:'message'};
+const item={id:'outbox_1',submissionId:'send',threadId:'thread',status:'queued',text:'message',createdAt:'2026-10-23T00:00:00Z',projectId:'p'};
+test('queued and blocked messages report their real delivery stage rather than waiting for an impossible receipt',()=>{
+ assert.equal(label(msg,[item],null),'排队中');
+ assert.equal(label(msg,[{...item,blockedBy:'old'}],null),'前序消息待处理 · 查看队列');
+ assert.equal(label(msg,[{...item,status:'held'}],null),'历史待处理 · 查看队列');
+ assert.equal(label(msg,[{...item,status:'uncertain'}],null),'发送结果待核对 · 查看队列');
+ assert.equal(label(msg,[{...item,status:'dispatching'}],null),'正在确认送达');
+ assert.equal(label({...msg,state:'sending'},[item],null),'发送中…');
+ const task={id:'outbox_1',runtime:{kind:'durable_outbox',state:'queued'},events:[{payload:{message:'前一条消息的发送结果待确认，确认后继续发送'}}]};
+ assert.equal(label(msg,[],task),'前序消息待处理 · 查看队列');
+ assert.equal(label(msg,[{...item,threadId:'other',status:'held'}],null),'等待送达确认');
+});
+test('reopening restores durable pending messages once, preserving exact payload and submission identity',()=>{
+ const attached={...item,text:'文字\n![手机端图片](C:/image.png)'};
+ let messages=restore([], [attached], 'thread');
+ assert.equal(messages.length,1);assert.equal(messages[0].submittedText,attached.text);
+ assert.equal(messages[0].restoredFromOutbox,true);assert.equal(messages[0].submissionId,'send');
+ messages=restore(messages,[attached],'thread');assert.equal(messages.length,1);
+ const existing={...msg,images:[{uri:'local-image'}]};
+ assert.equal(restore([existing],[item],'thread')[0],existing);
+ assert.equal(restore([],[{...item,status:'held'}],'thread').length,0,'historical held messages stay in the queue panel');
+ assert.equal(restore([],[{...item,status:'submitted'}],'thread').length,0);
+ assert.equal(restore([],[item],'another').length,0);
+});

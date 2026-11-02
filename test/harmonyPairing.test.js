@@ -229,9 +229,24 @@ test('index pairs through scan kit with manual fallback and runtime credential s
 
   const applyBody = extractMethodBody(indexText, 'applyRuntimeCredential');
   assert.match(applyBody, /this\.bridgeToken = credential\.token;/);
-  const applyTokenRefs = applyBody.match(/credential\.token/g) ?? [];
-  assert.equal(applyTokenRefs.length, 1, 'token value must only flow into state, never into logs');
+  assert.match(applyBody, /this\.bridgeToken !== credential\.token/);
   assert.doesNotMatch(applyBody, /totpSecret/);
+  const apply = new Function('CredentialRuntime', 'HuaweiPushRegistrationService', stripTypeScriptTypes(`function run(credential, source) {${applyBody}}`) + '; return run;')
+    ({ setRuntimeCredential() {} }, { configure() {} });
+  const logs = [];
+  const view = { bridgeUrl: 'https://old.example', bridgeToken: 'old-token', normalizedBridgeUrl() { return this.bridgeUrl; },
+    preserveCurrentSessionDraft: () => true, stopTaskEventStream() {}, stopCompanionEventStream() {},
+    restoreCurrentSessionDraft() {}, refreshBridgeOtp() {}, syncPushRegistration() {}, safeBridgeHost: () => 'new.example',
+    log: (...args) => logs.push(args) };
+  const credential = { bridgeUrl: 'https://new.example', token: 'private-token-sentinel',
+    totpSecret: 'private-totp-sentinel', deviceId: 'device' };
+  apply.call(view, credential, 'test');
+  assert.equal(view.bridgeToken, credential.token);
+  assert.equal(view.pairingDraftToken, credential.token);
+  apply.call(view, credential, 'unchanged');
+  assert.equal(logs.length, 2);
+  assert.match(JSON.stringify(logs), /pairing\.credential\.applied/);
+  assert.doesNotMatch(JSON.stringify(logs), /private-token-sentinel|private-totp-sentinel/);
   const enrollPairingBody = extractMethodBody(indexText, 'enrollPairing');
   assert.doesNotMatch(enrollPairingBody, /credential\.token/);
   assert.doesNotMatch(enrollPairingBody, /totpSecret/);

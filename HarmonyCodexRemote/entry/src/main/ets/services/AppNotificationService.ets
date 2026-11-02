@@ -26,6 +26,13 @@ export interface MonitorNotificationSyncResult {
 const MONITOR_NOTIFICATION_ID: number = 31_070;
 
 export class AppNotificationService {
+  private static remotePushEnabled: boolean = false;
+  private static remotePushThreadIds: string[] = [];
+
+  static setRemotePushEnabled(enabled: boolean, threadIds: string[] = []): void {
+    AppNotificationService.remotePushEnabled = enabled;
+    AppNotificationService.remotePushThreadIds = enabled ? [...threadIds] : [];
+  }
   private static requestCode: number = 31078;
   private static lastMonitorNotificationKey: string = '';
 
@@ -39,6 +46,13 @@ export class AppNotificationService {
   }
 
   static async publish(target: AppNotificationTarget, unreadCount: number): Promise<void> {
+    if (AppNotificationService.remotePushEnabled
+      && AppNotificationService.remotePushThreadIds.includes(target.sessionId)
+      && AppStorage.get<boolean>('codexRemoteAppForeground') !== true
+      && ['completed', 'failed', 'approval_required', 'user_input_required'].includes(target.type)) {
+      await AppNotificationService.syncBadgeNumber(unreadCount);
+      return;
+    }
     const copy = AppNotificationService.copyForType(target.type);
     const requestCode = AppNotificationService.requestCode;
     AppNotificationService.requestCode += 1;

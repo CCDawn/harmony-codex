@@ -1,19 +1,13 @@
 import { CodexDesktopCdpClient } from './codexDesktopCdpClient.js';
 import { companionCallRecords } from './companionCallHistory.js';
 import { annotateCompanionError } from './companionErrors.js';
+import { randomUUID } from 'node:crypto';
+import { DESKTOP_MODULE_GRAPH_LOADER } from './desktopModuleGraph.js';
 
 // Resolve the exports from the running desktop build, not another installed build.
-const LOAD_API = String.raw`
-const entry = [...document.scripts].find(s => s.type === 'module' && s.src);
-if (!entry) throw Object.assign(new Error('Desktop module entry unavailable'), {failureClass:'api_compatibility'});
-const indexSource = await (await fetch(entry.src)).text();
-// Desktop updates can relocate this client from shared to initial/primary.
-// Only inspect asset names referenced by the active entry, never another build.
-const assetNames = [...new Set(indexSource.match(/app-(?:shared|initial|primary)-[a-z0-9]+\.js/g) || [])];
+const LOAD_API = DESKTOP_MODULE_GRAPH_LOADER + String.raw`
 let api;
-for (const assetName of assetNames) {
-  const assetUrl = new URL(assetName, entry.src).href;
-  const source = await (await fetch(assetUrl)).text();
+for await (const {assetUrl, source} of activeDesktopModules()) {
   const internalName = source.match(/([A-Za-z_$][\w$]*)\.safeGet\(['"\`]\/tbo\/primary['"\`]/)?.[1];
   if (!internalName) continue;
   const exportBlock = source.slice(source.lastIndexOf('export{') >= 0
@@ -31,14 +25,144 @@ for (const assetName of assetNames) {
 if (!api) throw Object.assign(new Error('Desktop Companion API export unavailable'), {failureClass:'api_compatibility'});
 `;
 
+const REQUEST_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+// This is a read-only subscription to the desktop's existing messaging topic.
+// The upstream events invalidate messages; they are not token deltas. Keep the
+// function self-contained because it also executes inside the desktop renderer.
+export function attachCompanionMessageTopic(topic, roomId, emit, isCurrent) {
+  let active = true;
+  let subscribed = false;
+  let initialRecovery = true;
+  let scheduled = false;
+  const cleanups = [];
+  const stop = () => {
+    if (!active) return;
+    active = false;
+    for (const cleanup of cleanups.splice(0).reverse()) cleanup();
+  };
+  const control = reason => {
+    if (!active) return;
+    stop();
+    emit({ kind: 'control', reason });
+  };
+  const current = () => {
+    if (!active) return false;
+    if (isCurrent()) return true;
+    control('terminal');
+    return false;
+  };
+  const refresh = () => {
+    if (!current() || scheduled) return;
+    scheduled = true;
+    queueMicrotask(() => {
+      scheduled = false;
+      if (current()) emit({ kind: 'update' });
+    });
+  };
+  try {
+    // A bounded lease also releases our ownership if the bridge process dies
+    // before it can run renderer cleanup. Renew by reconnecting and repairing
+    // history; this timer never fetches messages.
+    const lease = setTimeout(() => control('reconnect'), 60000);
+    cleanups.push(() => clearTimeout(lease));
+    cleanups.push(topic.onMessage(event => {
+      if (!current() || event?.payload?.room_id !== roomId) return;
+      if (['calpico-message-add', 'calpico-message-update', 'calpico-message-task-associated'].includes(event.type)) refresh();
+      else if (event.type === 'calpico-room-leave') control('terminal');
+    }));
+    cleanups.push(topic.onDisconnect(() => control('reconnect')));
+    cleanups.push(topic.onPotentialMissedMessages(() => {
+      // A first subscription has no offset. Its initial authoritative read
+      // covers that recovery signal; subsequent gaps require history repair.
+      if (initialRecovery) initialRecovery = false;
+      else control('gap');
+    }));
+    cleanups.push(topic.onSubscribed(() => {
+      if (subscribed) { control('reconnect'); return; }
+      subscribed = true;
+      refresh();
+      queueMicrotask(() => { initialRecovery = false; });
+    }));
+    // Do not call unsubscribe(): another desktop consumer may own the topic.
+    const release = topic.retainSubscription();
+    if (active) cleanups.push(release);
+    else release();
+    return stop;
+  } catch (error) {
+    stop();
+    throw error;
+  }
+}
+
+const LOAD_MESSAGE_TOPIC = String.raw`
+let live;
+for await (const {assetUrl, source} of activeDesktopModules()) {
+  // Discover symbols by their actual call sites in the running build. Never
+  // reuse hashed exports or code from a different installed desktop version.
+  const topicFactory = source.match(/([A-Za-z_$][\w$]*)\(\w+\?\?\(\w+===\x60all\x60\?\x60calpico-chatgpt-messaging-all\x60:\x60calpico-chatgpt-messaging\x60\)/)?.[1];
+  const identity = source.match(/\.scope\.get\(([A-Za-z_$][\w$]*)\)!==\w+\.access\.accountId\|\|\w+\.scope\.get\(([A-Za-z_$][\w$]*)\)!==\w+\.access\.userId/);
+  if (!topicFactory || !identity) continue;
+  const exportBlock = source.slice(Math.max(source.lastIndexOf('export{'), source.lastIndexOf('export {')));
+  const exports = [...exportBlock.matchAll(/([A-Za-z_$][\w$]*)\s+as\s+([A-Za-z_$][\w$]*)/g)];
+  const module = await import(assetUrl);
+  const resolve = internal => module[exports.find(match => match[1] === internal)?.[2]];
+  const factory = resolve(topicFactory), account = resolve(identity[1]), user = resolve(identity[2]);
+  if (typeof factory !== 'function' || typeof account?.resolve !== 'function' || typeof user?.resolve !== 'function') continue;
+  // Read the existing authenticated AppScope; no token extraction, additional
+  // login, thread, turn, voice call or independent WebSocket is created here.
+  const pending = [window.__codexRoot?._internalRoot?.current];
+  let scanned = 0;
+  while (pending.length && scanned++ < 10000) {
+    const fiber = pending.pop();
+    if (!fiber) continue;
+    const chain = fiber.memoizedProps?.value;
+    if (chain instanceof Map && chain.has(account.scope.id) && chain.has(user.scope.id)) {
+      const read = atom => { const node = chain.get(atom.scope.id); return node.store.get(atom.resolve(node, chain)); };
+      const accountId = read(account), userId = read(user);
+      if (typeof accountId !== 'string' || !accountId || typeof userId !== 'string' || !userId) break;
+      const topic = factory('calpico-chatgpt-messaging',
+        () => api.safeGet('/celsius/ws/user', {retry:false,
+          additionalHeaders:{'ChatGPT-Account-ID':accountId},expectedIdentity:{accountId,userId}}).then(result => result.websocket_url),
+        JSON.stringify([accountId,userId]));
+      if (!['onMessage','onDisconnect','onSubscribed','onPotentialMissedMessages','retainSubscription'].every(key => typeof topic?.[key] === 'function')) break;
+      live = {topic,isCurrent:()=>read(account) === accountId && read(user) === userId};
+      break;
+    }
+    if (fiber.sibling) pending.push(fiber.sibling);
+    if (fiber.child) pending.push(fiber.child);
+  }
+  if (live) break;
+}
+if (!live) throw Object.assign(new Error('Desktop messaging subscription unavailable'), {failureClass:'api_compatibility'});
+`;
+
+function historyCreatedAt(value) {
+  // The official field is a timestamp with an explicit timezone. Date.parse
+  // alone also accepts ambiguous dates, numbers and impossible calendar days.
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d+)?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)$/.test(value)) return null;
+  const day = value.slice(0, 10);
+  const calendar = Date.parse(`${day}T00:00:00Z`);
+  const timestamp = Date.parse(value);
+  return Number.isFinite(calendar) && new Date(calendar).toISOString().slice(0, 10) === day
+    && Number.isFinite(timestamp) ? timestamp : null;
+}
+
 export function historyEntries(items, authors = null) {
   const roles = authors && new Map(authors.map(author => [author.accountUserId, author.role]));
   return (Array.isArray(items) ? items : [])
+    .filter(item => typeof item?.id === 'string' && item.id.trim() && item.id.length <= 512)
     .filter(item => !item.deleted_at && typeof item.content?.text === 'string' && item.content.text.trim())
     .filter(item => !roles || roles.has(item.account_user_id))
     .sort((a, b) => String(a.created_at ?? '').localeCompare(String(b.created_at ?? '')))
-    .map(item => ({ itemId: `room:${item.id}`, role: roles ? roles.get(item.account_user_id) : (item.role === 'user' ? 'user' : 'assistant'),
-      text: item.content.text, final: true }));
+    .map(item => {
+      const createdAt = historyCreatedAt(item.created_at);
+      return { itemId: `room:${item.id}`, role: roles ? roles.get(item.account_user_id) : (item.role === 'user' ? 'user' : 'assistant'),
+        text: item.content.text, final: true,
+        ...(typeof item.request_id === 'string' && REQUEST_ID_PATTERN.test(item.request_id)
+          ? { requestId: item.request_id.toLowerCase() } : {}),
+        ...(createdAt !== null ? { createdAt } : {}) };
+    });
 }
 
 export class CompanionDesktopClient {
@@ -144,6 +268,126 @@ return await api.safeGet('/messaging/rooms/{room_id}/messages', {
     };
   }
 
+  async subscribeMessages({ profileId, roomId, signal, onEntry, onControl } = {}) {
+    if (this.liveStop) throw new Error('Companion subscription already active');
+    const profile = await this.discover();
+    if (profile.id !== profileId || profile.roomId !== roomId) {
+      throw Object.assign(new Error('Personal assistant selection changed'), {statusCode:409});
+    }
+    await this.getRoomMetadata();
+    signal?.throwIfAborted();
+    const binding = `__companionWatch_${randomUUID().replaceAll('-', '')}`;
+    const socket = this.client.socket;
+    if (!socket || typeof socket.addEventListener !== 'function' || typeof this.client.call !== 'function') {
+      throw Object.assign(new Error('Desktop subscription transport unavailable'), {failureClass:'api_compatibility'});
+    }
+    let active = true;
+    let refreshing = false;
+    let dirty = false;
+    let stopPromise;
+    let startupTimer;
+    let sawUpdate = false;
+    const installation = Promise.withResolvers();
+    const previous = new Map();
+    const stop = () => {
+      if (stopPromise) return stopPromise;
+      active = false;
+      clearTimeout(startupTimer);
+      signal?.removeEventListener('abort', abort);
+      socket.removeEventListener('message', receive);
+      socket.removeEventListener('close', disconnected);
+      socket.removeEventListener('error', disconnected);
+      stopPromise = (async () => {
+        await installation.promise;
+        // The renderer cleanup owns only this retained topic listener. Closing
+        // the CDP connection alone would leave it running in the desktop.
+        if (this.client.socket === socket && socket.readyState === WebSocket.OPEN) {
+          try { await this.client.evaluate(`(()=>{window[${JSON.stringify(binding + '_stop')}]?.();delete window[${JSON.stringify(binding + '_stop')}];delete window[${JSON.stringify(binding)}];})()`, 5000); } catch {}
+          try { await this.client.call('Runtime.removeBinding', {name:binding}, 5000); } catch {}
+        }
+        if (this.liveStop === stop) this.liveStop = null;
+      })();
+      return stopPromise;
+    };
+    const control = reason => {
+      if (!active) return;
+      void stop();
+      onControl?.({type:'stream.control',reason});
+    };
+    const abort = () => { void stop(); };
+    const disconnected = () => control('reconnect');
+    const refresh = async () => {
+      dirty = true;
+      if (refreshing || !active) return;
+      refreshing = true;
+      try {
+        while (active && dirty) {
+          dirty = false;
+          // Coalesce notifications while a read is in flight into one further
+          // read. No timer periodically reads messages or simulates deltas.
+          await this.discover();
+          if (!active) break;
+          const page = await this.messages();
+          if (!active) break;
+          for (const entry of page.entries) {
+            const fingerprint = JSON.stringify(entry);
+            if (previous.get(entry.itemId) === fingerprint) continue;
+            previous.delete(entry.itemId);
+            previous.set(entry.itemId, fingerprint);
+            if (previous.size > 128) previous.delete(previous.keys().next().value);
+            onEntry?.(entry);
+            if (!active) break;
+          }
+        }
+      } catch { control('reconnect'); }
+      finally { refreshing = false; }
+    };
+    const receive = event => {
+      if (!active) return;
+      let message, payload;
+      try {
+        message = JSON.parse(event.data);
+        if (message.method !== 'Runtime.bindingCalled' || message.params?.name !== binding
+            || typeof message.params.payload !== 'string' || message.params.payload.length > 512) return;
+        payload = JSON.parse(message.params.payload);
+      } catch { return; }
+      if (payload?.kind === 'update') {
+        sawUpdate = true;
+        clearTimeout(startupTimer);
+        void refresh();
+      } else if (payload?.kind === 'control' && ['gap','terminal','reconnect'].includes(payload.reason)) control(payload.reason);
+    };
+    this.liveStop = stop;
+    socket.addEventListener('message', receive);
+    socket.addEventListener('close', disconnected);
+    socket.addEventListener('error', disconnected);
+    signal?.addEventListener('abort', abort, {once:true});
+    try {
+      await this.client.call('Runtime.addBinding', {name:binding});
+      signal?.throwIfAborted();
+      await this.invoke(`
+${LOAD_MESSAGE_TOPIC}
+if (!live.isCurrent()) throw Object.assign(new Error('Messaging account changed'), {failureClass:'account'});
+const current = await api.safeGet('/tbo/primary', {retry:false});
+if (current?.profile?.id !== params.profileId || current?.profile?.messaging_room_id !== params.roomId
+    || current?.profile?.aeon_kind !== 'orbit' || current?.profile?.status !== 'active') {
+  throw Object.assign(new Error('Personal assistant selection changed'), {failureClass:'account'});
+}
+const emit = event => window[params.binding](JSON.stringify(event));
+window[params.binding + '_stop'] = (${attachCompanionMessageTopic.toString()})(live.topic, params.roomId, emit, live.isCurrent);
+return {subscribed:true};`, {profileId,roomId,binding}, 30000, 'subscribe_messages');
+      installation.resolve();
+      signal?.throwIfAborted();
+      if (!active) { await stop(); return stop; }
+      if (!sawUpdate) startupTimer = setTimeout(() => control('reconnect'), 15000);
+      return stop;
+    } catch (error) {
+      installation.resolve();
+      await stop();
+      throw error;
+    }
+  }
+
   async sendText({ profileId, roomId, text, requestId } = {}) {
     if (typeof profileId !== 'string' || !profileId.trim() || profileId.length > 512
         || typeof roomId !== 'string' || !roomId.trim() || roomId.length > 512
@@ -157,6 +401,9 @@ return await api.safeGet('/messaging/rooms/{room_id}/messages', {
     // This check runs in the same desktop evaluation as the POST, so a cached
     // profile or a previous service read cannot silently retarget a write.
     const result = await this.invoke(`
+if (typeof api.safePost !== 'function') {
+  throw Object.assign(new Error('Desktop Companion text API unavailable'), {status:422,failureClass:'api_compatibility'});
+}
 const current = await api.safeGet('/tbo/primary', {retry:false});
 const p = current?.profile;
 if (p?.id !== params.profileId || p?.messaging_room_id !== params.roomId
@@ -219,5 +466,8 @@ return {ok:true};`, { id: this.profile.id, callId: this.callId }, 30000, action)
     return result;
   }
 
-  close() { this.client.close(); }
+  close() {
+    if (this.liveStop) return this.liveStop().finally(() => this.client.close());
+    this.client.close();
+  }
 }

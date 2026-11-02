@@ -1,0 +1,9 @@
+{
+  "UpdatedAt": "2026-10-08T07:14:08.4950870Z",
+  "OldWatchdogPid": 54032,
+  "NewWatchdogPid": 41068,
+  "WatchdogRunning": true,
+  "ProtectedProcessCount": 37,
+  "ProtectedProcessesPreserved": true,
+  "SupervisorArmed": true
+}

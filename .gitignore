@@ -36,9 +36,11 @@ tools/harmony/diagnostics/
 
 # Local machine configuration and generated app config
 *.local.psd1
+tools/harmony/huawei-push.service-account.local.json
 .env
 .env.local
 HarmonyCodexRemote/entry/src/main/ets/config/BridgeConfig.ets
+HarmonyCodexRemote/entry/src/main/ets/config/ControlConfig.ets
 HarmonyHdcRelayHelper/entry/src/main/ets/config/RelayConfig.ets
 HarmonyHdcRelayHelper/entry/src/main/ets/config/BridgeConfig.ets
 HarmonyCodexRelay/

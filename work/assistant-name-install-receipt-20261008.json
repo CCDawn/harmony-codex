@@ -1,0 +1,12 @@
+{
+  "At": "2026-10-08T07:34:41.6257335Z",
+  "InstallCommandExit": 0,
+  "InstallationVerifiedOnDevice": false,
+  "LaunchAttempted": false,
+  "LaunchSkippedReason": "App hosts the HDC relay; installer intentionally skips remote launch",
+  "HdcDisconnectedAfterInstall": true,
+  "AwaitingManualAppOpen": true,
+  "PhoneVisualAcceptance": false,
+  "InstallLog": "work/assistant-name-install-20261008.log",
+  "BeforeScreenshot": "logs/screenshots/assistant-name-before-install-20261008.jpeg"
+}

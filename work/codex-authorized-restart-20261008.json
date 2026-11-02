@@ -1,0 +1,104 @@
+{
+  "Authorized": true,
+  "StartedAt": "2026-10-08T07:04:10.5749062Z",
+  "Stage": "restarting",
+  "Completed": false,
+  "BeforeOfficial": [
+    {
+      "ProcessId": 28108,
+      "Name": "ChatGPT.exe",
+      "CreationDate": "2026-10-08T09:43:53.444359+08:00"
+    },
+    {
+      "ProcessId": 11528,
+      "Name": "ChatGPT.exe",
+      "CreationDate": "2026-10-08T09:43:53.5719+08:00"
+    },
+    {
+      "ProcessId": 17080,
+      "Name": "ChatGPT.exe",
+      "CreationDate": "2026-10-08T09:43:54.061628+08:00"
+    },
+    {
+      "ProcessId": 29188,
+      "Name": "ChatGPT.exe",
+      "CreationDate": "2026-10-08T09:43:54.069681+08:00"
+    },
+    {
+      "ProcessId": 27176,
+      "Name": "ChatGPT.exe",
+      "CreationDate": "2026-10-08T09:43:54.089447+08:00"
+    },
+    {
+      "ProcessId": 2016,
+      "Name": "ChatGPT.exe",
+      "CreationDate": "2026-10-08T09:44:04.657639+08:00"
+    },
+    {
+      "ProcessId": 3784,
+      "Name": "ChatGPT.exe",
+      "CreationDate": "2026-10-08T09:44:04.657642+08:00"
+    },
+    {
+      "ProcessId": 11736,
+      "Name": "ChatGPT.exe",
+      "CreationDate": "2026-10-08T09:44:18.680114+08:00"
+    },
+    {
+      "ProcessId": 8788,
+      "Name": "ChatGPT.exe",
+      "CreationDate": "2026-10-08T09:44:22.132172+08:00"
+    },
+    {
+      "ProcessId": 16436,
+      "Name": "ChatGPT.exe",
+      "CreationDate": "2026-10-08T09:44:24.214457+08:00"
+    },
+    {
+      "ProcessId": 9876,
+      "Name": "ChatGPT.exe",
+      "CreationDate": "2026-10-08T09:44:24.423551+08:00"
+    },
+    {
+      "ProcessId": 11400,
+      "Name": "ChatGPT.exe",
+      "CreationDate": "2026-10-08T09:44:25.884627+08:00"
+    },
+    {
+      "ProcessId": 32404,
+      "Name": "ChatGPT.exe",
+      "CreationDate": "2026-10-08T09:44:44.386701+08:00"
+    },
+    {
+      "ProcessId": 31356,
+      "Name": "ChatGPT.exe",
+      "CreationDate": "2026-10-08T09:44:46.409173+08:00"
+    },
+    {
+      "ProcessId": 29740,
+      "Name": "ChatGPT.exe",
+      "CreationDate": "2026-10-08T09:44:47.993408+08:00"
+    },
+    {
+      "ProcessId": 33428,
+      "Name": "ChatGPT.exe",
+      "CreationDate": "2026-10-08T09:45:22.45654+08:00"
+    },
+    {
+      "ProcessId": 22880,
+      "Name": "ChatGPT.exe",
+      "CreationDate": "2026-10-08T09:46:54.071085+08:00"
+    },
+    {
+      "ProcessId": 42320,
+      "Name": "ChatGPT.exe",
+      "CreationDate": "2026-10-08T12:29:10.013425+08:00"
+    },
+    {
+      "ProcessId": 44440,
+      "Name": "ChatGPT.exe",
+      "CreationDate": "2026-10-08T14:22:37.127308+08:00"
+    }
+  ],
+  "ProtectedProcessCount": 15
+}

@@ -7,6 +7,13 @@ function readScript(relativePath) {
   return fs.readFileSync(path.resolve(relativePath), 'utf8');
 }
 
+function scriptSection(text, startMarker, endMarker) {
+  const start = text.indexOf(startMarker);
+  const end = text.indexOf(endMarker, start + startMarker.length);
+  assert.ok(start >= 0 && end > start, `missing script section ${startMarker}`);
+  return text.slice(start, end);
+}
+
 test('direct Windows PowerShell startup entrypoints keep a UTF-8 BOM for Chinese diagnostics', () => {
   for (const filePath of [
     'scripts/agent/start-stack-interactive.ps1',
@@ -23,7 +30,10 @@ test('startup stack preserves bridge token for desktop live recovery paths', () 
   const text = readScript('scripts/start-codex-mobile-stack.ps1');
 
   assert.match(text, /\[string\]\$BridgeToken = \$env:CODEX_BRIDGE_TOKEN/);
-  assert.match(text, /\$env:CODEX_BRIDGE_TOKEN='\$BridgeToken'/);
+  const bridge = scriptSection(text, 'function Start-LocalBridgeProcess', 'function Ensure-LocalBridge');
+  assert.match(bridge, /\$env:CODEX_BRIDGE_TOKEN="\$BridgeToken"/);
+  assert.match(bridge, /Start-Process -WindowStyle Hidden -FilePath \$node -ArgumentList @\('src\/server\.js', \$workspaceMarker\) -WorkingDirectory \$repoRoot/);
+  assert.ok(bridge.indexOf('$env:CODEX_BRIDGE_TOKEN=') < bridge.indexOf('Start-Process'));
   assert.match(text, /recover-codex-desktop-live-soft\.ps1/);
   assert.match(text, /restart-codex-desktop-live\.ps1/);
   assert.match(text, /Add-OptionalStringArgument -Arguments \$args -Name '-BridgeToken' -Value \$BridgeToken/);
@@ -108,8 +118,19 @@ test('both local bridge launchers inject voice env guarded by the voice server f
     assert.match(text, /Test-Path -LiteralPath \$voiceServerPath/);
     assert.match(text, /CODEX_BRIDGE_VOICE_ENABLED/);
     assert.match(text, /CODEX_BRIDGE_VOICE_COMMAND/);
-    assert.match(text, /CODEX_BRIDGE_VOICE_ENABLED='\$VoiceEnabledText'/);
-    assert.match(text, /CODEX_BRIDGE_VOICE_COMMAND='\$VoiceCommand'/);
+    assert.match(text, /\$voiceEnabledText = '0'[\s\S]*if \(Test-Path -LiteralPath \$voiceServerPath\) \{\s*\$voiceEnabledText = '1'/);
+    if (filePath.startsWith('scripts/')) {
+      const bridge = scriptSection(text, 'function Start-LocalBridgeProcess', 'function Ensure-LocalBridge');
+      assert.match(bridge, /\$env:CODEX_BRIDGE_VOICE_ENABLED="\$VoiceEnabledText"/);
+      assert.match(bridge, /\$env:CODEX_BRIDGE_VOICE_COMMAND="\$VoiceCommand"/);
+      assert.match(bridge, /Start-Process -WindowStyle Hidden -FilePath \$node -ArgumentList @\('src\/server\.js', \$workspaceMarker\)/);
+      assert.ok(bridge.indexOf('$env:CODEX_BRIDGE_VOICE_COMMAND=') < bridge.indexOf('Start-Process'));
+    } else {
+      const bridge = scriptSection(text, 'function Start-LocalBridge {', 'Write-WatchLog "local bridge watchdog started');
+      assert.match(bridge, /CODEX_BRIDGE_VOICE_ENABLED='\$VoiceEnabledText'/);
+      assert.match(bridge, /CODEX_BRIDGE_VOICE_COMMAND='\$VoiceCommand'/);
+      assert.match(bridge, /node src\/server\.js[\s\S]*Start-Process -WindowStyle Hidden -FilePath \$powerShellHostPath[\s\S]*'-Command', \$command/);
+    }
   }
 });
 
@@ -151,8 +172,9 @@ test('desktop startup targets the packaged ChatGPT shell instead of the Codex ac
   assert.match(stackText, /ChatGPT\\\.exe/);
   assert.match(stackText, /GetProcessesByName\('ChatGPT'\)/);
   assert.match(restartText, /\$codexDesktopExe/);
-  assert.match(restartText, /Join-Path \$codexAppDir 'ChatGPT\.exe'/);
-  assert.match(restartText, /Start-Process -FilePath \$codexDesktopExe/);
+  assert.match(restartText, /\$packagedDesktopExe = Join-Path \$codexAppDir 'ChatGPT\.exe'/);
+  assert.match(restartText, /\$codexDesktopExe = if \(Test-Path -LiteralPath \$packagedDesktopExe\) \{ \$packagedDesktopExe \} else \{ \$legacyDesktopExe \}/);
+  assert.match(restartText, /Start-Process -WindowStyle Minimized -FilePath \$codexDesktopExe -ArgumentList \$arguments -WorkingDirectory \$codexAppDir/);
   assert.match(restartText, /OpenAI\\\.Codex_/);
 });
 
@@ -224,11 +246,17 @@ test('desktop live host launch scripts export bridge token', () => {
     assert.match(text, /\[string\]\$BridgeToken = \$env:CODEX_BRIDGE_TOKEN/);
     assert.match(text, /\$env:CODEX_BRIDGE_URL='\$BridgeUrl'/);
     assert.match(text, /\$env:CODEX_BRIDGE_TOKEN='\$BridgeToken'/);
-    assert.match(text, /node \.\\scripts\\start-desktop-cdp-live-host\.mjs/);
+    if (filePath.includes('recover-codex')) {
+      assert.match(text, /\$liveHostScriptLiteral = \(Join-Path \$repoRoot 'scripts\\start-desktop-cdp-live-host\.mjs'\)\.Replace/);
+      assert.match(text, /node '\$liveHostScriptLiteral'/);
+    } else {
+      assert.match(text, /node \.\\scripts\\start-desktop-cdp-live-host\.mjs/);
+    }
     assert.match(text, /script bridge auth unhealthy|脚本桥认证异常|desktop script bridge auth unhealthy/);
     assert.match(text, /function Resolve-CompatiblePowerShellHost/);
     assert.match(text, /\$powerShellHostPath = Resolve-CompatiblePowerShellHost/);
     assert.match(text, /-FilePath \$powerShellHostPath/);
+    assert.match(text, /Start-Process -WindowStyle Hidden -FilePath \$powerShellHostPath -ArgumentList @\([\s\S]*?'-Command', \$hostCommand[\s\S]*?\) -WorkingDirectory \$repoRoot/);
     assert.doesNotMatch(text, /-FilePath 'powershell\.exe'/);
   }
 });
@@ -308,7 +336,10 @@ test('startup stack defaults to the desktop-owned runtime and keeps independent 
   assert.match(stackText, /\[string\]\$RuntimeMode = \$env:CODEX_BRIDGE_RUNTIME_MODE/);
   assert.match(stackText, /\$RuntimeMode = 'desktop'/);
   assert.match(stackText, /'desktop', 'desktop-primary', 'app-server-shadow', 'app-server-new-only', 'app-server-canary', 'app-server-primary'/);
-  assert.match(stackText, /CODEX_BRIDGE_RUNTIME_MODE='\$RuntimeMode'/);
+  const bridge = scriptSection(stackText, 'function Start-LocalBridgeProcess', 'function Ensure-LocalBridge');
+  assert.match(bridge, /\$env:CODEX_BRIDGE_RUNTIME_MODE="\$RuntimeMode"/);
+  assert.match(bridge, /Start-Process -WindowStyle Hidden -FilePath \$node -ArgumentList @\('src\/server\.js', \$workspaceMarker\) -WorkingDirectory \$repoRoot/);
+  assert.ok(bridge.indexOf('$env:CODEX_BRIDGE_RUNTIME_MODE=') < bridge.indexOf('Start-Process'));
   assert.match(stackText, /Bridge 运行模式未生效: expected=\$RuntimeMode; actual=\$actualMode/);
   assert.match(stackText, /function Set-AppServerRuntimeStartupStatus/);
   assert.match(stackText, /桌面内嵌 App Server 为唯一所有者；独立 App Server 已禁用/);

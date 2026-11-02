@@ -4,6 +4,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { DurableOutbox } from '../src/durableOutbox.js';
+import { TaskStore } from '../src/taskStore.js';
 import { createOutboxReceiptReconciler } from '../src/outboxReceiptReconciler.js';
 
 function sampleItem(overrides = {}) {
@@ -18,146 +19,59 @@ function sampleItem(overrides = {}) {
   };
 }
 
-function imageReceiptFixture(overrides = {}) {
+function imageReceiptFixture() {
   const at = new Date().toISOString();
   const text = '检查图片\n![手机端图片](C:/probe/mobile-image.png)';
   const item = sampleItem({ text, lastAttemptAt: at, resultId: 'task-1', result: { deliveryPending: true } });
-  const task = { id: 'task-1', codexSessionId: item.threadId, status: 'running', events: [{
+  const task = { id: 'task-1', codexSessionId: item.threadId, submissionId: item.submissionId, status: 'running', events: [{
     type: 'codex.session_file.cursor_captured',
     payload: { sessionId: item.threadId, filePath: 'C:/probe/rollout.jsonl', offset: 100 }
   }] };
-  const record = {
-    timestamp: at, type: 'response_item',
-    payload: { type: 'message', role: 'user', content: [
-      { type: 'input_text', text },
-      { type: 'input_text', text: '<image name=[Image #1] path="C:/probe/mobile-image.png">' },
-      { type: 'input_image', image_url: 'data:image/png;base64,fixture' },
-      { type: 'input_text', text: '</image>' }
-    ] }
-  };
-  const records = [record];
-  const sessions = {
-    getSession: async () => ({ entries: [{ role: 'user', text: `${text}\n![桌面端图片](C:/probe/rendered.png)`, timestamp: at }] }),
-    readSessionRecordsAfterCursor: async cursor => {
-      assert.deepEqual(cursor, task.events[0].payload);
-      return records;
-    }
-  };
-  return { item, task, record, records, sessions, ...overrides };
+  const record = { timestamp: at, type: 'response_item', payload: { type: 'message', role: 'user', content: [
+    { type: 'input_text', text },
+    { type: 'input_text', text: '<image name=[Image #1] path="C:/probe/mobile-image.png">' },
+    { type: 'input_image', image_url: 'data:image/png;base64,fixture' },
+    { type: 'input_text', text: '</image>' }
+  ] } };
+  const sessions = { readSessionRecordsAfterCursor: async () => [record] };
+  return { item, task, record, sessions };
 }
 
-test('a current image submission is confirmed from its canonical user input before display formatting', async () => {
+test('matching image text and cursor alone cannot identify which client sent the input', async () => {
+  const { item, task, sessions } = imageReceiptFixture();
+  const reconcile = createOutboxReceiptReconciler({ store: { getTask: () => task }, sessions });
+  assert.deepEqual(await reconcile(item), { status: 'unknown', evidence: 'awaiting_official_message' });
+  item.result.run = task;
+  const afterRestart = createOutboxReceiptReconciler({ sessions });
+  assert.equal((await afterRestart(item)).status, 'uncertain');
+});
+
+test('image input is accepted only by the matching native start or steer ACK', async t => {
+  const gate = Promise.withResolvers();
+  const store = new TaskStore({ projects: [{ id: 'probe', root: '.' }], eventBus: { publish() {} },
+    adapter: { run: async ({ emit }) => { await gate.promise;
+      emit('codex.app_server.turn.started', { turn: { id: 'turn-1', status: 'inProgress' } });
+      await new Promise(() => {}); }, steer: async () => ({ turnId: 'turn-1' }) } });
+  t.after(() => store.close());
   const fixture = imageReceiptFixture();
-  const reconcile = createOutboxReceiptReconciler({ store: { getTask: () => fixture.task }, sessions: fixture.sessions });
-  assert.equal((await reconcile(fixture.item)).status, 'submitted');
+  const task = store.createTask({ projectId: 'probe', codexSessionId: 'thread-a', prompt: fixture.item.text, submissionId: 'phone-1' });
+  const item = { ...fixture.item, resultId: task.id };
+  const reconcile = createOutboxReceiptReconciler({ store, sessions: fixture.sessions });
+  assert.equal((await reconcile(item)).status, 'unknown');
+  gate.resolve();
+  await new Promise(resolve => setImmediate(resolve));
+  const first = await reconcile(item);
+  assert.equal(first.status, 'submitted');
+  assert.equal(first.evidence, 'rpc_acknowledgement');
+  const second = { ...item, submissionId: 'phone-2' };
+  assert.equal((await reconcile(second)).status, 'unknown');
+  await store.steerSessionTask('thread-a', { prompt: item.text, submissionId: 'phone-2' });
+  const secondReceipt = await reconcile(second);
+  assert.equal(secondReceipt.status, 'submitted');
+  assert.equal(secondReceipt.evidence, 'rpc_acknowledgement');
 });
 
-test('canonical image receipt rejects old input, nested file text, other roles and malformed image wrappers', async () => {
-  for (const mutate of [
-    f => { f.record.timestamp = new Date(Date.parse(f.item.lastAttemptAt) - 1).toISOString(); },
-    f => { f.record.payload.content[0].text = `<file>\n${f.item.text}\n</file>`; },
-    f => { f.record.payload.role = 'assistant'; },
-    f => { f.record.type = 'event_msg'; },
-    f => { f.record.payload.type = 'function_call_output'; },
-    f => { f.task.events[0].payload.sessionId = 'another-thread'; },
-    f => { f.task.id = 'another-task'; },
-    f => { f.record.payload.content[1].text = 'unrelated file contents'; },
-    f => { f.record.payload.content[1].text = '<image name=[Image #1] path="C:/probe/another-image.png">'; },
-    f => { f.record.payload.content[1].text = '<image name=[Image #2] path="C:/probe/mobile-image.png">'; },
-    f => { f.record.payload.content[3].text = '</image>\nadditional user content'; },
-    f => { f.record.payload.content.push(...f.record.payload.content.slice(1)); }
-  ]) {
-    const fixture = imageReceiptFixture();
-    mutate(fixture);
-    const reconcile = createOutboxReceiptReconciler({ store: { getTask: () => fixture.task }, sessions: fixture.sessions });
-    assert.equal((await reconcile(fixture.item)).status, 'unknown');
-  }
-});
-
-test('canonical image receipt stays uncertain without a task-owned cursor and never reads an arbitrary file', async () => {
-  const fixture = imageReceiptFixture();
-  fixture.task.events = [];
-  fixture.item.lastAttemptAt = new Date(Date.now() - 100_000).toISOString();
-  let reads = 0;
-  fixture.sessions.readSessionRecordsAfterCursor = async () => { reads++; return fixture.records; };
-  const reconcile = createOutboxReceiptReconciler({ store: { getTask: () => fixture.task }, sessions: fixture.sessions });
-  assert.equal((await reconcile(fixture.item)).status, 'uncertain');
-  assert.equal(reads, 0);
-});
-
-test('image receipt reconciliation and duplicate submission never dispatch the accepted message again', async t => {
-  const fixture = imageReceiptFixture();
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-image-receipt-'));
-  t.after(() => fs.rm(root, { recursive: true, force: true }));
-  let calls = 0;
-  let available = false;
-  fixture.sessions.readSessionRecordsAfterCursor = async () => available ? fixture.records : [];
-  const reconcile = createOutboxReceiptReconciler({ store: { getTask: () => fixture.task }, sessions: fixture.sessions });
-  const outbox = new DurableOutbox({ filePath: path.join(root, 'outbox.json'), schedule: false, reconcile,
-    dispatch: async () => { calls++; return { run: fixture.task, deliveryPending: true }; } });
-  t.after(() => outbox.close());
-  const accepted = await outbox.enqueue(fixture.item);
-  await outbox.dispatchReady();
-  assert.equal(outbox.get(accepted.id).status, 'dispatching');
-  await outbox.dispatchReady();
-  assert.equal(calls, 1);
-  available = true;
-  fixture.record.timestamp = new Date(Date.parse(outbox.get(accepted.id).lastAttemptAt) + 1).toISOString();
-  await outbox.dispatchReady();
-  assert.equal(outbox.get(accepted.id).status, 'submitted');
-  const duplicate = await outbox.enqueue(fixture.item);
-  assert.equal(duplicate.id, accepted.id);
-  await outbox.dispatchReady();
-  assert.equal(calls, 1);
-});
-
-test('after restart an image receipt uses the persisted cursor without reviving the stale running task', async () => {
-  const fixture = imageReceiptFixture();
-  fixture.item.result.run = fixture.task;
-  const reconcile = createOutboxReceiptReconciler({ store: { getTask: () => null }, sessions: fixture.sessions });
-  const receipt = await reconcile(fixture.item);
-  assert.equal(receipt.status, 'submitted');
-  assert.equal(receipt.result.deliveryPending, false);
-  assert.equal(receipt.result.run, undefined);
-  assert.equal(receipt.result.threadId, fixture.item.threadId);
-  assert.equal(receipt.result.submissionId, fixture.item.submissionId);
-  assert.equal(receipt.result.observedAt, fixture.record.timestamp);
-  assert.equal(fixture.task.status, 'running');
-});
-
-test('a persisted running snapshot without the official image input remains uncertain after restart', async () => {
-  const fixture = imageReceiptFixture();
-  fixture.item.result.run = fixture.task;
-  fixture.records.length = 0;
-  const reconcile = createOutboxReceiptReconciler({ sessions: fixture.sessions });
-  assert.equal((await reconcile(fixture.item)).status, 'uncertain');
-});
-
-test('persisted image receipt rejects wrong task, session, cursor identity and missing cursor without reading', async () => {
-  for (const mutate of [
-    f => { f.task.id = 'another-task'; },
-    f => { f.task.codexSessionId = 'another-thread'; },
-    f => { delete f.task.codexSessionId; },
-    f => { f.task.events[0].payload.sessionId = 'another-thread'; },
-    f => { f.task.events[0].taskId = 'another-task'; },
-    f => { f.task.events[0].payload.offset = -1; },
-    f => { f.task.events[0].payload.offset = 'invalid'; },
-    f => { f.task.events[0].payload.offset = ''; },
-    f => { delete f.task.events[0].payload.filePath; },
-    f => { f.task.events = []; }
-  ]) {
-    const fixture = imageReceiptFixture();
-    fixture.item.result.run = fixture.task;
-    mutate(fixture);
-    let reads = 0;
-    fixture.sessions.readSessionRecordsAfterCursor = async () => { reads++; return fixture.records; };
-    const reconcile = createOutboxReceiptReconciler({ sessions: fixture.sessions });
-    assert.equal((await reconcile(fixture.item)).status, 'uncertain');
-    assert.equal(reads, 0);
-  }
-});
-
-test('restart reconciles a persisted image submission once without redispatching on duplicate requests', async t => {
+test('ambiguous image input survives restart uncertain without redispatching on duplicate request', async t => {
   const fixture = imageReceiptFixture();
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-restart-image-receipt-'));
   t.after(() => fs.rm(root, { recursive: true, force: true }));
@@ -171,17 +85,104 @@ test('restart reconciles a persisted image submission once without redispatching
   first.close();
   const restored = new DurableOutbox({ filePath, schedule: false,
     reconcile: createOutboxReceiptReconciler({ sessions: fixture.sessions }),
-    dispatch: async () => { calls++; throw new Error('confirmed input must not dispatch again'); } });
+    dispatch: async () => { calls++; throw new Error('ambiguous input must not dispatch again'); } });
   t.after(() => restored.close());
   await restored.initialize();
-  assert.equal(restored.get(accepted.id).status, 'submitted');
-  assert.equal(restored.get(accepted.id).result.run, undefined);
+  assert.equal(restored.get(accepted.id).status, 'uncertain');
   await restored.enqueue(fixture.item);
   await restored.dispatchReady();
+  assert.equal(restored.get(accepted.id).status, 'uncertain');
   assert.equal(calls, 1);
 });
 
-test('desktop receipt requires this exact submission in official history, not task creation or an older identical prompt', async () => {
+test('native start and each steer acknowledge only their exact TaskStore submission', async t => {
+  const gate = Promise.withResolvers();
+  const store = new TaskStore({ projects: [{ id: 'probe', root: '.' }], eventBus: { publish() {} },
+    adapter: {
+      run: async ({ emit }) => { emit('codex.delivery.attempted', { threadId: 'thread-a' });
+        await gate.promise; emit('codex.app_server.turn.started', { turn: { id: 'turn-1', status: 'inProgress' } });
+        await new Promise(() => {}); },
+      steer: async () => ({ turnId: 'turn-1' })
+    } });
+  t.after(() => store.close());
+  const task = store.createTask({ projectId: 'probe', codexSessionId: 'thread-a', prompt: 'first', submissionId: 'first' });
+  const reconcile = createOutboxReceiptReconciler({ store });
+  const item = sampleItem({ submissionId: 'first', resultId: task.id,
+    lastAttemptAt: new Date().toISOString(), result: { run: task, deliveryPending: true } });
+  assert.equal((await reconcile(item)).status, 'unknown', 'running and attempted are not ACKs');
+  gate.resolve();
+  await new Promise(resolve => setImmediate(resolve));
+  const first = await reconcile(item);
+  assert.equal(first.status, 'submitted');
+  assert.equal(first.evidence, 'rpc_acknowledgement');
+  assert.equal(first.result.deliveryPending, false);
+  assert.equal(first.result.run.status, 'running');
+  const second = { ...item, submissionId: 'second' };
+  assert.equal((await reconcile(second)).status, 'unknown', 'the first ACK must not acknowledge a later submission');
+  await store.steerSessionTask('thread-a', { prompt: 'second', submissionId: 'second' });
+  const steered = await reconcile(second);
+  assert.equal(steered.status, 'submitted');
+  assert.equal(steered.evidence, 'rpc_acknowledgement');
+  assert.equal(steered.result.deliveryPending, false);
+  assert.equal((await reconcile({ ...item, submissionId: 'third' })).status, 'unknown');
+});
+
+test('RPC receipt requires the correct task, thread, submission and nonempty turn ID', async () => {
+  const task = { id: 'task-1', codexSessionId: 'thread-a', submissionId: 'first', status: 'running',
+    events: [{ taskId: 'task-1', type: 'codex.app_server.turn.started', payload: { turn: { id: 'turn-1' } } },
+      { taskId: 'task-1', type: 'task.guidance.accepted', payload: { submissionId: 'second', turnId: 'turn-1' } }] };
+  const item = sampleItem({ submissionId: 'first', resultId: task.id, lastAttemptAt: new Date().toISOString(),
+    result: { deliveryPending: true } });
+  const reconcile = createOutboxReceiptReconciler({ store: { getTask: () => task } });
+  assert.equal((await reconcile({ ...item, threadId: 'wrong' })).status, 'unknown');
+  assert.equal((await reconcile({ ...item, resultId: 'wrong' })).status, 'unknown');
+  task.events[0].payload.turn.id = '';
+  assert.equal((await reconcile(item)).status, 'unknown');
+  task.events[1].payload.turnId = '';
+  assert.equal((await reconcile({ ...item, submissionId: 'second' })).status, 'unknown');
+  task.events[1].payload.turnId = 'turn-1';
+  task.events[1].taskId = 'wrong';
+  assert.equal((await reconcile({ ...item, submissionId: 'second' })).status, 'unknown');
+});
+
+test('native start ACK advances a pending outbox without waiting for generation or history', async t => {
+  const gate = Promise.withResolvers();
+  const store = new TaskStore({ projects: [{ id: 'probe', root: '.' }], eventBus: { publish() {} },
+    adapter: { run: async ({ emit }) => { await gate.promise;
+      emit('codex.app_server.turn.started', { turn: { id: 'turn-1', status: 'inProgress' } });
+      await new Promise(() => {}); } } });
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-rpc-receipt-'));
+  const outbox = new DurableOutbox({ filePath: path.join(root, 'outbox.json'), schedule: false,
+    reconcile: createOutboxReceiptReconciler({ store }),
+    dispatch: async item => ({ run: store.createTask({ projectId: item.projectId, codexSessionId: item.threadId,
+      prompt: item.text, submissionId: item.submissionId }), deliveryPending: true }) });
+  t.after(async () => { store.close(); outbox.close(); await fs.rm(root, { recursive: true, force: true }); });
+  const item = await outbox.enqueue(sampleItem());
+  await outbox.dispatchReady();
+  assert.equal(outbox.get(item.id).status, 'dispatching');
+  gate.resolve();
+  await new Promise(resolve => setImmediate(resolve));
+  await outbox.dispatchReady();
+  assert.equal(outbox.get(item.id).status, 'submitted');
+  assert.equal(outbox.get(item.id).result.deliveryPending, false);
+  assert.equal(outbox.get(item.id).result.run.status, 'running');
+});
+
+test('persisted ACK is recovered as a receipt without reviving a stale running task', async () => {
+  const task = { id: 'task-1', createdCodexSessionId: 'new-thread', submissionId: 'phone-1', status: 'running',
+    events: [{ taskId: 'task-1', type: 'codex.app_server.turn.started', createdAt: '2026-10-31T00:00:00.000Z',
+      payload: { turn: { id: 'turn-1', status: 'inProgress' } } }] };
+  const item = sampleItem({ kind: 'new_thread', threadId: '', resultId: task.id,
+    result: { run: task, deliveryPending: true } });
+  const result = await createOutboxReceiptReconciler()(item);
+  assert.equal(result.evidence, 'rpc_acknowledgement');
+  assert.equal(result.result.threadId, 'new-thread');
+  assert.equal(result.result.submissionId, item.submissionId);
+  assert.equal(result.result.run, undefined);
+  assert.equal(result.result.deliveryPending, false);
+});
+
+test('a pending delivery cannot claim a concurrent same-text desktop user item', async () => {
   const at = new Date().toISOString();
   const task = { id: 'task-1', status: 'running' };
   const entries = [{ role: 'user', text: '远程提交内容', timestamp: new Date(Date.parse(at) - 1).toISOString() }];
@@ -190,10 +191,11 @@ test('desktop receipt requires this exact submission in official history, not ta
   assert.equal((await reconcile(item)).status, 'unknown');
   entries.push({ role: 'user', text: 'another insertion', timestamp: at });
   assert.equal((await reconcile(item)).status, 'unknown');
-  entries.push({ role: 'user', text: item.text, timestamp: at });
+  entries.push({ role: 'user', itemId: 'unrelated-desktop-item', text: item.text, timestamp: at });
   const receipt = await reconcile(item);
-  assert.equal(receipt.status, 'submitted');
-  assert.equal(receipt.result.run.id, task.id);
+  // The earlier positive asserted equal text proved delivery; a concurrent
+  // desktop send can have the same body and timestamp without this identity.
+  assert.deepEqual(receipt, { status: 'unknown', evidence: 'awaiting_official_message' });
 });
 
 test('desktop task transport failure without official input is uncertain, never delivered', async () => {
@@ -223,7 +225,50 @@ test('outbox receipt reconciler prefers an exact persisted submission receipt', 
   assert.equal(result.evidence, 'submission_journal');
 });
 
-test('outbox receipt reconciler recognizes a matching CDP session message after dispatch began', async () => {
+test('after an interrupted dispatch, same-text history cannot identify the submitted message', async () => {
+  const at = '2026-07-29T00:00:10.000Z';
+  for (const [description, timestamp] of [
+    ['previous submission one second earlier', '2026-07-29T00:00:09.000Z'],
+    ['previous submission in the same second', at],
+    ['concurrent desktop submission', '2026-07-29T00:00:11.000Z']
+  ]) {
+    const reconcile = createOutboxReceiptReconciler({ sessions: { getSession: async () => ({ entries: [
+      { role: 'user', type: 'userMessage', itemId: 'other-input', text: '远程提交内容', timestamp }
+    ] }) } });
+    assert.deepEqual(await reconcile(sampleItem({ submissionId: 'second-send', lastAttemptAt: at })),
+      { status: 'unknown', evidence: 'no_receipt' }, description);
+  }
+});
+
+test('restart leaves an ambiguous same-text submission uncertain and never redispatches it', async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-ambiguous-receipt-'));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const filePath = path.join(root, 'outbox.json');
+  const at = '2026-07-29T00:00:10.000Z';
+  const now = () => Date.parse(at);
+  let sends = 0;
+  const first = new DurableOutbox({ filePath, schedule: false, now, dispatch: async () => { sends++; } });
+  const input = sampleItem({ submissionId: 'second-send', lastAttemptAt: at });
+  const queued = await first.enqueue(input);
+  // This is the durable state written just before an in-flight dispatch.
+  first.items[0].status = 'dispatching';
+  first.items[0].lastAttemptAt = at;
+  await first.persist();
+  first.close();
+  const sessions = { getSession: async () => ({ entries: [{ role: 'user', type: 'userMessage',
+    itemId: 'earlier-send', text: input.text, timestamp: '2026-07-29T00:00:09.000Z' }] }) };
+  const restored = new DurableOutbox({ filePath, schedule: false, now,
+    dispatch: async () => { sends++; }, reconcile: createOutboxReceiptReconciler({ sessions }) });
+  t.after(() => restored.close());
+  await restored.initialize();
+  assert.equal(restored.get(queued.id).status, 'uncertain');
+  assert.equal((await restored.enqueue(input)).id, queued.id);
+  await restored.dispatchReady();
+  assert.equal(restored.get(queued.id).status, 'uncertain');
+  assert.equal(sends, 0);
+});
+
+test('matching CDP session text after dispatch began is not an identity-bound receipt', async () => {
   const reconcile = createOutboxReceiptReconciler({
     threadService: null,
     sessions: {
@@ -241,9 +286,9 @@ test('outbox receipt reconciler recognizes a matching CDP session message after 
   });
 
   const result = await reconcile(sampleItem());
-  assert.equal(result.status, 'submitted');
-  assert.equal(result.result.threadId, 'thread-a');
-  assert.equal(result.evidence, 'session_user_message');
+  // The old expectation treated text and timestamp as a receipt, but another
+  // send can have identical content after this dispatch began.
+  assert.deepEqual(result, { status: 'unknown', evidence: 'no_receipt' });
 });
 
 test('outbox receipt reconciler does not accept an older identical session message', async () => {

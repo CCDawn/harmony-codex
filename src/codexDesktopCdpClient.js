@@ -3,8 +3,36 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readRecentDesktopThread } from './desktopRecentThread.js';
+import { LOAD_DESKTOP_HOST_MESSAGES } from './desktopHostMessages.js';
+import { collectDesktopCdpResponse, stageDesktopCdpResponse } from './desktopCdpResponses.js';
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+
+// Reuse an already injected collector, including the previous bounded buffer.
+// Assign shared monotonically increasing identities to retained objects without
+// consuming them, so each CDP client can maintain its own high-water mark.
+const NOTIFICATION_COLLECTOR = String.raw`
+  window.__codexHramonyBridge = window.__codexHramonyBridge || { notifications: [], installed: false };
+  const bridge = window.__codexHramonyBridge;
+  if (!bridge.installed) {
+    bridge.installed = true;
+    window.addEventListener('message', (event) => {
+      const data = event.data;
+      if (data && data.type === 'mcp-notification') {
+        bridge.notifications.push({ at: Date.now(), hostId: data.hostId, method: data.method, params: data.params });
+        if (bridge.notifications.length > 1000) {
+          bridge.notifications.splice(0, bridge.notifications.length - 1000);
+        }
+      }
+    });
+  }
+  const cursor = bridge.notificationCursor || (bridge.notificationCursor = {
+    epoch: String(Date.now()) + ':' + String(Math.random()), sequence: 0, sequences: new WeakMap()
+  });
+  for (const notification of bridge.notifications) {
+    if (!cursor.sequences.has(notification)) cursor.sequences.set(notification, ++cursor.sequence);
+  }
+`;
 
 export class CodexDesktopCdpClient {
   constructor(options = {}) {
@@ -18,16 +46,26 @@ export class CodexDesktopCdpClient {
     this.nextMcpId = 1;
     this.connected = null;
     this.notificationOffset = 0;
+    this.notificationEpoch = null;
+    this.notificationDrainQueue = Promise.resolve();
   }
 
-  async request(method, params = {}) {
+  async request(method, params = {}, options = {}) {
     const operation = async () => {
       await this.ensureConnected();
+      if (options.shouldStop?.()) {
+        const error = new Error('用户已请求停止当前会话。');
+        error.code = 'CODEX_USER_STOP_REQUESTED';
+        error.deliveryAttempted = false;
+        error.safeToFallback = false;
+        throw error;
+      }
       const request = {
         id: `desktop-cdp-${Date.now()}-${this.nextMcpId++}`,
         method,
         params
       };
+      options.onDispatch?.();
       return this.evaluate(requestExpression(this.hostId, request), this.timeoutMs);
     };
     return this.withCdpReconnectRetry(operation, {
@@ -93,32 +131,39 @@ export class CodexDesktopCdpClient {
   }
 
   async drainNotifications() {
-    return this.withCdpReconnectRetry(async () => {
+    const pending = this.notificationDrainQueue.then(() => this.withCdpReconnectRetry(async () => {
       await this.ensureConnected();
       const result = await this.evaluate(`
 (() => {
-  window.__codexHramonyBridge = window.__codexHramonyBridge || { notifications: [], installed: false };
-  const bridge = window.__codexHramonyBridge;
-  if (!bridge.installed) {
-    bridge.installed = true;
-    window.addEventListener('message', (event) => {
-      const data = event.data;
-      if (data && data.type === 'mcp-notification') {
-        bridge.notifications.push({ at: Date.now(), hostId: data.hostId, method: data.method, params: data.params });
-        if (bridge.notifications.length > 1000) {
-          bridge.notifications.splice(0, bridge.notifications.length - 1000);
-        }
-      }
-    });
-  }
-  return bridge.notifications;
+  ${NOTIFICATION_COLLECTOR}
+  const after = cursor.epoch === ${JSON.stringify(this.notificationEpoch)} ? ${this.notificationOffset} : 0;
+  return {epoch:cursor.epoch,sequence:cursor.sequence,
+    notifications:bridge.notifications.filter(notification => cursor.sequences.get(notification) > after)
+      .map(notification => ({...notification, notificationId:cursor.epoch + ':' + cursor.sequences.get(notification)}))};
 })()
 `, this.timeoutMs);
-      const notifications = Array.isArray(result) ? result.slice(this.notificationOffset) : [];
-      if (Array.isArray(result)) {
-        this.notificationOffset = result.length;
+      const notifications = Array.isArray(result?.notifications) ? result.notifications : [];
+      if (typeof result?.epoch === 'string' && Number.isSafeInteger(result.sequence)) {
+        this.notificationEpoch = result.epoch;
+        this.notificationOffset = result.sequence;
       }
       return notifications.filter((notification) => notification.hostId === this.hostId);
+    }, { retries: 1 }));
+    this.notificationDrainQueue = pending.catch(() => {});
+    return pending;
+  }
+
+  async readRetainedNotifications(threadId) {
+    return this.withCdpReconnectRetry(async () => {
+      await this.ensureConnected();
+      return this.evaluate(`
+(() => {
+  ${NOTIFICATION_COLLECTOR}
+  return bridge.notifications.filter(notification => notification.hostId === ${JSON.stringify(this.hostId)}
+    && notification.params?.threadId === ${JSON.stringify(threadId)})
+    .map(notification => ({...notification, notificationId:cursor.epoch + ':' + cursor.sequences.get(notification)}));
+})()
+`, this.timeoutMs);
     }, { retries: 1 });
   }
 
@@ -218,27 +263,19 @@ export class CodexDesktopCdpClient {
   async installNotificationCollector() {
     const result = await this.evaluate(`
 (() => {
-  window.__codexHramonyBridge = window.__codexHramonyBridge || { notifications: [], installed: false };
-  const bridge = window.__codexHramonyBridge;
-  if (!bridge.installed) {
-    bridge.installed = true;
-    window.addEventListener('message', (event) => {
-      const data = event.data;
-      if (data && data.type === 'mcp-notification') {
-        bridge.notifications.push({ at: Date.now(), hostId: data.hostId, method: data.method, params: data.params });
-        if (bridge.notifications.length > 1000) {
-          bridge.notifications.splice(0, bridge.notifications.length - 1000);
-        }
-      }
-    });
-  }
-  return bridge.notifications.length;
+  ${NOTIFICATION_COLLECTOR}
+  return {epoch:cursor.epoch,sequence:cursor.sequence};
 })()
 `, this.timeoutMs);
-    this.notificationOffset = Number.isFinite(Number(result)) ? Number(result) : 0;
+    if (typeof result?.epoch === 'string' && Number.isSafeInteger(result.sequence)
+        && this.notificationEpoch !== result.epoch) {
+      this.notificationEpoch = result.epoch;
+      this.notificationOffset = result.sequence;
+    }
   }
 
   async evaluate(expression, timeoutMs = this.timeoutMs) {
+    const startedAt = Date.now();
     const response = await this.call('Runtime.evaluate', {
       expression,
       awaitPromise: true,
@@ -250,7 +287,13 @@ export class CodexDesktopCdpClient {
     if (response.result?.exceptionDetails) {
       throw new Error(response.result.exceptionDetails.exception?.description ?? response.result.exceptionDetails.text);
     }
-    const value = response.result?.result?.value;
+    const value = await collectDesktopCdpResponse(response.result?.result?.value,
+      async (expression, remainingMs) => {
+        const chunk = await this.call('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true }, remainingMs);
+        if (chunk.error) throw new Error(chunk.error.message ?? 'Codex desktop response transport failed');
+        if (chunk.result?.exceptionDetails) throw new Error(chunk.result.exceptionDetails.text ?? 'Codex desktop response transfer failed');
+        return chunk.result?.result?.value;
+      }, Math.max(0, timeoutMs - (Date.now() - startedAt)));
     if (value && value.ok === false) {
       throw new Error(value.error ?? value.response?.error?.message ?? 'Codex 桌面 app-server 请求失败');
     }
@@ -266,12 +309,8 @@ export class CodexDesktopCdpClient {
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
         this.pending.delete(id);
-        this.markDisconnected(socket, new Error(`Codex 桌面 CDP 请求超时：${method}`));
-        try {
-          socket.close();
-        } catch {
-          // The socket may already be closed by Electron/CDP.
-        }
+        // A slow evaluation is not evidence that the shared transport died.
+        // Real socket errors/closures still reject all calls in markDisconnected.
         reject(new Error(`Codex 桌面 CDP 请求超时：${method}`));
       }, timeoutMs);
       this.pending.set(id, { resolve, reject, timeout });
@@ -428,7 +467,11 @@ export function resolveDesktopCdpPortCandidates(env = process.env) {
     const statusPath = env.CODEX_DESKTOP_CDP_STATUS_PATH
       ?? path.join(projectRoot, 'logs', 'desktop-live-status.json');
     const status = JSON.parse(readFileSync(statusPath, 'utf8').replace(/^\uFEFF/, ''));
-    if (String(status?.status ?? '') !== 'injected') {
+    // The launcher publishes its selected port before waiting for live-host
+    // readiness. That readiness probe also uses this resolver; requiring an
+    // 'injected' status here deadlocks startup whenever the port changes.
+    // This is only a candidate: CDP must still answer and pass target checks.
+    if (!['starting', 'injected'].includes(String(status?.status ?? ''))) {
       addCandidate(9229);
       return candidates;
     }
@@ -460,6 +503,46 @@ export function buildDesktopCdpWebSocketOptions(port, env = process.env) {
       Origin: origin
     }
   };
+}
+
+// 桌面在线判定的地面真相：DevTools HTTP 入口必须在短超时内返回可解析 JSON。
+// TCP 端口可连不等于在线——半死的桌面外壳进程可以占住监听 socket 却永不应答。
+export const DESKTOP_CDP_LIVENESS_TIMEOUT_MS = 1500;
+
+export async function probeDesktopCdpLiveness(options = {}) {
+  const env = options.env ?? process.env;
+  const envTimeoutMs = Number.parseInt(env.CODEX_DESKTOP_CDP_LIVENESS_TIMEOUT_MS ?? '', 10);
+  const timeoutMs = clampLivenessTimeoutMs(options.timeoutMs ?? (Number.isFinite(envTimeoutMs) ? envTimeoutMs : undefined));
+  const candidates = Array.isArray(options.ports) ? options.ports : resolveDesktopCdpPortCandidates(env);
+  const ports = candidates.filter((port) => Number.isInteger(port) && port > 0);
+  const checkedAt = new Date().toISOString();
+  if (ports.length === 0) {
+    return { checked: true, ok: false, ports: [], reason: '没有可探测的 CDP 候选端口', checkedAt };
+  }
+  let lastError = null;
+  for (const port of ports) {
+    try {
+      const version = await getLoopbackCdpJson(port, ['/json/version'], timeoutMs,
+        (value) => value && typeof value === 'object');
+      if (version && typeof version === 'object') {
+        return { checked: true, ok: true, port, browser: String(version.Browser ?? ''), checkedAt };
+      }
+      lastError = new Error(`CDP /json/version 返回无法识别的内容：127.0.0.1:${port}`);
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  return {
+    checked: true,
+    ok: false,
+    ports,
+    reason: `CDP 端口有监听但无真实应答（${ports.map((port) => `127.0.0.1:${port}`).join(', ')}）：${lastError?.message ?? 'unknown'}`,
+    checkedAt
+  };
+}
+
+function clampLivenessTimeoutMs(value) {
+  return Number.isFinite(value) && value >= 250 ? value : DESKTOP_CDP_LIVENESS_TIMEOUT_MS;
 }
 
 function currentConversationIdExpression() {
@@ -562,29 +645,17 @@ function openDesktopThreadExpression(sessionId) {
 
 function requestExpression(hostId, request) {
   return `
-(() => new Promise((resolve) => {
-  window.__codexHramonyBridge = window.__codexHramonyBridge || { notifications: [], installed: false };
-  const bridge = window.__codexHramonyBridge;
-  if (!bridge.installed) {
-    bridge.installed = true;
-    window.addEventListener('message', (event) => {
-      const data = event.data;
-      if (data && data.type === 'mcp-notification') {
-        bridge.notifications.push({ at: Date.now(), hostId: data.hostId, method: data.method, params: data.params });
-        if (bridge.notifications.length > 1000) {
-          bridge.notifications.splice(0, bridge.notifications.length - 1000);
-        }
-      }
-    });
-  }
+(async () => {
+  ${LOAD_DESKTOP_HOST_MESSAGES}
+  return new Promise((resolve) => {
+  ${NOTIFICATION_COLLECTOR}
   const hostId = ${JSON.stringify(hostId)};
   const request = ${JSON.stringify(request)};
   const timeout = setTimeout(() => {
     cleanup();
     resolve({ ok: false, error: '等待 Codex 桌面 app-server 响应超时', request });
   }, ${Math.max(1000, Number.parseInt(process.env.CODEX_DESKTOP_MCP_TIMEOUT_MS ?? '30000', 10))});
-  const handler = (event) => {
-    const data = event.data;
+  const handler = (data) => {
     if (!data || data.type !== 'mcp-response' || data.hostId !== hostId || data.message?.id !== request.id) {
       return;
     }
@@ -593,27 +664,28 @@ function requestExpression(hostId, request) {
   };
   const cleanup = () => {
     clearTimeout(timeout);
-    window.removeEventListener('message', handler);
+    unsubscribe();
   };
-  window.addEventListener('message', handler);
+  const unsubscribe = desktopMessages.subscribe('mcp-response', handler);
   window.electronBridge.sendMessageFromView({ type: 'mcp-request', hostId, request }).catch((error) => {
     cleanup();
     resolve({ ok: false, error: String(error), request });
   });
-}))()
+}).then(value => (${stageDesktopCdpResponse.toString()})(window, value)); })()
 `;
 }
 
 function hostFetchExpression(command, params) {
   return `
-(() => new Promise((resolve) => {
+(async () => {
+  ${LOAD_DESKTOP_HOST_MESSAGES}
+  return new Promise((resolve) => {
   const requestId = 'desktop-host-fetch-' + Date.now() + '-' + Math.random().toString(16).slice(2);
   const timeout = setTimeout(() => {
     cleanup();
     resolve({ ok: false, error: '等待 Codex 桌面 Host 命令响应超时', command, requestId });
   }, ${Math.max(1000, Number.parseInt(process.env.CODEX_DESKTOP_MCP_TIMEOUT_MS ?? '30000', 10))});
-  const handler = (event) => {
-    const data = event.data;
+  const handler = (data) => {
     if (!data || data.type !== 'fetch-response' || data.requestId !== requestId) {
       return;
     }
@@ -630,11 +702,11 @@ function hostFetchExpression(command, params) {
   };
   const cleanup = () => {
     clearTimeout(timeout);
-    window.removeEventListener('message', handler);
+    unsubscribe();
   };
   const command = ${JSON.stringify(command)};
   const params = ${JSON.stringify(params)};
-  window.addEventListener('message', handler);
+  const unsubscribe = desktopMessages.subscribe('fetch-response', handler);
   window.electronBridge.sendMessageFromView({
     type: 'fetch',
     requestId,
@@ -645,7 +717,7 @@ function hostFetchExpression(command, params) {
     cleanup();
     resolve({ ok: false, error: String(error), command, requestId });
   });
-}))()
+}).then(value => (${stageDesktopCdpResponse.toString()})(window, value)); })()
 `;
 }
 
@@ -723,44 +795,62 @@ function authenticatedPathFetchExpression(urlPath, options = {}) {
 `;
 }
 
-async function getCdpTargets(port, timeoutMs = 10000) {
-  const urls = [
-    `http://127.0.0.1:${port}/json`,
-    `http://127.0.0.1:${port}/json/list`
-  ];
+export async function getCdpTargets(port, timeoutMs = 10000) {
+  return getLoopbackCdpJson(port, ['/json', '/json/list'], timeoutMs, Array.isArray);
+}
+
+async function getLoopbackCdpJson(port, paths, timeoutMs, accepts) {
+  const hosts = ['127.0.0.1', '[::1]'];
+  const deadline = Date.now() + timeoutMs;
   let lastError = null;
-  for (const url of urls) {
-    try {
-      const targets = await getJson(url, timeoutMs);
-      if (Array.isArray(targets)) {
-        return targets;
+  for (const [hostIndex, host] of hosts.entries()) {
+    // Reserve time for IPv6 even when an IPv4 listener accepts but never answers.
+    const hostDeadline = Date.now() + Math.max(0, deadline - Date.now()) / (hosts.length - hostIndex);
+    for (const [pathIndex, endpoint] of paths.entries()) {
+      const remainingMs = Math.min(deadline, hostDeadline) - Date.now();
+      if (remainingMs <= 0) break;
+      const requestTimeoutMs = Math.max(1, Math.floor(remainingMs / (paths.length - pathIndex)));
+      const url = `http://${host}:${port}${endpoint}`;
+      try {
+        const value = await getJson(url, requestTimeoutMs);
+        if (accepts(value)) return value;
+        throw new Error(`Codex 桌面 CDP 返回格式异常：${url}`);
+      } catch (error) {
+        lastError = error;
       }
-      throw new Error(`Codex 桌面 CDP 返回格式异常：${url}`);
-    } catch (error) {
-      lastError = error;
     }
   }
-  throw lastError ?? new Error(`请求 Codex 桌面 CDP 入口失败：127.0.0.1:${port}`);
+  throw lastError ?? new Error(`请求 Codex 桌面 CDP 入口超时：loopback:${port}`);
 }
 
 function getJson(url, timeoutMs = 10000) {
   return new Promise((resolve, reject) => {
+    let timeout;
     const request = http.get(url, (response) => {
       let body = '';
       response.on('data', (chunk) => {
         body += chunk;
       });
       response.on('end', () => {
+        clearTimeout(timeout);
         try {
           resolve(JSON.parse(body));
         } catch (error) {
           reject(error);
         }
       });
+      response.on('error', (error) => {
+        clearTimeout(timeout);
+        reject(error);
+      });
     });
-    request.setTimeout(timeoutMs, () => {
+    // Bound total time even when the peer keeps sending partial JSON.
+    timeout = setTimeout(() => {
       request.destroy(new Error(`请求 Codex 桌面 CDP 入口超时：${url}`));
+    }, timeoutMs);
+    request.on('error', (error) => {
+      clearTimeout(timeout);
+      reject(error);
     });
-    request.on('error', reject);
   });
 }

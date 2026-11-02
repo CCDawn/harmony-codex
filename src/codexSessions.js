@@ -2041,6 +2041,12 @@ function summarizeRecord(record, options = {}) {
   const timestamp = String(record.timestamp ?? '');
   const type = String(record.type ?? 'unknown');
   const payload = record.payload ?? {};
+  // Protocol instructions are not conversation or client notices. Filter by
+  // the record's role, never by words quoted in an ordinary user/assistant body.
+  if (type === 'response_item' && payload.type === 'message'
+    && (payload.role === 'developer' || payload.role === 'system')) {
+    return null;
+  }
   const noticeEntry = summarizeCodexClientNoticeRecord(record, options);
   if (noticeEntry) {
     return noticeEntry;
@@ -2294,7 +2300,7 @@ function isImageContentItem(item) {
     || Object.hasOwn(item, 'imageUrl');
 }
 
-function materializeImageItemForMobile(item, mobileImagesDir = '') {
+export function materializeImageItemForMobile(item, mobileImagesDir = '') {
   if (!item || typeof item !== 'object') {
     return '';
   }
@@ -2435,7 +2441,7 @@ function looksLikeBase64Image(value) {
   return /^(iVBORw0KGgo|\/9j\/|UklGR|R0lGOD)/.test(text) || text.length > 1024;
 }
 
-function materializeLocalImageForMobile(imagePath, mobileImagesDir = '') {
+export function materializeLocalImageForMobile(imagePath, mobileImagesDir = '') {
   const filePath = normalizeLocalImagePath(imagePath);
   if (filePath.length === 0 || !isSupportedImageFilePath(filePath)) {
     return '';
@@ -2464,7 +2470,7 @@ function materializeLocalImageForMobile(imagePath, mobileImagesDir = '') {
   }
 }
 
-function materializeMarkdownImagesForMobile(text, mobileImagesDir = '', projectedPaths = new Map()) {
+export function materializeMarkdownImagesForMobile(text, mobileImagesDir = '', projectedPaths = new Map()) {
   return String(text ?? '').replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (match, label, target) => {
     const trimmedTarget = String(target ?? '').trim();
     const projectedPath = label === '手机端图片' ? projectedPaths.get(mobileImagePathKey(trimmedTarget)) : '';

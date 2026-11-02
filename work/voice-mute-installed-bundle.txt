@@ -1,0 +1,591 @@
+com.codex.remote.app:
+{
+    "appId": "com.codex.remote.app_BFqs8b+2vvEnJ34zFUPzyQ6UhWoJyG9QrstO8L/EDoMwoMtZJIEMdy58/ozJKUAtNp1mYxiXcQ201NcFy0gaOPs=",
+    "appIdentifier": "6918734068368080270",
+    "appIndex": 0,
+    "applicationInfo": {
+        "GWPAsanEnabled": false,
+        "accessTokenId": 537259754,
+        "accessTokenIdEx": 34896998122,
+        "accessible": false,
+        "allowAppRunWhenDeviceFirstLocked": false,
+        "allowArkTsLargeHeap": false,
+        "allowCommonEvent": [],
+        "allowEnableNotification": false,
+        "allowListenBundleChangedEvent": [],
+        "allowMultiProcess": false,
+        "alternateIcons": [],
+        "apiCompatibleVersion": 60101024,
+        "apiReleaseType": "Release",
+        "apiTargetVersion": 60101024,
+        "appDetailAbilityLibraryPath": "",
+        "appDistributionType": "none",
+        "appEnvironments": [],
+        "appIndex": 0,
+        "appPreloadPhase": 0,
+        "appPrivilegeLevel": "normal",
+        "appProvisionType": "debug",
+        "appQuickFix": {
+            "bundleName": "",
+            "deployedAppqfInfo": {
+                "cpuAbi": "",
+                "hqfInfos": [],
+                "nativeLibraryPath": "",
+                "type": 0,
+                "versionCode": 0,
+                "versionName": ""
+            },
+            "deployingAppqfInfo": {
+                "cpuAbi": "",
+                "hqfInfos": [],
+                "nativeLibraryPath": "",
+                "type": 0,
+                "versionCode": 0,
+                "versionName": ""
+            },
+            "versionCode": 0,
+            "versionName": ""
+        },
+        "appSignType": "none",
+        "applicationFlags": 1,
+        "applicationReservedFlag": 0,
+        "arkNativeFileAbi": "",
+        "arkNativeFilePath": "",
+        "arkTSMode": "dynamic",
+        "asanEnabled": false,
+        "asanLogPath": "",
+        "assetAccessGroups": [],
+        "associatedWakeUp": false,
+        "bundleName": "com.codex.remote.app",
+        "bundleType": 0,
+        "cacheDir": "",
+        "cloudFileSyncEnabled": false,
+        "cloudStructuredDataSyncEnabled": false,
+        "codePath": "/data/app/el1/bundle/public/com.codex.remote.app",
+        "compatibleMinorVersion": 0,
+        "compatiblePatchVersion": 0,
+        "compileSdkType": "HarmonyOS",
+        "compileSdkVersion": "6.1.1.125",
+        "configuration": "",
+        "cpuAbi": "arm64-v8a",
+        "crowdtestDeadline": -1,
+        "curAlternateIconModuleName": "entry",
+        "dataBaseDir": "/data/app/el2/database/com.codex.remote.app",
+        "dataDir": "",
+        "debug": true,
+        "description": "",
+        "descriptionId": 0,
+        "descriptionResource": {
+            "bundleName": "com.codex.remote.app",
+            "id": 0,
+            "moduleName": "entry"
+        },
+        "deviceId": "PHONE-001",
+        "distributedNotificationEnabled": true,
+        "enabled": true,
+        "entityType": "unspecified",
+        "entryDir": "",
+        "entryModuleName": "",
+        "fingerprint": "5B6993296DBC5AF5E1F5640285E488F147E533C7CB71732473C40AF7ADBD4DEB",
+        "flags": 0,
+        "formVisibleNotify": false,
+        "hasPlugin": false,
+        "hideDesktopIcon": false,
+        "hnpPackages": {},
+        "hwasanEnabled": false,
+        "icon": "",
+        "iconId": 16777217,
+        "iconPath": "$media:app_icon",
+        "iconResource": {
+            "bundleName": "com.codex.remote.app",
+            "id": 16777217,
+            "moduleName": "entry"
+        },
+        "installSource": "unknown",
+        "installedForAllUser": false,
+        "isCompressNativeLibs": true,
+        "isForceRotate": false,
+        "isFreeInstallApp": false,
+        "isLauncherApp": false,
+        "isSystemApp": false,
+        "keepAlive": false,
+        "label": "$string:app_name",
+        "labelId": 16777216,
+        "labelResource": {
+            "bundleName": "com.codex.remote.app",
+            "id": 16777216,
+            "moduleName": "entry"
+        },
+        "maxChildProcess": 512,
+        "metaData": {},
+        "metadata": {},
+        "minCompatibleVersionCode": 1000014,
+        "moduleInfos": [
+            {
+                "moduleName": "entry",
+                "moduleSourceDir": "",
+                "preloads": []
+            }
+        ],
+        "moduleSourceDirs": [],
+        "multiAppMode": {
+            "maxCount": 0,
+            "multiAppModeType": 0
+        },
+        "multiProjects": false,
+        "name": "com.codex.remote.app",
+        "nativeLibraryPath": "libs/arm64",
+        "needAppDetail": false,
+        "organization": "李一铭",
+        "overlayState": 0,
+        "permissions": [],
+        "process": "com.codex.remote.app",
+        "profileable": false,
+        "removable": true,
+        "resourcesApply": [],
+        "runningResourcesApply": false,
+        "signatureKey": "",
+        "singleton": false,
+        "startMode": 1,
+        "supportedModes": 0,
+        "targetBundleList": [],
+        "targetBundleName": "",
+        "targetMinorApiVersion": 0,
+        "targetPatchApiVersion": 0,
+        "targetPriority": 0,
+        "tsanEnabled": false,
+        "ubsanEnabled": false,
+        "uid": 20020266,
+        "userDataClearable": true,
+        "vendor": "codex-remote",
+        "versionCode": 1000014,
+        "versionName": "1.0.14"
+    },
+    "buildVersion": "",
+    "compatibleMinorVersion": 0,
+    "compatiblePatchVersion": 0,
+    "compatibleVersion": 60101024,
+    "cpuAbi": "",
+    "defPermissions": [],
+    "description": "",
+    "entryInstallationFree": false,
+    "entryModuleName": "entry",
+    "firstInstallTime": 1788838270035,
+    "gid": 20020266,
+    "hapModuleInfos": [
+        {
+            "abilityInfos": [
+                {
+                    "allowSelfRedirect": true,
+                    "appIndex": 0,
+                    "applicationName": "com.codex.remote.app",
+                    "arkTSMode": "dynamic",
+                    "backgroundModes": 2049,
+                    "bundleName": "com.codex.remote.app",
+                    "codePath": "",
+                    "compileMode": 1,
+                    "configChanges": [],
+                    "continuable": false,
+                    "continueBundleName": [],
+                    "continueType": [
+                        "EntryAbility"
+                    ],
+                    "defaultFormHeight": 0,
+                    "defaultFormWidth": 0,
+                    "description": "$string:ability_desc",
+                    "descriptionId": 16777218,
+                    "deviceCapabilities": [],
+                    "deviceTypes": [
+                        "phone",
+                        "tablet"
+                    ],
+                    "enabled": true,
+                    "excludeFromDock": false,
+                    "excludeFromMissions": false,
+                    "extensionAbilityType": 255,
+                    "formEnabled": false,
+                    "formEntity": 0,
+                    "hapPath": "/data/app/el1/bundle/public/com.codex.remote.app/entry.hap",
+                    "iconId": 16777217,
+                    "iconPath": "$media:app_icon",
+                    "isLauncherAbility": false,
+                    "isModuleJson": true,
+                    "isNativeAbility": false,
+                    "isStageBasedModel": true,
+                    "isolationProcess": false,
+                    "kind": "",
+                    "label": "$string:app_name",
+                    "labelId": 16777216,
+                    "launchMode": 0,
+                    "maxWindowHeight": 0,
+                    "maxWindowRatio": 0,
+                    "maxWindowWidth": 0,
+                    "metaData": {
+                        "customizeData": []
+                    },
+                    "metadata": [],
+                    "minFormHeight": 0,
+                    "minFormWidth": 0,
+                    "minWindowHeight": 0,
+                    "minWindowRatio": 0,
+                    "minWindowWidth": 0,
+                    "moduleName": "entry",
+                    "name": "EntryAbility",
+                    "orientation": 6,
+                    "orientationId": 0,
+                    "package": "entry",
+                    "permissions": [],
+                    "preferMultiWindowOrientation": "default",
+                    "priority": 0,
+                    "process": "",
+                    "readPermission": "",
+                    "recoverable": false,
+                    "removeMissionAfterTerminate": false,
+                    "resourcePath": "/data/app/el1/bundle/public/com.codex.remote.app/entry/resources.index",
+                    "skills": [
+                        {
+                            "actions": [
+                                "action.system.home"
+                            ],
+                            "domainVerify": false,
+                            "entities": [
+                                "entity.system.home"
+                            ],
+                            "permissions": [],
+                            "uris": []
+                        }
+                    ],
+                    "srcEntrance": "./ets/entryability/EntryAbility.ets",
+                    "srcLanguage": "js",
+                    "srcPath": "",
+                    "startWindow": "",
+                    "startWindowBackground": "$color:start_window_background",
+                    "startWindowBackgroundId": 16777227,
+                    "startWindowIcon": "$media:start_icon",
+                    "startWindowIconId": 16777228,
+                    "startWindowId": 0,
+                    "startWindowResource": {
+                        "startWindowAppIconId": 0,
+                        "startWindowBackgroundColorId": 0,
+                        "startWindowBackgroundImageFit": "Cover",
+                        "startWindowBackgroundImageId": 0,
+                        "startWindowBrandingImageId": 0,
+                        "startWindowIllustrationId": 0
+                    },
+                    "supportExtNames": [],
+                    "supportMimeTypes": [],
+                    "supportPipMode": false,
+                    "supportWindowMode": [
+                        0,
+                        1,
+                        2
+                    ],
+                    "targetAbility": "",
+                    "theme": "",
+                    "type": 1,
+                    "uid": -1,
+                    "unclearableMission": false,
+                    "uri": "",
+                    "visible": true,
+                    "writePermission": ""
+                }
+            ],
+            "abilitySrcEntryDelegator": "",
+            "abilityStageSrcEntryDelegator": "",
+            "aotCompileStatus": 0,
+            "appEnvironments": [],
+            "appStartup": "",
+            "arkTSMode": "dynamic",
+            "backgroundImg": "",
+            "buildHash": "",
+            "bundleName": "com.codex.remote.app",
+            "colorMode": -1,
+            "compileMode": 1,
+            "compressNativeLibs": true,
+            "cpuAbi": "",
+            "crossAppSharedConfig": "",
+            "deduplicateHar": false,
+            "deliveryWithInstall": true,
+            "dependencies": [],
+            "description": "$string:module_desc",
+            "descriptionId": 16777219,
+            "deviceTypes": [
+                "phone",
+                "tablet"
+            ],
+            "easyGo": "",
+            "executableBinaryPaths": [],
+            "extensionInfos": [
+                {
+                    "appIdentifierAllowList": [],
+                    "appIndex": 0,
+                    "arkTSMode": "dynamic",
+                    "bundleName": "com.codex.remote.app",
+                    "compileMode": 1,
+                    "customProcess": "",
+                    "dataGroupIds": [],
+                    "description": "$string:standby_monitor_ability_desc",
+                    "descriptionId": 16777223,
+                    "enabled": true,
+                    "extensionProcessMode": -1,
+                    "extensionTypeName": "form",
+                    "hapPath": "/data/app/el1/bundle/public/com.codex.remote.app/entry.hap",
+                    "icon": "",
+                    "iconId": 0,
+                    "isolationProcess": false,
+                    "label": "$string:standby_monitor_ability_label",
+                    "labelId": 16777224,
+                    "metadata": [
+                        {
+                            "name": "ohos.extension.form",
+                            "resource": "$profile:standby_monitor_form_config",
+                            "value": "",
+                            "valueId": 0
+                        }
+                    ],
+                    "moduleName": "entry",
+                    "name": "StandbyMonitorFormAbility",
+                    "needCreateSandbox": false,
+                    "permissions": [],
+                    "priority": 0,
+                    "process": "com.codex.remote.app:form",
+                    "readPermission": "",
+                    "resourcePath": "/data/app/el1/bundle/public/com.codex.remote.app/entry/resources.index",
+                    "skills": [],
+                    "skipAbilityStageLifecycle": false,
+                    "srcEntrance": "./ets/standbymonitorformability/StandbyMonitorFormAbility.ets",
+                    "type": 0,
+                    "uid": -1,
+                    "uri": "",
+                    "validDataGroupIds": [],
+                    "visible": true,
+                    "writePermission": ""
+                }
+            ],
+            "fileContextMenu": "",
+            "formExtensionModule": "",
+            "formWidgetModule": "",
+            "hapPath": "/data/app/el1/bundle/public/com.codex.remote.app/entry.hap",
+            "hasIntent": false,
+            "hashValue": "",
+            "hqfInfo": {
+                "cpuAbi": "",
+                "hapSha256": "",
+                "hqfFilePath": "",
+                "moduleName": "",
+                "nativeLibraryPath": "",
+                "type": 0
+            },
+            "iconId": 16777217,
+            "iconPath": "$media:app_icon",
+            "installationFree": false,
+            "isLibIsolated": false,
+            "isModuleJson": true,
+            "isRemovable": {},
+            "isRemovableSet": [],
+            "isStageBasedModel": true,
+            "isolationMode": 0,
+            "label": "$string:app_name",
+            "labelId": 16777216,
+            "librarySupportDirectory": [],
+            "mainAbility": "EntryAbility",
+            "mainElementName": "EntryAbility",
+            "metadata": [
+                {
+                    "name": "metaInfo_module_markdown",
+                    "resource": "",
+                    "value": "markdown",
+                    "valueId": 0
+                }
+            ],
+            "moduleArkTSMode": "dynamic",
+            "moduleName": "entry",
+            "moduleSourceDir": "",
+            "moduleType": 1,
+            "name": "entry",
+            "nativeLibraryFileNames": [],
+            "nativeLibraryPath": "",
+            "overlayModuleInfos": [],
+            "package": "entry",
+            "packageName": "entry",
+            "pages": "$profile:main_pages",
+            "preloads": [],
+            "process": "com.codex.remote.app",
+            "proxyDatas": [],
+            "reqCapabilities": [],
+            "requiredDeviceFeatures": {},
+            "resizeable": false,
+            "resourcePath": "/data/app/el1/bundle/public/com.codex.remote.app/entry/resources.index",
+            "routerArray": [],
+            "routerMap": "",
+            "shareFiles": "",
+            "srcEntrance": "",
+            "srcPath": "",
+            "supportedModes": 0,
+            "systemTheme": "",
+            "uiSyntax": "hml",
+            "upgradeFlag": 0,
+            "versionCode": 1000014,
+            "virtualMachine": ""
+        }
+    ],
+    "hapModuleNames": [
+        "entry"
+    ],
+    "installTime": 1788838270035,
+    "isDifferentName": false,
+    "isKeepAlive": false,
+    "isNativeApp": false,
+    "isNewVersion": true,
+    "isPreInstallApp": false,
+    "jointUserId": "",
+    "label": "",
+    "mainEntry": "entry",
+    "maxSdkVersion": -1,
+    "minCompatibleVersionCode": 1000014,
+    "minSdkVersion": -1,
+    "moduleDirs": [
+        "/data/app/el1/bundle/public/com.codex.remote.app/entry"
+    ],
+    "moduleNames": [
+        "entry"
+    ],
+    "modulePublicDirs": [
+        ""
+    ],
+    "moduleResPaths": [
+        "/data/app/el1/bundle/public/com.codex.remote.app/entry/resources.index"
+    ],
+    "name": "com.codex.remote.app",
+    "oldAppIds": [
+        "com.codex.remote.app_BFqs8b+2vvEnJ34zFUPzyQ6UhWoJyG9QrstO8L/EDoMwoMtZJIEMdy58/ozJKUAtNp1mYxiXcQ201NcFy0gaOPs="
+    ],
+    "overlayBundleInfos": [],
+    "overlayType": 3,
+    "pluginBundleInfos": {},
+    "releaseType": "Release",
+    "reqPermissionDetails": [
+        {
+            "moduleName": "entry",
+            "name": "ohos.permission.ACCELEROMETER",
+            "reason": "$string:permission_sensor_reason",
+            "reasonId": 16777222,
+            "requiredFeature": "",
+            "usedScene": {
+                "abilities": [
+                    "EntryAbility"
+                ],
+                "when": "inuse"
+            }
+        },
+        {
+            "moduleName": "entry",
+            "name": "ohos.permission.GET_NETWORK_INFO",
+            "reason": "$string:permission_internet_reason",
+            "reasonId": 16777221,
+            "requiredFeature": "",
+            "usedScene": {
+                "abilities": [
+                    "EntryAbility",
+                    "StandbyMonitorFormAbility"
+                ],
+                "when": "inuse"
+            }
+        },
+        {
+            "moduleName": "entry",
+            "name": "ohos.permission.INTERNET",
+            "reason": "$string:permission_internet_reason",
+            "reasonId": 16777221,
+            "requiredFeature": "",
+            "usedScene": {
+                "abilities": [
+                    "EntryAbility",
+                    "StandbyMonitorFormAbility"
+                ],
+                "when": "inuse"
+            }
+        },
+        {
+            "moduleName": "entry",
+            "name": "ohos.permission.KEEP_BACKGROUND_RUNNING",
+            "reason": "$string:permission_background_reason",
+            "reasonId": 16777220,
+            "requiredFeature": "",
+            "usedScene": {
+                "abilities": [
+                    "EntryAbility"
+                ],
+                "when": "inuse"
+            }
+        },
+        {
+            "moduleName": "entry",
+            "name": "ohos.permission.MICROPHONE",
+            "reason": "$string:permission_mic_reason",
+            "reasonId": 16777233,
+            "requiredFeature": "",
+            "usedScene": {
+                "abilities": [
+                    "EntryAbility"
+                ],
+                "when": "inuse"
+            }
+        }
+    ],
+    "reqPermissionStates": [
+        0,
+        0,
+        0,
+        0,
+        0
+    ],
+    "reqPermissions": [
+        "ohos.permission.ACCELEROMETER",
+        "ohos.permission.GET_NETWORK_INFO",
+        "ohos.permission.INTERNET",
+        "ohos.permission.KEEP_BACKGROUND_RUNNING",
+        "ohos.permission.MICROPHONE"
+    ],
+    "routerArray": [],
+    "sandboxCreatorBundleName": "",
+    "seInfo": "",
+    "singleton": false,
+    "targetMinorApiVersion": 0,
+    "targetPatchApiVersion": 0,
+    "targetVersion": 60101024,
+    "uid": 20020266,
+    "updateTime": 1791557949455,
+    "userInfo": [
+        {
+            "accessTokenId": 537259754,
+            "accessTokenIdEx": 34896998122,
+            "bundleName": "com.codex.remote.app",
+            "bundleUserInfo": {
+                "disabledAbilities": [],
+                "enabled": true,
+                "overlayState": [],
+                "setEnabledCaller": "",
+                "userId": 100
+            },
+            "canUninstall": true,
+            "cloneInfos": {},
+            "curAlternateIconName": "",
+            "curDynamicIconModule": "",
+            "firstInstallTime": 1788838270035,
+            "gids": [
+                20020266
+            ],
+            "installTime": 1788838270035,
+            "installedPluginSet": [],
+            "isBundleFirstLaunched": true,
+            "isRemovable": true,
+            "sandboxInfos": {},
+            "uid": 20020266,
+            "updateTime": 1791557949455
+        }
+    ],
+    "vendor": "codex-remote",
+    "versionCode": 1000014,
+    "versionName": "1.0.14"
+}

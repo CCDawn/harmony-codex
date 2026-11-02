@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { effectiveCodexSettings, effectiveReasoningSettings, extractModelFromConfig, extractReasoningEffortFromConfig } from '../src/codexUserConfig.js';
+import { effectiveCodexSettings, effectiveReasoningSettings, extractServiceTierFromConfig, extractModelFromConfig, extractReasoningEffortFromConfig } from '../src/codexUserConfig.js';
 import { readAppServerCodexSettings } from '../src/codexDesktopSettings.js';
 
 test('extractReasoningEffortFromConfig reads Codex model_reasoning_effort', () => {
@@ -117,4 +117,28 @@ test('managed App Server is the primary model catalog and includes all selectabl
     'gpt-5.6-luna'
   ]);
   assert.deepEqual(calls.map((call) => call.method), ['config/read', 'model/list']);
+});
+
+
+test('service tier config reads root defaults without leaking a profile or losing explicit standard', () => {
+  assert.equal(extractServiceTierFromConfig('service_tier = "priority"\n[profiles.other]\nservice_tier = "default"'), 'priority');
+  assert.equal(extractServiceTierFromConfig('[profiles.other]\nservice_tier = "priority"'), 'default');
+  assert.equal(extractServiceTierFromConfig('service_tier = "default"'), 'default');
+  assert.equal(extractServiceTierFromConfig('service_tier = "bad tier"'), 'default');
+});
+
+test('official config/read service_tier and future model serviceTiers survive normalization and catalog revisions', async () => {
+  const tiers = [{ id: 'priority', name: 'Fast', description: 'Fast inference', futureFlag: 'retained' }];
+  const source = await readAppServerCodexSettings({ async requestAppServer(method) {
+    return method === 'config/read' ? { config: { model: 'gpt-test', service_tier: 'priority' } }
+      : { data: [{ id: 'gpt-test', serviceTiers: tiers }] };
+  } }, { configPath: 'unused-test-config.toml' });
+  assert.equal(source.serviceTier, 'priority');
+  const settings = effectiveCodexSettings({}, source);
+  assert.equal(settings.effectiveServiceTier, 'priority');
+  assert.equal(settings.serviceTierSource, 'desktop');
+  assert.deepEqual(settings.serviceTierOptions, tiers);
+  const next = effectiveCodexSettings({}, { ...source, models: [{ id: 'gpt-test', serviceTiers: [{ id: 'future-tier', name: 'Future' }] }] });
+  assert.notEqual(settings.modelCatalogRevision, next.modelCatalogRevision);
+  assert.equal(next.serviceTierOptions[0].id, 'future-tier');
 });

@@ -54,6 +54,11 @@ Ensure-FromExample `
   -LocalPath (Join-Path $repoRoot 'tools\harmony\hdc-relay.local.psd1')
 
 Ensure-FromExample `
+  -Id 'control-agent-config' `
+  -ExamplePath (Join-Path $repoRoot 'tools\harmony\control-agent.example.psd1') `
+  -LocalPath (Join-Path $repoRoot 'tools\harmony\control-agent.local.psd1')
+
+Ensure-FromExample `
   -Id 'virtual-hdc-config' `
   -ExamplePath (Join-Path $repoRoot 'tools\harmony\virtual-hdc.example.psd1') `
   -LocalPath (Join-Path $repoRoot 'tools\harmony\virtual-hdc.local.psd1')
@@ -62,6 +67,11 @@ Ensure-FromExample `
   -Id 'bridge-config' `
   -ExamplePath (Join-Path $repoRoot 'HarmonyCodexRemote\entry\src\main\ets\config\BridgeConfig.example.ets') `
   -LocalPath (Join-Path $repoRoot 'HarmonyCodexRemote\entry\src\main\ets\config\BridgeConfig.ets')
+
+Ensure-FromExample `
+  -Id 'control-target-config' `
+  -ExamplePath (Join-Path $repoRoot 'HarmonyCodexRemote\entry\src\main\ets\config\ControlConfig.example.ets') `
+  -LocalPath (Join-Path $repoRoot 'HarmonyCodexRemote\entry\src\main\ets\config\ControlConfig.ets')
 
 Ensure-FromExample `
   -Id 'voice-tunnel-config' `

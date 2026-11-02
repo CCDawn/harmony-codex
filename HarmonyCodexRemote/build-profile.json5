@@ -5,13 +5,13 @@
         "name": "default",
         "type": "HarmonyOS",
         "material": {
-          "certpath": "",
+          "certpath": "C:\\Users\\Administrator\\.ohos\\config\\default_phone-app_TKLX_mNWYni5DIzXpJhuyrEFBeKlZDG9LQTZeKyI9ls=.cer",
           "keyAlias": "debugKey",
-          "keyPassword": "",
-          "profile": "",
+          "keyPassword": "0000001BBC20A7CB1B064371FB6A6EC7F744D358C3A9E01F3F8A0875C7BD6D1A8D8863FA7592D3E2BF9E50",
+          "profile": "C:\\Users\\Administrator\\.ohos\\config\\default_phone-app_TKLX_mNWYni5DIzXpJhuyrEFBeKlZDG9LQTZeKyI9ls=.p7b",
           "signAlg": "SHA256withECDSA",
-          "storeFile": "",
-          "storePassword": ""
+          "storeFile": "C:\\Users\\Administrator\\.ohos\\config\\default_phone-app_TKLX_mNWYni5DIzXpJhuyrEFBeKlZDG9LQTZeKyI9ls=.p12",
+          "storePassword": "0000001BB0F1F9BB950A996205F4051AEA210D74639931B2853320109AF259053B7A6DE97CF9BE47925C22"
         }
       }
     ],

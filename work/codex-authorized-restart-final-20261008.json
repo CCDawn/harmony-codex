@@ -1,0 +1,81 @@
+{
+  "Authorized": true,
+  "CompletedAt": "2026-10-08T07:18:44.7410423Z",
+  "RestartObserved": true,
+  "OriginalHelperInterrupted": true,
+  "OldOfficialProcessesGone": true,
+  "OfficialMain": [
+    {
+      "Pid": 48148,
+      "CreatedAt": "2026-10-08T15:09:52.678504+08:00",
+      "RemoteConnectionArgument": true
+    }
+  ],
+  "CdpListening": true,
+  "DesktopLive": true,
+  "ProtectedRolesChanged": [],
+  "ProtectedServicesPreserved": true,
+  "Diagnostics": {
+    "checks": [
+      {
+        "id": "bridge",
+        "title": "本地桥接",
+        "state": "ready",
+        "message": "健康检查通过，使用桌面模式"
+      },
+      {
+        "id": "desktop",
+        "title": "Codex 桌面连接",
+        "state": "ready",
+        "message": "桌面实时通道已连接"
+      },
+      {
+        "id": "sessions",
+        "title": "普通会话",
+        "state": "ready",
+        "message": "会话列表读取正常；未验证发送"
+      },
+      {
+        "id": "companion",
+        "title": "个人助手会话",
+        "state": "ready",
+        "message": "会话内容读取正常；未验证发送"
+      },
+      {
+        "id": "computer",
+        "title": "助手云电脑",
+        "state": "error",
+        "message": "请求失败或超时"
+      },
+      {
+        "id": "voice",
+        "title": "语音",
+        "state": "unverified",
+        "message": "隧道任务运行中；实际通话和锁屏语音尚未验证"
+      },
+      {
+        "id": "phone_debug",
+        "title": "手机安装与调试",
+        "state": "waiting",
+        "message": "未发现在线调试设备，暂不能安装；不代表手机会话离线"
+      }
+    ],
+    "restartRequired": false,
+    "severity": "degraded",
+    "summary": "连接需要处理：助手云电脑",
+    "nextAction": "safe_repair"
+  },
+  "VoiceTaskState": "Running",
+  "AssistantIdentity": {
+    "verifiedAt": "2026-10-08T07:26:24.522Z",
+    "readOnly": true,
+    "profileHttp": 200,
+    "assistantName": "葱花拌海星",
+    "assistantDiscovered": true,
+    "avatarPresent": true,
+    "bindingPresent": true,
+    "elapsedMs": 4014
+  },
+  "ActualPhoneAndVoiceVerified": false,
+  "RenameConfirmedByUser": true
+}

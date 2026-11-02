@@ -1,0 +1,25 @@
+[
+  {
+    "phase": "offer",
+    "status": null,
+    "headersMs": null,
+    "elapsedMs": 1062,
+    "allocated": false
+  },
+  {
+    "phase": "request",
+    "status": null,
+    "headersMs": null,
+    "elapsedMs": 2107,
+    "allocated": false
+  },
+  {
+    "phase": "error",
+    "status": 503,
+    "headersMs": 29728,
+    "elapsedMs": 31833,
+    "failedPhase": "headers",
+    "errorName": "Error",
+    "allocated": false
+  }
+]

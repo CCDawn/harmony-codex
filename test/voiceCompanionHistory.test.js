@@ -67,7 +67,7 @@ test('final phone transcripts survive an official-history refresh that contains 
   ]);
   const phoneFinal = {
     itemId: 'voice:call-7:item-2', role: 'assistant', text: '手机收到的最终语音回复', final: true,
-    phoneTranscript: true, callId: 'call-7'
+    phoneTranscript: true, callId: 'call-7', createdAt: 100
   };
   const withLocal = VoiceTranscriptReducer.append(official, phoneFinal);
   const refreshed = VoiceTranscriptReducer.replaceHistory(official, withLocal);
@@ -87,16 +87,16 @@ test('final phone transcripts survive an official-history refresh that contains 
 test('transcript reducer preserves local provenance while partial text becomes final', () => {
   const partial = VoiceTranscriptReducer.append([], {
     itemId: 'voice:call-8:item-3', role: 'user', text: '七加', final: false,
-    phoneTranscript: true, callId: 'call-8'
+    phoneTranscript: true, callId: 'call-8', createdAt: 200
   });
   const final = VoiceTranscriptReducer.append(partial, {
     itemId: 'voice:call-8:item-3', role: 'user', text: '七加五等于几', final: true,
-    phoneTranscript: true, callId: 'call-8'
+    phoneTranscript: true, callId: 'call-8', createdAt: 900
   });
 
   assert.deepEqual(final, [{
     itemId: 'voice:call-8:item-3', role: 'user', text: '七加五等于几', final: true,
-    phoneTranscript: true, callId: 'call-8'
+    phoneTranscript: true, callId: 'call-8', createdAt: 200
   }]);
 });
 

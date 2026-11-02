@@ -1,3 +1,24 @@
+import { latestSessionStreamText } from '../services/SessionStreamPresentation';
+import { SessionDraftStore, SessionDraftScope } from '../services/SessionDraftStore';
+import { BridgeEventStream } from '../services/BridgeEventStream';
+import { StreamUiBatch } from '../services/StreamUiBatch';
+import { taskWithStreamEvents, taskStreamNeedsSnapshot } from '../services/TaskStreamState';
+import { mergeOfficialSessionEntryPages, mergeSessionLiveEntries, pruneSessionLiveEntries, upsertSessionLiveEntry, SessionStreamMessage } from '../services/SessionLiveEntries';
+import { outboxMessageLabel, outboxTaskMessageLabel, restoreOutboxMessages } from '../services/OutboxMessagePresentation';
+import { SseFrame } from '../services/SseParser';
+import { buildSessionTimeline, SessionTimelineRow } from '../services/SessionTimeline';
+import { sessionRenderWindow, earlierSessionRenderStartKey } from '../services/SessionRenderWindow';
+import { isFastServiceTier } from '../services/ServiceTierPresentation';
+import { CodexServiceTier, SessionSettings } from '../model/BridgeModels';
+import { CodexRuntimeSession } from '../model/BridgeModels';
+import { CodexContinueStatus, CodexLiveRuntimeFrame } from '../model/BridgeModels';
+import { canContinueNativeSession, sessionControlStateLabel, sessionCompletionKind } from '../services/SessionControlPresentation';
+import { util } from '@kit.ArkTS';
+import { parseSessionUserReplies, SessionUserReply } from '../services/SessionUserReplyPresentation';
+import { parseSessionHeartbeat, parseSessionHeartbeatResult, SessionHeartbeat, SessionHeartbeatResult } from '../services/SessionHeartbeatPresentation';
+import { SessionHeartbeatCard } from '../components/SessionHeartbeatCard';
+import { presentSessionActivities, presentSessionEntryContext, SessionDisplayEntry } from '../services/SessionActivityPresentation';
+import { reconcileSessionSidebar } from '../services/SessionSidebarPresentation';
 import { PairingPanel } from '../components/PairingPanel';
 import { SettingsPanel } from '../components/SettingsPanel';
 import { GuardianStatus } from '../model/BridgeModels';
@@ -6,6 +27,7 @@ import { CompanionComputerLifecycle } from '../services/CompanionComputerLifecyc
 import { CompanionComputerPanel } from '../components/CompanionComputerPanel';
 import { VoiceTranscriptReducer } from '../services/VoiceTranscriptReducer';
 import { CompanionCallRecord, CompanionProfile, CompanionVoiceIdentity, CompanionTextMessage } from '../model/CompanionModels';
+import { mergeCompanionHistory } from '../services/CompanionTimeline';
 import { CompanionTextService, CompanionTextPartition } from '../services/CompanionTextService';
 import { CompanionTranscriptStore, CompanionTranscriptPartition } from '../services/CompanionTranscriptStore';
 import { CompanionHistoryReducer } from '../services/CompanionHistoryReducer';
@@ -18,6 +40,10 @@ import { HdcRelayConfig, HdcRelayState, HdcRelayTunnel } from '../services/HdcRe
 import { ContentActionService } from '../services/ContentActionService';
 import { AttachmentService, PickedMobileFile } from '../services/AttachmentService';
 import { MarkdownReader } from '../components/MarkdownReader';
+import { MermaidDiagram } from '../components/MermaidDiagram';
+import { MobileControlService } from '../services/MobileControlService';
+import { MobileControlJob } from '../model/MobileControlModels';
+import { DEFAULT_CONTROL_TARGET_ID } from '../config/ControlConfig';
 import {
   MarkdownDocumentService,
   MarkdownReaderDocument
@@ -33,6 +59,10 @@ import {
 } from '../services/SessionPresentationService';
 import {
   appendOptimisticSessionMessage,
+  markOptimisticSessionSubmitted,
+  reconcileOptimisticSessionMessages,
+  stableCanonicalMessageKey,
+  stableCanonicalMessageKeys,
   OptimisticSessionFile,
   OptimisticSessionMessage,
   optimisticSessionMessagesForTarget,
@@ -60,6 +90,7 @@ import { BridgePairingService } from '../services/BridgePairingService';
 import { SessionConnectionFailure, SessionConnectionFailurePresentation } from '../services/SessionConnectionFailure';
 import { SessionRuntimeStore } from '../services/SessionRuntimeStore';
 import { AppBackgroundRuntimeService } from '../services/AppBackgroundRuntimeService';
+import { HuaweiPushRegistrationService } from '../services/HuaweiPushRegistrationService';
 import { common, ConfigurationConstant } from '@kit.AbilityKit';
 import { fileIo } from '@kit.CoreFileKit';
 import { photoAccessHelper } from '@kit.MediaLibraryKit';
@@ -96,6 +127,7 @@ import {
   normalizeFontScaleMode,
   scaleFontSize
 } from '../theme/AppTypography';
+import { CONVERSATION_FONT_FAMILY, CONVERSATION_MONOSPACE_FONT_FAMILY } from '../theme/ConversationTypography';
 
 const SESSION_READ_BASELINE_STORAGE_KEY = 'codexRemoteSessionReadBaseline';
 
@@ -118,6 +150,15 @@ interface PendingSessionImage {
   mimeType: string;
 }
 
+interface BridgeStreamControl {
+  reason?: string;
+  requiresSnapshot?: boolean;
+}
+
+interface CompanionStreamMessage {
+  entry?: VoiceTranscriptEntry;
+}
+
 interface ComposedSessionMessage {
   text: string;
   uploadedImages: PendingSessionImage[];
@@ -137,6 +178,10 @@ interface FailedSessionMessage {
   files: PickedMobileFile[];
   error: string;
   createdAt: string;
+  submittedText?: string;
+  baselineEntryKeys?: string[];
+  turnId?: string;
+  itemId?: string;
   retrying: boolean;
   retryCount: number;
   retryLimit: number;
@@ -165,6 +210,7 @@ interface PendingSessionSend {
   images: PendingSessionImage[];
   files: PickedMobileFile[];
   retryFailedMessageId: string;
+  deliveryAccepted?: boolean;
 }
 
 interface SessionMarkdownBlock {
@@ -175,6 +221,48 @@ interface SessionMarkdownBlock {
   checked: boolean;
   ordered: boolean;
   language: string;
+}
+
+interface SessionEntryCardParams {
+  entry: CodexSessionEntry;
+  rowKey: string;
+}
+
+interface SessionMarkdownContentParams extends SessionEntryCardParams {
+  isUser: boolean;
+}
+
+interface SessionMarkdownBlockViewParams extends SessionMarkdownContentParams {
+  blockItem: SessionMarkdownBlock;
+}
+
+interface SessionMarkdownInlineTextParams {
+  text: string;
+  isUser: boolean;
+  fontSize: number;
+  lineHeight: number;
+  isHeading: boolean;
+}
+
+interface SessionMarkdownTableViewParams {
+  block: SessionMarkdownBlock;
+  isUser: boolean;
+}
+
+interface OptimisticSessionMessageParams {
+  message: OptimisticSessionMessage;
+}
+
+interface SessionEntryViewParams {
+  entry: CodexSessionEntry;
+}
+
+interface SessionAgentItemParams extends SessionEntryViewParams {
+  toolItem: SessionToolPresentationItem;
+}
+
+interface SessionAgentDetailParams {
+  toolItem: SessionToolPresentationItem;
 }
 
 interface SessionStructuredField {
@@ -216,7 +304,7 @@ struct Index {
   @StorageLink(NOTIFICATION_SESSION_STORAGE_KEY) notificationTargetSessionId: string = '';
   @StorageLink(NOTIFICATION_EVENT_TYPE_STORAGE_KEY) notificationTargetEventType: string = '';
   @StorageLink(NOTIFICATION_EVENT_ID_STORAGE_KEY) notificationTargetEventId: string = '';
-  @StorageLink(NOTIFICATION_REVISION_STORAGE_KEY) notificationTargetRevision: string = '';
+  @StorageLink(NOTIFICATION_REVISION_STORAGE_KEY) @Watch('notificationTargetChanged') notificationTargetRevision: string = '';
   @State @Watch('guardianCredentialChanged') bridgeUrl: string = DEFAULT_BRIDGE_URL;
   @State @Watch('guardianCredentialChanged') bridgeToken: string = DEFAULT_BRIDGE_TOKEN;
   @State bridgeOtpCode: string = '';
@@ -229,14 +317,16 @@ struct Index {
   @State pairedDeviceId: string = '';
   @State prompt: string = '请检查当前项目，修复发现的问题，并用中文说明改动和验证结果';
   @State projects: BridgeProject[] = [];
-  @State tasks: BridgeTaskSummary[] = [];
-  @State sessions: CodexSessionSummary[] = [];
+  @State @Watch('sidebarRuntimeInputsChanged') tasks: BridgeTaskSummary[] = [];
+  @State @Watch('sidebarRuntimeInputsChanged') sessions: CodexSessionSummary[] = [];
   @State sessionsLoadError: string = '';
   @State sessionsFailureDiagnosticsAvailable: boolean = false;
   @State sessionsFailureDetailsExpanded: boolean = false;
   @State lastGoodSessionCount: number = 0;
-  @State selectedSession: CodexSessionDetail | null = null;
+  @State @Watch('reconcileVisibleSessionMessages') selectedSession: CodexSessionDetail | null = null;
   @State sessionSearchQuery: string = '';
+  @State sessionTimelineStartKey: string = '';
+  @State pendingSessionLoadError: string = '';
   @State companionAvatarFailed: boolean = false;
   @State companionProfile: CompanionProfile | null = null;
   @State companionComputerVisible: boolean = false;
@@ -265,7 +355,7 @@ struct Index {
   private pendingVoiceTranscriptIds: Record<string, string> = {};
   private voiceCallBridgeUrlSnapshot: string = '';
   @State selectedProjectId: string = 'probe';
-  @State currentTask: BridgeTask | null = null;
+  @State @Watch('currentTaskSidebarChanged') currentTask: BridgeTask | null = null;
   @State message: string = '就绪';
   @State isBusy: boolean = false;
   @State @Watch('guardianNavigationChanged') activeTab: string = 'sessions';
@@ -279,7 +369,10 @@ struct Index {
   private homeMenuScroller: Scroller = new Scroller();
   @State homeMenuCanScrollUp: boolean = false;
   @State homeMenuCanScrollDown: boolean = false;
-  @StorageLink('codexRemoteBackgroundRuntimeState') backgroundRuntimeState: string = 'stopped';
+  @StorageLink('codexRemotePushState') pushState: string = 'connecting';
+  private pushSessionSnapshotKey: string = '';
+  private pushThreadIds: string[] = [];
+  @StorageLink('codexRemoteAppForeground') @Watch('appForegroundChanged') appForeground: boolean = false;
   @State logSessionId: string = `app-${Date.now()}`;
   @State sessionSidebarCollapsed: boolean = false;
   @State sessionSidebarUserCollapsed: boolean = false;
@@ -289,6 +382,9 @@ struct Index {
   @State availableModels: CodexModelOption[] = [];
   @State sessionReasoningEffort: string = '';
   @State desktopDefaultReasoningEffort: string = '';
+  @State sessionServiceTier: string = '';
+  @State desktopDefaultServiceTier: string = '';
+  @State availableServiceTiers: CodexServiceTier[] = [];
   @State reasoningEffortMenuVisible: boolean = false;
   @State isSavingReasoningEffort: boolean = false;
   @State isNewSessionDraft: boolean = false;
@@ -296,11 +392,12 @@ struct Index {
   @State activeSessionTaskId: string = '';
   @State activeSessionTaskTitle: string = '';
   @State expandedSessionEntries: string[] = [];
-  @State runningSessionIds: string[] = [];
+  @State @Watch('sidebarRuntimeInputsChanged') runningSessionIds: string[] = [];
+  @State sidebarRunningSessionIds: string[] = [];
   @State unreadCompletedSessionIds: string[] = [];
   // Persisted read baseline: sessionId -> activityUpdatedAt last seen by the user.
   @StorageLink(SESSION_READ_BASELINE_STORAGE_KEY) sessionReadBaselineJson: string = '{}';
-  @State locallyClearedRunningSessionIds: string[] = [];
+  @State @Watch('sidebarRuntimeInputsChanged') locallyClearedRunningSessionIds: string[] = [];
   @State sessionMonitorRevision: number = 0;
   @State showTaskEventDetails: boolean = false;
   @State relayStateText: HdcRelayState = '已停止';
@@ -314,7 +411,15 @@ struct Index {
   @State desktopLiveTargetSessionId: string = '';
   @State desktopLiveSessionVerified: boolean = false;
   @State desktopLiveChecking: boolean = false;
+  @State runtimeConnectionState: string = 'connecting';
+  @State runtimeDesktopConnected: boolean = false;
+  @State selectedSessionControl: CodexContinueStatus | null = null;
+  @State selectedControlStreamHealthy: boolean = false;
+  @State sessionContinueBusyId: string = '';
+  @State sessionContinueUncertainIds: string[] = [];
   @State desktopLiveRestarting: boolean = false;
+  @State mobileControlJob: MobileControlJob | null = null;
+  @State mobileControlMessage: string = '';
   @State isOpeningDesktopSession: boolean = false;
   @State desktopLiveRequiresDesktopCdp: boolean = false;
   @State desktopLiveMobileRecoverable: boolean = true;
@@ -377,6 +482,7 @@ struct Index {
   @State failedSessionMessages: FailedSessionMessage[] = [];
   @State optimisticSessionMessages: OptimisticSessionMessage[] = [];
   @State sessionComposerFocused: boolean = false;
+  @State activeSessionContentActionsKey: string = '';
   @State desktopScreenshotMetaText: string = '';
   @State sessionAutoFollowBottom: boolean = true;
   @State isLoadingOlderSessionEntries: boolean = false;
@@ -399,7 +505,12 @@ struct Index {
 
   private sessionScroller: Scroller = new Scroller();
   private sessionContentHeight: number = 0;
+  private sessionDetailRefreshSeq: number = 0;
+  private sessionDetailSnapshotRevisions: Map<string, number> = new Map<string, number>();
+  private sessionTaskAdoptionSeq: number = 0;
+  private sessionUserScrollActive: boolean = false;
   private historyScrollAnchorKey: string = '';
+  private sessionHistoryRequestSeq: number = 0;
   private pollTimer: number = -1;
   private dashboardTimer: number = -1;
   private desktopMonitorTimer: number = -1;
@@ -409,11 +520,36 @@ struct Index {
   private pendingLogs: AppLogPayload[] = [];
   private isFlushingLogs: boolean = false;
   private isRefreshingDashboard: boolean = false;
-  private appForeground: boolean = true;
+  private sessionDraftStore: SessionDraftStore = new SessionDraftStore();
+  private taskEventStream: BridgeEventStream | null = null;
+  private taskEventStreamKey: string = '';
+  private taskEventStreamHealthy: boolean = false;
+  private taskStreamUiBatch: StreamUiBatch<BridgeEvent> | null = null;
+  private taskStreamTextEvents: BridgeEvent[] | null = null;
+  private taskStreamTextLength: number = 0;
+  private taskStreamTextValue: string = '';
+  private taskStreamRecovering: boolean = false;
+  private taskStreamRepairId: string = '';
+  private taskStreamRenderedAt: number = 0;
+  @State sessionStreamEntries: CodexSessionEntry[] = [];
+  private sessionEventStream: BridgeEventStream | null = null;
+  private sessionEventStreamKey: string = '';
+  private sessionStreamUiBatch: StreamUiBatch<CodexSessionEntry> | null = null;
+  private sessionStreamRefreshing: boolean = false;
+  private sessionStreamRefreshGeneration: number = 0;
+  private sessionStreamRefreshPending: boolean = false;
+  private sessionStreamDiagnosticAt: number = 0;
+  private companionEventStream: BridgeEventStream | null = null;
+  private companionEventStreamKey: string = '';
+  private companionEventStreamHealthy: boolean = false;
+  private companionPollTick: number = 0;
+  private companionStreamRevision: number = 0;
   private taskPollStartedAt: number = 0;
   private taskPollLastStatus: string = '';
   private taskPollLastEventCount: number = -1;
   private taskPollDelayMs: number = 2000;
+  private taskTerminalPreviousStatusById: Record<string, string | undefined> = {};
+  private taskTerminalHandledIds: string[] = [];
   private lastProjectsRefreshAt: number = 0;
   private lastTasksRefreshAt: number = 0;
   private lastSessionsRefreshAt: number = 0;
@@ -441,30 +577,38 @@ struct Index {
   private lastDesktopSyncWarningTaskId: string = '';
   private relayAutoStarted: boolean = false;
   private relayRunning: boolean = false;
-  private relayBackgroundRunning: boolean = false;
   private relayStateChangedAt: number = Date.now();
   private relayLastRestartAt: number = 0;
   private taskStatusById: Record<string, string> = {};
   private taskSessionById: Record<string, string> = {};
   private latestTaskIdBySessionId: Record<string, string> = {};
-  private pendingSessionSendsByTaskId: Record<string, PendingSessionSend> = {};
+  private pendingSessionSendsByTaskId: Record<string, PendingSessionSend[]> = {};
   private failedSessionRetryTimersById: Record<string, number> = {};
   private canceledFailedSessionRetryIds: string[] = [];
   private failedSessionAutoRetryLimit: number = 5;
   private failedSessionAutoRetryDelayMs: number = 1800;
   private sessionActivityStatusById: Record<string, string> = {};
   private sessionUpdatedAtById: Record<string, string> = {};
+  private sidebarTaskSignature: string = '';
   private clearedRunningSessionUpdatedAtById: Record<string, string> = {};
   private sessionRuntimeStore: SessionRuntimeStore = new SessionRuntimeStore();
+  private runtimeEventStream: BridgeEventStream | null = null;
+  private runtimeEventStreamKey: string = '';
+  private continueStatusRequestSequence: number = 0;
+  private continueUncertainTurnIds: Record<string, string> = {};
+  private notifiedNativeTurnIds: string[] = [];
   private latestRuntimeSnapshot: CodexRuntimeSnapshot | null = null;
   private reasoningEffortLoadedSessionId: string = '';
   private reasoningEffortLoadedAt: number = 0;
   private desktopModelDefaultsLoadedAt: number = 0;
   private modelSettingsCacheTtlMs: number = 10000;
+  private modelSettingsRequestSeq: number = 0;
+  private modelSettingsLoadingSessionId: string = '';
   private notifiedTaskIds: string[] = [];
   private notifiedSessionCompletionKeys: string[] = [];
   private notifiedAttentionKeys: string[] = [];
   private lastHandledNotificationRevision: string = '';
+  private notificationNavigationBusy: boolean = false;
   private lastConnectionNotificationAt: number = 0;
   private relayTunnel: HdcRelayTunnel = new HdcRelayTunnel((state: HdcRelayState, detail: string) => {
     if (this.relayStateText !== state || this.relayDetailText !== detail) {
@@ -483,7 +627,7 @@ struct Index {
     this.themeMode = normalizeThemeMode(this.themeMode);
     this.fontScaleMode = normalizeFontScaleMode(this.fontScaleMode);
     this.applyThemeMode();
-    this.appForeground = true;
+    this.refreshSessionSidebarSnapshot();
     this.guardianPageVisible = true;
     this.startGuardianRefresh();
     this.applyKeyboardAvoidMode();
@@ -495,9 +639,10 @@ struct Index {
     this.startLogFlusher();
     this.startBridgeOtpRefresh();
     this.startDashboardRefresh();
+    this.syncRuntimeEventStream();
     void this.refreshSlashIndex();
     void this.loadDesktopReasoningDefaults(true);
-    void this.startRelayBackgroundRunning();
+    this.syncPushRegistration();
     void this.requestNotificationPermission();
     void this.applyPendingNotificationNavigation();
     if (this.desktopMonitorVisible) {
@@ -508,13 +653,14 @@ struct Index {
       this.startRelayWatchdog();
       this.startEmbeddedRelayOnce();
     }
-    this.log('info', 'app.appear', `bridgeUrl=${this.bridgeUrl}; sessionId=${this.logSessionId}`);
+    this.log('info', 'app.appear', `bridgeUrl=${this.bridgeUrl}; sessionId=${this.logSessionId}; lastExitReason=${AppStorage.get<number>('codexRemoteLastExitReason') ?? 0}`);
   }
 
   aboutToDisappear(): void {
+    this.stopRuntimeEventStream();
+    this.stopSessionEventStream();
     this.guardianPageVisible = false;
     this.stopGuardianRefresh();
-    this.appForeground = false;
     this.stopCompanionPolling();
     this.stopDesktopMonitorRefresh();
     this.stopBridgeOtpRefresh();
@@ -528,6 +674,19 @@ struct Index {
     if (this.homeActionMenuVisible) {
       this.homeActionMenuVisible = false;
       this.homeActionMenuSource = '';
+      return true;
+    }
+    if (this.accountUsagePanelVisible) {
+      this.closeAccountUsagePanel('system_back');
+      return true;
+    }
+    if (this.reasoningEffortMenuVisible) {
+      this.reasoningEffortMenuVisible = false;
+      return true;
+    }
+    if (this.composerActionMenuExpanded || this.slashCommandPanelVisible) {
+      this.composerActionMenuExpanded = false;
+      this.slashCommandPanelVisible = false;
       return true;
     }
     if (this.companionComputerVisible && this.activeTab === 'sessions') {
@@ -790,10 +949,11 @@ struct Index {
       SettingsPanel({
         darkMode: this.usesDarkTheme(), themeMode: this.themeMode,
         fontScaleMode: this.fontScaleMode,
-        backgroundState: this.backgroundRuntimeState === 'running' ? '运行中' : '未运行',
+        pushState: this.pushStatusText(),
         voiceState: this.pairingVoiceStatus(),
         guardian: this.guardian, guardianBusy: this.guardianBusy || this.guardianSaving,
         guardianError: this.guardianError, initialSection: this.guardianInitialSection,
+        repairMessage: this.mobileControlMessage, repairActive: this.desktopLiveRestarting,
         onGuardianToggle: (enabled: boolean) => { void this.setGuardianEnabled(enabled); },
         onGuardianRefresh: () => { void this.refreshGuardianStatus(); },
         onBack: () => this.closeConfigurationPage(),
@@ -948,7 +1108,6 @@ struct Index {
           this.SessionSidebarResizeHandle()
         }
         Column() {
-          this.GuardianStatusRow()
           Column() { this.SessionPanel() }.width('100%').layoutWeight(1)
         }
         .layoutWeight(1)
@@ -1044,7 +1203,7 @@ struct Index {
                 .fontColor(this.themeColor('#17202A'))
                 .maxLines(1)
                 .textOverflow({ overflow: TextOverflow.Ellipsis })
-              Text(this.sessionMonitorSummaryText())
+              Text(`${this.liveDesktopLabel()} · ${this.sessionMonitorSummaryText()}`)
                 .fontSize(this.scaledFontSize(10))
                 .fontColor(this.themeColor('#68717D'))
                 .maxLines(1)
@@ -1081,7 +1240,7 @@ struct Index {
     .width('100%')
     .height('100%')
     .padding({ left: 12, right: 12, top: 12, bottom: 0 })
-    .backgroundColor(this.themeColor('#F7F8FA'))
+    .backgroundColor(this.theme().canvas)
     }
   }
 
@@ -1129,7 +1288,7 @@ struct Index {
       .backgroundColor(this.themeColor('#EAF2FF'))
       .border({ width: 1, color: this.themeColor('#BBD2FF') })
       .borderRadius(15)
-      .enabled(this.selectedSession !== null && !this.isOpeningDesktopSession)
+      .enabled(this.selectedSession !== null && !this.isSessionDetailPending() && !this.isOpeningDesktopSession)
       .onClick(() => {
         void this.openDesktopSelectedSession('conversation_header');
       })
@@ -1187,6 +1346,10 @@ struct Index {
           .fontColor(this.themeColor('#1F6FEB'))
           .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
+        if (this.sessionFastModeEnabled()) {
+          Text('⚡').fontSize(this.scaledFontSize(11)).fontColor(this.theme().accent)
+            .accessibilityText('快速模式已开启')
+        }
         Text('▾')
           .fontSize(this.scaledFontSize(10))
           .fontColor(this.themeColor('#68717D'))
@@ -1206,6 +1369,26 @@ struct Index {
         this.slashCommandPanelVisible = false;
         this.log('info', 'ui.model_settings.toggle', `visible=${this.reasoningEffortMenuVisible}; sessionId=${this.reasoningEffortSessionId()}; model=${this.sessionModel || 'auto'}; effort=${this.sessionReasoningEffort || 'auto'}`);
       })
+  }
+
+  @Builder
+  ServiceTierMenu() {
+    Column({ space: 4 }) {
+      Text('速度').fontSize(this.scaledFontSize(11)).fontWeight(FontWeight.Bold)
+        .fontColor(this.theme().textSecondary).width('100%')
+      ForEach(this.serviceTierOptionValues(), (option: CodexServiceTier) => {
+        Button() {
+          Row({ space: 8 }) {
+            Text(this.sessionServiceTier === option.id ? '✓' : '').width(12)
+              .fontSize(this.scaledFontSize(12)).fontColor(this.theme().accent)
+            Text(option.name).fontSize(this.scaledFontSize(12)).fontColor(this.theme().textPrimary).layoutWeight(1)
+          }
+        }.width(210).height(38).padding({ left: 8, right: 8 }).borderRadius(9)
+          .backgroundColor(this.sessionServiceTier === option.id ? this.themeColor('#EAF2FF') : this.theme().surface)
+          .enabled(!this.isSavingReasoningEffort)
+          .onClick(() => { void this.changeServiceTier(option.id); })
+      }, (option: CodexServiceTier) => `speed:${option.id}`)
+    }.width('100%')
   }
 
   @Builder
@@ -1273,6 +1456,8 @@ struct Index {
         .width('100%')
         .height(1)
         .backgroundColor(this.themeColor('#E6EAF0'))
+
+      this.ServiceTierMenu()
 
       Text('思考强度')
         .fontSize(this.scaledFontSize(11))
@@ -2010,9 +2195,9 @@ struct Index {
         }
           .width(64)
           .height(38)
-          .backgroundColor(this.canDeleteSession(session) ? this.themeColor('#D92D20') : this.themeColor('#D0D5DD'))
+          .backgroundColor(this.canDisplaySessionDelete(session) ? this.themeColor('#D92D20') : this.themeColor('#D0D5DD'))
           .borderRadius(8)
-          .enabled(this.canDeleteSession(session))
+          .enabled(this.canDisplaySessionDelete(session))
           .onClick(() => {
             this.confirmDeleteSession(session);
           })
@@ -2043,7 +2228,7 @@ struct Index {
           }
           Text(this.sessionTimeLabel(session))
             .fontSize(this.scaledFontSize(11))
-            .fontColor(this.isSessionRunning(session.id) ? this.themeColor('#68717D') : this.themeColor('#8A95A3'))
+            .fontColor(this.isSidebarSessionRunning(session.id) ? this.themeColor('#68717D') : this.themeColor('#8A95A3'))
             .maxLines(1)
             .textAlign(TextAlign.End)
         }
@@ -2054,7 +2239,7 @@ struct Index {
       .width('100%')
       .height(Math.max(58, this.scaledLineHeight(36)))
       .padding({ left: 8, right: 8, top: 6, bottom: 6 })
-      .backgroundColor(this.selectedSession?.id === session.id ? this.theme().accentSurface : this.theme().surfaceSubtle)
+      .backgroundColor(this.activeSessionId === session.id ? this.theme().accentSurface : this.theme().surfaceSubtle)
       .borderRadius(8)
       .alignItems(VerticalAlign.Center)
       .translate({ x: this.sessionSwipeOffset(session.id), y: 0 })
@@ -2084,7 +2269,7 @@ struct Index {
 
   @Builder
   SessionActivityBadge(session: CodexSessionSummary) {
-    if (this.isSessionRunning(session.id)) {
+    if (this.isSidebarSessionRunning(session.id)) {
       Row() {
         LoadingProgress()
           .width(18)
@@ -2117,7 +2302,7 @@ struct Index {
           .width('100%')
           .enabled(!this.isSendingSessionMessage && this.newSessionTaskId.length === 0)
           .onSelect((index: number) => {
-            this.selectedProjectId = this.projects[index].id;
+            this.selectComposerProject(this.projects[index].id);
           })
         if (this.hasNewSessionConversation()) {
           Column({ space: 6 }) {
@@ -2128,15 +2313,9 @@ struct Index {
             Stack({ alignContent: Alignment.BottomEnd }) {
               Scroll(this.sessionScroller) {
                 Column({ space: 3 }) {
-                  ForEach(this.visibleNewSessionEntries(), (entry: CodexSessionEntry) => {
-                    this.SessionEntryCard(entry)
-                  }, (entry: CodexSessionEntry) => this.sessionEntryKey(entry))
-                  ForEach(this.visibleOptimisticSessionMessages(), (message: OptimisticSessionMessage) => {
-                    this.OptimisticSessionMessageCard(message)
-                  }, (message: OptimisticSessionMessage) => message.id)
-                  ForEach(this.visibleFailedSessionMessages(), (message: FailedSessionMessage) => {
-                    this.FailedSessionMessageCard(message)
-                  }, (message: FailedSessionMessage) => message.id)
+                  Repeat<SessionTimelineRow>(this.sessionTimelineRows())
+                    .each((row: RepeatItem<SessionTimelineRow>) => { this.SessionTimelineCard(row) })
+                    .key((row: SessionTimelineRow): string => this.sessionTimelineRenderKey(row))
                 }
                 .width('100%')
                 .onAreaChange((oldArea: Area, newArea: Area) => {
@@ -2181,8 +2360,19 @@ struct Index {
           this.SessionFloatingStatusPanel()
         }
 
+        this.SessionControlProgress()
         this.SessionPendingInteractions()
         this.SessionComposer()
+      } else if (this.isSessionDetailPending()) {
+        Column({ space: 10 }) {
+          if (this.pendingSessionLoadError.length === 0) {
+            LoadingProgress().width(24).height(24).color(this.theme().accent)
+            Text('正在读取会话').fontSize(this.scaledFontSize(14)).fontColor(this.theme().textSecondary)
+          } else {
+            Text(this.pendingSessionLoadError).fontSize(this.scaledFontSize(14)).fontColor(this.theme().textSecondary)
+            Button('重试').onClick(() => { void this.loadSessionDetail(this.activeSessionId); })
+          }
+        }.layoutWeight(1).width('100%').justifyContent(FlexAlign.Center)
       } else if (this.selectedSession === null) {
         Column({ space: 10 }) {
           Text('会话列表')
@@ -2217,21 +2407,9 @@ struct Index {
           Scroll(this.sessionScroller) {
             Column({ space: 3 }) {
               this.SessionHistoryLoader()
-              ForEach(this.visibleSessionEntries(), (entry: CodexSessionEntry) => {
-                Column() {
-                  this.SessionEntryCard(entry)
-                }
-                .width('100%')
-                .onAreaChange((oldArea: Area, newArea: Area) => {
-                  this.restoreHistoryScrollAnchor(this.sessionEntryKey(entry), oldArea, newArea);
-                })
-              }, (entry: CodexSessionEntry) => this.sessionEntryKey(entry))
-              ForEach(this.visibleOptimisticSessionMessages(), (message: OptimisticSessionMessage) => {
-                this.OptimisticSessionMessageCard(message)
-              }, (message: OptimisticSessionMessage) => message.id)
-              ForEach(this.visibleFailedSessionMessages(), (message: FailedSessionMessage) => {
-                this.FailedSessionMessageCard(message)
-              }, (message: FailedSessionMessage) => message.id)
+              Repeat<SessionTimelineRow>(this.sessionTimelineRows())
+                .each((row: RepeatItem<SessionTimelineRow>) => { this.SessionTimelineCard(row) })
+                .key((row: SessionTimelineRow): string => this.sessionTimelineRenderKey(row))
             }
             .width('100%')
             .onAreaChange((oldArea: Area, newArea: Area) => {
@@ -2257,6 +2435,7 @@ struct Index {
           this.SessionFloatingStatusPanel()
         }
 
+        this.SessionControlProgress()
         this.SessionPendingInteractions()
         this.SessionComposer()
       }
@@ -2267,29 +2446,33 @@ struct Index {
   }
 
   @Builder
+  SessionControlProgress() {
+    if (this.desktopLiveRestarting) {
+      Row({ space: 8 }) {
+        LoadingProgress().width(16).height(16).color(this.theme().accent)
+        Text(this.mobileControlMessage).fontSize(this.scaledFontSize(12))
+          .fontColor(this.theme().textSecondary).maxLines(2).layoutWeight(1)
+      }.width('100%').padding({ left: 16, right: 16, top: 6, bottom: 6 })
+    }
+  }
+
+  @Builder
   SessionPendingInteractions() {
-    if (this.visibleDesktopInteractions().length > 0 || this.pendingUserInput() !== null
-      || this.pendingApprovalId().length > 0 || this.desktopInteractionError.length > 0
-      || this.interactionSubmitError.length > 0) {
+    if (this.shouldShowPendingInteractionFooter()) {
       Scroll() {
         Column({ space: 8 }) {
-          if (this.desktopInteractionError.length > 0 || this.interactionSubmitError.length > 0) {
-            Text(this.interactionSubmitError || this.desktopInteractionError)
-              .fontSize(this.scaledFontSize(13)).fontColor(this.theme().danger).width('100%')
-            Button('刷新待处理请求').height(44).onClick(() => { void this.refreshDesktopInteractions(); })
+          if (this.pendingInteractionNotice().length > 0) {
+            Row({ space: 8 }) {
+              Text(this.pendingInteractionNotice())
+                .fontSize(this.scaledFontSize(13))
+                .fontColor(this.interactionSubmitError.length > 0 ? this.theme().danger : this.theme().textSecondary)
+                .layoutWeight(1).maxLines(2).textOverflow({ overflow: TextOverflow.Ellipsis })
+              Button('重试').height(32).fontSize(this.scaledFontSize(12))
+                .onClick(() => { void this.refreshDesktopInteractions(); })
+            }.width('100%')
           }
-          ForEach(this.visibleDesktopInteractions(), (request: BridgeDesktopInteraction) => {
-            SessionInteractionPanel({
-              request, darkMode: this.usesDarkTheme(), fontScaleMode: this.fontScaleMode,
-              answers: this.userInputAnswers,
-              busy: this.isInteractionBusy('desktop', request.threadId, request.id),
-              onAnswer: (interaction: BridgeDesktopInteraction, questionId: string, value: string) => {
-                this.setDesktopInteractionAnswer(interaction, questionId, value);
-              },
-              onRespond: (interaction: BridgeDesktopInteraction, decision: string) => {
-                void this.respondDesktopInteraction(interaction, decision);
-              }
-            })
+          ForEach(this.footerDesktopInteractions(), (request: BridgeDesktopInteraction) => {
+            this.SessionDesktopInteractionView(request)
           }, (request: BridgeDesktopInteraction) => JSON.stringify([request.threadId, request.id]))
           if (this.pendingApprovalId().length > 0) {
             Column({ space: 8 }) {
@@ -2311,7 +2494,8 @@ struct Index {
             this.UserInputForm()
           }
         }.width('100%')
-      }.width('100%').constraintSize({ maxHeight: this.isLandscapeSessionLayout() ? 190 : 300 })
+      }.width('100%').constraintSize({ maxHeight: this.hasKnownPendingInteractions()
+        ? (this.isLandscapeSessionLayout() ? 190 : 300) : 80 })
         .scrollBar(BarState.Auto).edgeEffect(EdgeEffect.Spring)
     }
   }
@@ -2344,182 +2528,158 @@ struct Index {
   }
 
   @Builder
-  OptimisticSessionMessageCard(message: OptimisticSessionMessage) {
+  SessionTimelineCard(row: RepeatItem<SessionTimelineRow>) {
+    Column() {
+      if (row.item.kind === 'entry' && row.item.entry !== undefined) {
+        this.SessionEntryCard({ entry: row.item.entry as CodexSessionEntry, rowKey: row.item.key })
+      } else if (row.item.kind === 'optimistic' && row.item.optimistic !== undefined) {
+        this.OptimisticSessionMessageCard({ message: row.item.optimistic as OptimisticSessionMessage })
+      } else if (row.item.kind === 'failed') {
+        ForEach(this.failedSessionMessages.filter((message: FailedSessionMessage) => message.id === row.item.failedId), (message: FailedSessionMessage) => {
+          this.FailedSessionMessageCard(message)
+        }, (message: FailedSessionMessage) => JSON.stringify(message))
+      }
+    }
+    .width('100%')
+    .onAppear(() => {
+      if (row.item.entry?.type === 'live_agent_streaming' && Date.now() - this.taskStreamRenderedAt >= 1000) {
+        this.taskStreamRenderedAt = Date.now();
+        this.log('info', this.sessionEventStream !== null ? 'session.stream.row_mounted' : 'task.stream.row_mounted', `clientAtMs=${Date.now()}; taskId=${this.currentTask?.id ?? ''}; sessionId=${this.selectedSession?.id ?? ''}; length=${row.item.entry.text.length}; autoFollow=${this.sessionAutoFollowBottom}`);
+      }
+    })
+    .onAreaChange((oldArea: Area, newArea: Area) => {
+      this.restoreHistoryScrollAnchor(`row:${row.item.key}`, oldArea, newArea);
+      if (row.item.entry !== undefined) this.restoreHistoryScrollAnchor(this.sessionEntryKey(row.item.entry as CodexSessionEntry), oldArea, newArea);
+    })
+  }
+
+  @Builder
+  OptimisticSessionMessageCard($$: OptimisticSessionMessageParams) {
+    if ($$.message.restoredFromOutbox === true) {
+      Column({ space: 0 }) {
+        this.SessionEntryCard({ entry: this.restoredOutboxEntry($$.message), rowKey: `local:${$$.message.id}` })
+        this.PendingMessageDeliveryFooter({ message: $$.message })
+      }.width('100%')
+    } else {
     Row() {
       Blank()
-
-      Column({ space: 5 }) {
-        if (message.images.length > 0) {
-          ForEach(message.images, (image: PendingSessionImage) => {
-            Row() {
-              Blank()
-              Image(image.uri)
-                .width(72)
-                .height(72)
-                .objectFit(ImageFit.Contain)
-                .backgroundColor('#00000000')
-                .borderRadius(8)
-                .onClick(() => {
-                  this.openImagePreview(image.uri, `optimistic:${message.id}:${image.id}`);
-                })
-            }
-            .width('100%')
-          }, (image: PendingSessionImage) => `${message.id}-${image.id}`)
-        }
-
-        if (message.text.trim().length > 0) {
-          Text(message.text)
-            .fontSize(this.scaledFontSize(12))
-            .fontColor(this.themeColor('#17202A'))
-            .width('100%')
-            .padding({ left: 12, right: 12, top: 9, bottom: 10 })
-            .backgroundColor(this.theme().surfaceMuted)
-
-            .borderRadius(14)
-            .copyOption(CopyOptions.LocalDevice)
-        }
-        ForEach(message.files, (file: OptimisticSessionFile) => {
-          Text(file.fileName)
-            .fontSize(this.scaledFontSize(12))
-            .fontColor(this.theme().textPrimary)
-            .width('100%')
-            .padding(10)
-            .backgroundColor(this.theme().surfaceMuted)
-            .borderRadius(10)
-        }, (file: OptimisticSessionFile) => `${message.id}-${file.id}`)
-        Row({ space: 5 }) {
-          LoadingProgress().width(10).height(10).color(this.theme().textTertiary)
-          Text('发送中…')
-            .fontSize(this.scaledFontSize(10))
-            .fontColor(this.theme().textTertiary)
+      Column({ space: 4 }) {
+        Column({ space: 8 }) {
+          ForEach($$.message.images, (image: PendingSessionImage) => {
+            Image(image.uri).width('100%').height(this.isLandscapeSessionLayout() ? 176 : 144)
+              .objectFit(ImageFit.Contain).borderRadius(10)
+              .onClick(() => { this.openImagePreview(image.uri, `optimistic:${$$.message.id}:${image.id}`); })
+          }, (image: PendingSessionImage) => `${$$.message.id}-${image.id}`)
+          if ($$.message.text.trim().length > 0) {
+            Text($$.message.text).fontFamily(CONVERSATION_FONT_FAMILY).fontSize(this.scaledFontSize(16)).lineHeight(this.scaledLineHeight(26))
+              .fontColor(this.theme().textPrimary).width('100%').copyOption(CopyOptions.LocalDevice)
+          }
+          ForEach($$.message.files, (file: OptimisticSessionFile) => {
+            Text(file.fileName).fontFamily(CONVERSATION_FONT_FAMILY).fontSize(this.scaledFontSize(13)).fontColor(this.theme().textSecondary)
+              .width('100%').padding({ top: 4, bottom: 4 })
+          }, (file: OptimisticSessionFile) => `${$$.message.id}-${file.id}`)
         }
         .width('100%')
-        .justifyContent(FlexAlign.End)
+        .padding({ left: 14, right: 14, top: 10, bottom: 10 })
+        .backgroundColor(this.theme().surfaceMuted)
+        .borderRadius(18)
+        this.PendingMessageDeliveryFooter({ message: $$.message })
+      }
+      .width($$.message.files.length > 0 || $$.message.images.length > 0 ? '78%' : this.userTextBubbleWidth($$.message.text))
+      .constraintSize({ maxWidth: '88%' })
+    }
+    .width('100%')
+    .padding({ top: 6, bottom: 12 })
+    }
+  }
+
+  @Builder
+  PendingMessageDeliveryFooter($$: OptimisticSessionMessageParams) {
+    Row({ space: 5 }) {
+      if ($$.message.state !== 'submitted') {
+        LoadingProgress().width(10).height(10).color(this.theme().textTertiary)
+      }
+      Text(outboxMessageLabel($$.message, this.outboxItems, this.currentTask))
+        .fontFamily(CONVERSATION_FONT_FAMILY).fontSize(this.scaledFontSize(12)).fontColor(this.theme().textTertiary)
+        .onClick(() => {
+          if ($$.message.taskId?.startsWith('outbox_') || this.outboxItems.some((item: BridgeOutboxItem) => item.submissionId === $$.message.submissionId)) {
+            this.openOutboxPanel('message_status');
+          }
+        })
+    }.width('100%').justifyContent(FlexAlign.End)
+  }
+
+  private restoredOutboxEntry(message: OptimisticSessionMessage): CodexSessionEntry {
+    return { timestamp: message.createdAt, type: 'outbox_user_message', role: 'user',
+      threadId: message.sessionId, text: message.submittedText ?? message.text };
+  }
+
+  @Builder
+  FailedSessionMessageCard(message: FailedSessionMessage) {
+    Row() {
+      Blank()
+      Column({ space: 4 }) {
+        Column({ space: 8 }) {
+          ForEach(message.images, (image: PendingSessionImage) => {
+            Image(image.uri).width('100%').height(this.isLandscapeSessionLayout() ? 176 : 144)
+              .objectFit(ImageFit.Contain).borderRadius(10)
+              .onClick(() => { this.openImagePreview(image.uri, `failed:${message.id}:${image.id}`); })
+          }, (image: PendingSessionImage) => `${message.id}-${image.id}`)
+          if (message.text.trim().length > 0) {
+            Text(message.text)
+              .fontFamily(CONVERSATION_FONT_FAMILY).fontSize(this.scaledFontSize(16)).lineHeight(this.scaledLineHeight(26))
+              .fontColor(this.theme().textPrimary).width('100%').copyOption(CopyOptions.LocalDevice)
+          }
+          ForEach(message.files, (file: PickedMobileFile) => {
+            Text(file.fileName).fontFamily(CONVERSATION_FONT_FAMILY).fontSize(this.scaledFontSize(13))
+              .fontColor(this.theme().textSecondary).width('100%')
+          }, (file: PickedMobileFile) => `${message.id}-${file.id}`)
+        }
+        .width('100%')
+        .padding({ left: 14, right: 14, top: 10, bottom: 10 })
+        .backgroundColor(this.theme().surfaceMuted)
+        .borderRadius(18)
+        Row({ space: 4 }) {
+          if (message.retrying) {
+            LoadingProgress().width(11).height(11).color(this.theme().textTertiary)
+          }
+          Text(this.failedSessionMessageStatusText(message))
+            .fontFamily(CONVERSATION_FONT_FAMILY).fontSize(this.scaledFontSize(12)).fontColor(this.theme().danger)
+            .layoutWeight(1).maxLines(2).textOverflow({ overflow: TextOverflow.Ellipsis })
+          Button('重试')
+            .fontFamily(CONVERSATION_FONT_FAMILY).fontSize(this.scaledFontSize(12)).fontColor(this.theme().accent)
+            .height(44).padding({ left: 8, right: 8 }).backgroundColor(Color.Transparent)
+            .enabled(this.canRetryFailedSessionMessage(message))
+            .onClick(() => { void this.retryFailedSessionMessage(message, 'manual'); })
+          Button('移除')
+            .fontFamily(CONVERSATION_FONT_FAMILY).fontSize(this.scaledFontSize(12)).fontColor(this.theme().textSecondary)
+            .height(44).padding({ left: 8, right: 8 }).backgroundColor(Color.Transparent)
+            .onClick(() => { this.cancelFailedSessionAutoRetry(message.id); })
+        }
+        .width('100%')
+        if (message.error.length > 0) {
+          Text(this.compactDisplayText(message.error, 90))
+            .fontFamily(CONVERSATION_FONT_FAMILY).fontSize(this.scaledFontSize(11)).fontColor(this.theme().textSecondary)
+            .width('100%').maxLines(2).textOverflow({ overflow: TextOverflow.Ellipsis })
+            .copyOption(CopyOptions.LocalDevice)
+        }
       }
       .width(message.files.length > 0 || message.images.length > 0 ? '78%' : this.userTextBubbleWidth(message.text))
       .constraintSize({ maxWidth: '88%' })
     }
     .width('100%')
-    .padding({ top: 3, bottom: 3 })
+    .padding({ top: 6, bottom: 12 })
   }
 
   @Builder
-  FailedSessionMessageCard(message: FailedSessionMessage) {
-    Row({ space: 8 }) {
-      Blank()
-
-      Button() {
-        if (message.retrying) {
-          LoadingProgress()
-            .width(16)
-            .height(16)
-            .color(this.theme().textOnAccent)
-        } else {
-          SymbolGlyph($r('sys.symbol.arrow_up'))
-            .fontSize(16)
-            .fontColor([this.theme().textOnAccent])
-        }
-      }
-        .width(32)
-        .height(32)
-        .backgroundColor(message.retrying ? this.themeColor('#8A95A3') : this.themeColor('#14853D'))
-        .borderRadius(16)
-        .enabled(this.canRetryFailedSessionMessage(message))
-        .onClick(() => {
-          void this.retryFailedSessionMessage(message, 'manual');
-        })
-
-      Row({ space: 6 }) {
-        Column({ space: 5 }) {
-          Row({ space: 6 }) {
-            Text(this.failedSessionMessageTimeText(message))
-              .fontSize(this.scaledFontSize(9))
-              .fontColor(this.themeColor('#B42318'))
-          }
-          .width('100%')
-          .justifyContent(FlexAlign.End)
-
-          if (message.images.length > 0) {
-            Row({ space: 6 }) {
-              Blank()
-              ForEach(message.images, (image: PendingSessionImage) => {
-                Image(image.uri)
-                  .width(54)
-                  .height(54)
-                  .objectFit(ImageFit.Cover)
-                  .backgroundColor(this.themeColor('#ECEFF3'))
-                  .borderRadius(8)
-                  .onClick(() => {
-                    this.openImagePreview(image.uri, `failed:${message.id}:${image.id}`);
-                  })
-              }, (image: PendingSessionImage) => `${message.id}-${image.id}`)
-            }
-            .width('100%')
-          }
-
-          if (message.text.trim().length > 0) {
-            Text(message.text)
-              .fontSize(this.scaledFontSize(12))
-              .fontColor(this.themeColor('#17202A'))
-              .fontWeight(FontWeight.Regular)
-              .width('100%')
-              .maxLines(8)
-              .textOverflow({ overflow: TextOverflow.Ellipsis })
-              .copyOption(CopyOptions.LocalDevice)
-          }
-
-          ForEach(message.files, (file: PickedMobileFile) => {
-            Text(file.fileName)
-              .fontSize(this.scaledFontSize(12))
-              .fontColor(this.theme().textPrimary)
-              .width('100%')
-          }, (file: PickedMobileFile) => `${message.id}-${file.id}`)
-          Text(this.failedSessionMessageStatusText(message))
-            .fontSize(this.scaledFontSize(10))
-            .fontColor(this.theme().danger)
-            .width('100%')
-            .textAlign(TextAlign.End)
-          Text(this.compactDisplayText(message.error, 90))
-            .fontSize(this.scaledFontSize(9))
-            .fontColor(this.themeColor('#B42318'))
-            .width('100%')
-            .maxLines(2)
-            .textOverflow({ overflow: TextOverflow.Ellipsis })
-            .copyOption(CopyOptions.LocalDevice)
-        }
-        .layoutWeight(1)
-        .padding({ left: 12, right: 12, top: 8, bottom: 9 })
-        .backgroundColor(this.themeColor('#FFF1F0'))
-        .border({ width: 1, color: this.themeColor('#FDA29B') })
-        .borderRadius(10)
-
-        Column({ space: 6 }) {
-          Button() {
-            SymbolGlyph($r('sys.symbol.xmark'))
-              .fontSize(14)
-              .fontColor([this.themeColor('#667085')])
-          }
-            .width(28)
-            .height(28)
-            .backgroundColor(this.themeColor('#FFFFFF'))
-            .border({ width: 1, color: this.themeColor('#DDE3EA') })
-            .borderRadius(14)
-            .enabled(true)
-            .onClick(() => {
-              this.cancelFailedSessionAutoRetry(message.id);
-            })
-        }
-        .justifyContent(FlexAlign.Center)
-      }
-      .width('78%')
-    }
-    .width('100%')
-    .padding({ top: 3, bottom: 3 })
-  }
-
-  @Builder
-  SessionEntryCard(entry: CodexSessionEntry) {
-    if (entry.type === 'live_activity') {
+  SessionEntryCard($$: SessionEntryCardParams) {
+    if (this.inlineDesktopInteractions($$.entry).length > 0) {
+      ForEach(this.inlineDesktopInteractions($$.entry), (request: BridgeDesktopInteraction) => {
+        this.SessionDesktopInteractionView(request)
+      }, (request: BridgeDesktopInteraction) => JSON.stringify([request.threadId, request.id]))
+    } else if (($$.entry.type === 'live_activity' || $$.entry.type === 'live_agent_status') && this.sessionActivityIsInHeader($$.entry)) {
+      Row().height(0)
+    } else if ($$.entry.type === 'live_activity') {
       Column({ space: 3 }) {
         Row({ space: 6 }) {
           LoadingProgress()
@@ -2527,8 +2687,8 @@ struct Index {
             .height(11)
             .color(this.themeColor('#1F6FEB'))
 
-          Text(this.sessionEntryDisplayText(entry))
-            .fontSize(this.scaledFontSize(10))
+          Text(this.sessionEntryDisplayText($$.entry))
+            .fontFamily(CONVERSATION_FONT_FAMILY).fontSize(this.scaledFontSize(10))
             .fontColor(this.themeColor('#52606D'))
             .fontWeight(FontWeight.Regular)
             .layoutWeight(1)
@@ -2539,68 +2699,60 @@ struct Index {
         .width('100%')
         .alignItems(VerticalAlign.Center)
       }
-      .width('88%')
-      .padding({ left: 12, right: 0, top: 0, bottom: 4 })
-    } else if (entry.type === 'live_agent_status') {
-      Column({ space: 5 }) {
-        Row({ space: 6 }) {
-          Text('Codex')
-            .fontSize(this.scaledFontSize(10))
-            .fontColor(this.themeColor('#8A95A3'))
-            .fontWeight(FontWeight.Regular)
-          Text(this.sessionEntryTimeText(entry))
-            .fontSize(this.scaledFontSize(9))
-            .fontColor(this.themeColor('#8A95A3'))
-          LoadingProgress()
-            .width(12)
-            .height(12)
-            .color(this.themeColor('#1F6FEB'))
-        }
-        .width('100%')
-
-        Text(this.sessionEntryDisplayText(entry))
-          .fontSize(this.scaledFontSize(11))
-          .fontColor(this.themeColor('#344054'))
-          .fontWeight(FontWeight.Regular)
-          .width('100%')
-          .maxLines(4)
+      .width('100%')
+      .padding({ left: 0, right: 0, top: 0, bottom: 4 })
+    } else if ($$.entry.type === 'live_agent_status') {
+      Row({ space: 8 }) {
+        Text('Codex')
+          .fontFamily(CONVERSATION_FONT_FAMILY).fontSize(this.scaledFontSize(12))
+          .fontColor(this.theme().textSecondary)
+        Text(this.sessionEntryTimeText($$.entry))
+          .fontFamily(CONVERSATION_FONT_FAMILY).fontSize(this.scaledFontSize(11))
+          .fontColor(this.theme().textTertiary)
+        Blank()
+        LoadingProgress().width(11).height(11).color(this.theme().accent)
+        Text(this.sessionEntryDisplayText($$.entry))
+          .fontFamily(CONVERSATION_FONT_FAMILY).fontSize(this.scaledFontSize(12))
+          .fontColor(this.theme().textSecondary)
+          .constraintSize({ maxWidth: '62%' })
+          .maxLines(2)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
-          .copyOption(CopyOptions.LocalDevice)
       }
-      .width('88%')
-      .padding({ left: 12, right: 0, top: 1, bottom: 5 })
-    } else if (entry.role === 'tool') {
-      this.SessionToolEntryView(entry)
-    } else if (entry.role === 'developer' || (entry.role === 'system' && entry.type === 'response_item')) {
-      this.SessionSystemNoticeView(entry)
-    } else if (this.isSessionMetaEntry(entry)) {
+      .width('100%')
+      .alignItems(VerticalAlign.Center)
+      .padding({ top: 8, bottom: 12 })
+    } else if ($$.entry.role === 'tool') {
+      this.SessionToolEntryView({ entry: $$.entry })
+    } else if ($$.entry.role === 'developer' || ($$.entry.role === 'system' && $$.entry.type === 'response_item')) {
+      this.SessionSystemNoticeView({ entry: $$.entry })
+    } else if (this.isSessionMetaEntry($$.entry)) {
       Column({ space: 1 }) {
         Row({ space: 7 }) {
-          if (this.isActiveSessionMetaEntry(entry)) {
+          if (this.isActiveSessionMetaEntry($$.entry)) {
             LoadingProgress()
               .width(11)
               .height(11)
               .color(this.themeColor('#8A949F'))
           } else {
-            Text(this.sessionMetaEntryMark(entry))
-              .fontSize(this.scaledFontSize(10))
-              .fontColor(this.sessionMetaEntryColor(entry))
+            Text(this.sessionMetaEntryMark($$.entry))
+              .fontFamily(CONVERSATION_FONT_FAMILY).fontSize(this.scaledFontSize(10))
+              .fontColor(this.sessionMetaEntryColor($$.entry))
               .width(14)
               .textAlign(TextAlign.Center)
           }
 
-          Text(this.sessionMetaEntrySummaryText(entry))
-            .fontSize(this.scaledFontSize(9))
-            .fontColor(this.sessionMetaEntryColor(entry))
+          Text(this.sessionMetaEntrySummaryText($$.entry))
+            .fontFamily(CONVERSATION_FONT_FAMILY).fontSize(this.scaledFontSize(9))
+            .fontColor(this.sessionMetaEntryColor($$.entry))
             .fontWeight(FontWeight.Regular)
             .layoutWeight(1)
             .maxLines(2)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
             .copyOption(CopyOptions.LocalDevice)
 
-          if (this.hasExpandableSessionMetaEntry(entry)) {
-            Text(this.isSessionEntryExpanded(entry) ? '⌃' : '⌄')
-              .fontSize(this.scaledFontSize(10))
+          if (this.hasExpandableSessionMetaEntry($$.entry)) {
+            Text(this.isSessionEntryExpanded($$.entry) ? '⌃' : '⌄')
+              .fontFamily(CONVERSATION_FONT_FAMILY).fontSize(this.scaledFontSize(10))
               .fontColor(this.themeColor('#8A949F'))
               .width(14)
               .textAlign(TextAlign.Center)
@@ -2609,9 +2761,9 @@ struct Index {
         .width('100%')
         .alignItems(VerticalAlign.Center)
 
-        if (this.isSessionEntryExpanded(entry) && this.sessionMetaEntryDetailText(entry).length > 0) {
-          Text(this.sessionMetaEntryDetailText(entry))
-            .fontSize(this.scaledFontSize(8))
+        if (this.isSessionEntryExpanded($$.entry) && this.sessionMetaEntryDetailText($$.entry).length > 0) {
+          Text(this.sessionMetaEntryDetailText($$.entry))
+            .fontFamily(CONVERSATION_FONT_FAMILY).fontSize(this.scaledFontSize(8))
             .fontColor(this.themeColor('#667085'))
             .lineHeight(this.scaledLineHeight(12))
             .padding({ left: 21, right: 2, top: 1 })
@@ -2619,105 +2771,79 @@ struct Index {
             .copyOption(CopyOptions.LocalDevice)
         }
       }
-      .width('88%')
-      .padding({ left: 12, right: 0, top: 0, bottom: 0 })
+      .width('100%')
+      .padding({ left: 0, right: 0, top: 0, bottom: 0 })
       .onClick(() => {
-        if (this.hasExpandableSessionMetaEntry(entry)) {
-          this.toggleSessionEntry(entry);
+        if (this.hasExpandableSessionMetaEntry($$.entry)) {
+          this.toggleSessionEntry($$.entry);
         }
       })
-    } else if (entry.role === 'user') {
+    } else if ($$.entry.role === 'user' && this.sessionHeartbeatRequest($$.entry) !== null) {
+      this.SessionHeartbeatRequestView($$.entry, this.sessionHeartbeatRequest($$.entry) as SessionHeartbeat, $$.rowKey)
+    } else if ($$.entry.role === 'user') {
       Row() {
         Blank()
-        Column({ space: 5 }) {
-          if (this.sessionEntryImages(entry).length > 0) {
-            ForEach(this.sessionEntryImages(entry), (imageUrl: string) => {
-              Row() {
-                Blank()
-                Image(imageUrl)
-                  .width(this.userImageEntryWidth(entry))
-                  .height(this.userImageEntryHeight(entry))
-                  .objectFit(ImageFit.Contain)
-                  .backgroundColor('#00000000')
-                  .borderRadius(8)
-                  .onClick(() => {
-                    this.openImagePreview(imageUrl, 'user_entry');
-                  })
+        Column({ space: 4 }) {
+          Column({ space: 8 }) {
+            ForEach(this.sessionEntryImages($$.entry), (imageUrl: string) => {
+              Image(imageUrl)
+                .width(this.userImageEntryWidth($$.entry))
+                .height(this.userImageEntryHeight($$.entry))
+                .objectFit(ImageFit.Contain)
+                .backgroundColor('#00000000')
+                .borderRadius(10)
+                .onClick(() => { this.openImagePreview(imageUrl, 'user_entry'); })
+              if (this.sessionContentActionsVisible($$.entry)) {
+                Row() { Blank(); this.SessionContentActionRow($$.entry, imageUrl) }.width('100%')
               }
-              .width('100%')
-              Row() {
-                Blank()
-                this.SessionContentActionRow(entry, imageUrl)
-              }
-              .width('100%')
             }, (imageUrl: string) => imageUrl)
-          }
-
-          if (this.shouldRenderUserTextBubble(entry)) {
-            Column({ space: 4 }) {
-              this.SessionMarkdownContent(entry, true)
-              if (this.isSessionEntryFoldCandidate(entry)) {
-                this.SessionEntryFoldToggleView(entry)
-              }
+            if (parseSessionUserReplies($$.entry.text).length > 0) {
+              ForEach(parseSessionUserReplies($$.entry.text), (reply: SessionUserReply, index: number) => {
+                this.SessionUserReplyContent($$.entry, reply, index)
+              }, (reply: SessionUserReply, index: number) => `${index}:${reply.questionItemId}`)
+            } else if (this.shouldRenderUserTextBubble($$.entry)) {
+              this.SessionMarkdownContent({ entry: $$.entry, isUser: true, rowKey: $$.rowKey })
+              if (this.isSessionEntryFoldCandidate($$.entry)) this.SessionEntryFoldToggleView($$.entry)
             }
-            .width('100%')
-            .padding({ left: 12, right: 12, top: 9, bottom: 10 })
-            .backgroundColor(this.theme().surfaceMuted)
-            .borderRadius(14)
-            Row() {
-              Blank()
-              this.SessionContentActionRow(entry, '')
-            }
-            .width('100%')
           }
-          if (entry.type === 'live_user_message') {
+          .width('100%')
+          .padding({ left: 14, right: 14, top: 10, bottom: 10 })
+          .backgroundColor(this.theme().surfaceMuted)
+          .borderRadius(18)
+          .gesture(LongPressGesture().onAction(() => { this.toggleSessionContentActions($$.entry); }))
+          if (this.sessionContentActionsVisible($$.entry) && this.shouldRenderUserTextBubble($$.entry)) {
+            Row() { Blank(); this.SessionContentActionRow($$.entry, '') }.width('100%')
+          }
+          if ($$.entry.type === 'live_user_message') {
             Text(this.liveUserMessageStatus())
-              .fontSize(this.scaledFontSize(10))
+              .fontFamily(CONVERSATION_FONT_FAMILY).fontSize(this.scaledFontSize(12))
               .fontColor(this.theme().textTertiary)
-              .width('100%')
-              .textAlign(TextAlign.End)
+              .width('100%').textAlign(TextAlign.End)
           }
         }
-        .width(this.userSessionEntryWidth(entry))
+        .width(this.userSessionEntryWidth($$.entry))
         .constraintSize({ maxWidth: '88%' })
       }
       .width('100%')
+      .padding({ top: 6, bottom: 12 })
     } else {
       Column({ space: 5 }) {
-        if (this.sessionEntryShowAssistantHeader(entry)) {
-          Row({ space: 6 }) {
-            Row()
-              .width(6)
-              .height(6)
-              .backgroundColor(this.theme().accent)
-              .borderRadius(3)
-            Text(this.sessionAssistantEntryLabel(entry))
-              .fontSize(this.scaledFontSize(10))
-              .fontColor(this.themeColor('#8A95A3'))
+        if (this.sessionEntryShowAssistantHeader($$.entry)) {
+          Row({ space: 8 }) {
+            Text(this.sessionAssistantEntryLabel($$.entry))
+              .fontFamily(CONVERSATION_FONT_FAMILY).fontSize(this.scaledFontSize(12))
+              .fontColor(this.theme().textSecondary)
               .fontWeight(FontWeight.Regular)
-            Text(this.sessionEntryTimeText(entry))
-              .fontSize(this.scaledFontSize(9))
-              .fontColor(this.themeColor('#8A95A3'))
-            if (entry.type === 'live_agent_streaming') {
-              LoadingProgress()
-                .width(12)
-                .height(12)
-                .color(this.themeColor('#1F6FEB'))
-            }
+            Text(this.sessionEntryTimeText($$.entry))
+              .fontFamily(CONVERSATION_FONT_FAMILY).fontSize(this.scaledFontSize(11))
+              .fontColor(this.theme().textTertiary)
           }
           .width('100%')
-        } else if (entry.type === 'live_agent_streaming') {
-          Row({ space: 6 }) {
-            LoadingProgress()
-              .width(12)
-              .height(12)
-              .color(this.themeColor('#1F6FEB'))
-          }
-          .width('100%')
+          .alignItems(VerticalAlign.Center)
         }
 
-        if (this.sessionEntryImages(entry).length > 0) {
-          ForEach(this.sessionEntryImages(entry), (imageUrl: string) => {
+        if (this.sessionEntryImages($$.entry).length > 0) {
+          ForEach(this.sessionEntryImages($$.entry), (imageUrl: string) => {
             Row() {
               Image(imageUrl)
                 .width(this.assistantImageEntryWidth())
@@ -2731,9 +2857,9 @@ struct Index {
               Blank()
             }
             .width('100%')
-            if (this.isSessionLastAssistantEntry(entry)) {
+            if (this.shouldShowAssistantContentActions($$.entry)) {
               Row() {
-                this.SessionContentActionRow(entry, imageUrl)
+                this.SessionContentActionRow($$.entry, imageUrl)
                 Blank()
               }
               .width('100%')
@@ -2741,33 +2867,95 @@ struct Index {
           }, (imageUrl: string) => imageUrl)
         }
 
-        this.SessionMarkdownContent(entry, false)
-        if (this.isSessionEntryFoldCandidate(entry)) {
-          this.SessionEntryFoldToggleView(entry)
+        this.SessionMarkdownContent({ entry: $$.entry, isUser: false, rowKey: $$.rowKey })
+        if (this.sessionAssistantHeaderStatus($$.entry).length > 0) {
+          Row({ space: 6 }) {
+            LoadingProgress().width(10).height(10).color(this.theme().accent)
+            Text(this.sessionAssistantHeaderStatus($$.entry)).fontFamily(CONVERSATION_FONT_FAMILY).fontSize(this.scaledFontSize(11))
+              .fontColor(this.theme().textSecondary)
+          }.width('100%').padding({ top: 2, bottom: 2 })
         }
-        if (this.isSessionLastAssistantEntry(entry) && this.sessionEntryVisibleText(entry).length > 0) {
+        if (this.isSessionEntryFoldCandidate($$.entry)) {
+          this.SessionEntryFoldToggleView($$.entry)
+        }
+        if (this.shouldShowAssistantContentActions($$.entry) && this.sessionEntryVisibleText($$.entry).length > 0) {
           Row() {
-            this.SessionContentActionRow(entry, '')
+            this.SessionContentActionRow($$.entry, '')
             Blank()
           }
           .width('100%')
         }
       }
       .width('100%')
-      .padding({ left: 0, right: 0, top: 8, bottom: 12 })
+      .padding({ left: 0, right: 0, top: 4, bottom: 12 })
     }
   }
 
   @Builder
+  SessionHeartbeatRequestView(entry: CodexSessionEntry, heartbeat: SessionHeartbeat, rowKey: string) {
+    Row() {
+      Blank()
+      Column() {
+        SessionHeartbeatCard({
+          title: '自动任务', preview: heartbeat.preview, body: heartbeat.instructions,
+          metadata: [`触发时间：${heartbeat.currentTimeIso}`, `任务编号：${heartbeat.automationId}`],
+          expanded: this.isSessionHeartbeatExpanded(entry, 'request', rowKey),
+          darkMode: this.usesDarkTheme(), fontScaleMode: this.fontScaleMode,
+          onToggle: () => this.toggleSessionHeartbeat(entry, 'request', rowKey),
+          onCopy: () => { void this.copySessionPresentationText(heartbeat.instructions, '自动任务正文'); }
+        })
+      }.width('88%').constraintSize({ maxWidth: 620 })
+    }.width('100%').padding({ top: 6, bottom: 12 })
+  }
+
+  @Builder
+  SessionHeartbeatResultView(entry: CodexSessionEntry, block: SessionMarkdownBlock, heartbeat: SessionHeartbeatResult, rowKey: string) {
+    SessionHeartbeatCard({
+      title: '自动任务结果', preview: heartbeat.preview, body: heartbeat.message,
+      metadata: [`处理决定：${heartbeat.decision}`, `任务编号：${heartbeat.automationId}`],
+      expanded: this.isSessionHeartbeatExpanded(entry, block.id, rowKey),
+      darkMode: this.usesDarkTheme(), fontScaleMode: this.fontScaleMode,
+      onToggle: () => this.toggleSessionHeartbeat(entry, block.id, rowKey),
+      onCopy: () => { void this.copySessionPresentationText(heartbeat.message, '自动任务结果正文'); }
+    })
+  }
+
+  @Builder
+  SessionUserReplyContent(entry: CodexSessionEntry, reply: SessionUserReply, index: number) {
+    Column({ space: 4 }) {
+      Column({ space: 4 }) {
+        Row({ space: 6 }) {
+          Text('回复了一条确认询问')
+            .fontFamily(CONVERSATION_FONT_FAMILY).fontSize(this.scaledFontSize(12)).fontColor(this.theme().textSecondary).layoutWeight(1)
+          SymbolGlyph(this.sessionReplyQuestionExpanded(entry, index) ? $r('sys.symbol.chevron_up') : $r('sys.symbol.chevron_down'))
+            .fontSize(11).fontColor([this.theme().textSecondary])
+        }
+        .width('100%').constraintSize({ minHeight: 44 })
+        if (this.sessionReplyQuestionExpanded(entry, index)) {
+          Text(reply.question).fontFamily(CONVERSATION_FONT_FAMILY).fontSize(this.scaledFontSize(12)).lineHeight(this.scaledLineHeight(20))
+            .fontColor(this.theme().textSecondary).width('100%').copyOption(CopyOptions.LocalDevice)
+        }
+      }
+      .width('100%')
+      .padding({ left: 10 })
+      .border({ width: { left: 2 }, color: this.theme().border })
+      .onClick(() => { this.toggleSessionReplyQuestion(entry, index); })
+      Text(reply.answer).fontFamily(CONVERSATION_FONT_FAMILY).fontSize(this.scaledFontSize(16)).lineHeight(this.scaledLineHeight(26))
+        .fontColor(this.theme().textPrimary).width('100%').copyOption(CopyOptions.LocalDevice)
+    }
+    .width('100%')
+  }
+
+  @Builder
   SessionContentActionRow(entry: CodexSessionEntry, imageUrl: string) {
-    Row({ space: 4 }) {
+    Row({ space: 0 }) {
       Button() {
         Image($r('app.media.action_copy')).width(16).height(16).fillColor(this.theme().textSecondary)
       }
         .accessibilityText(imageUrl.length > 0 ? '复制图片' : '复制')
         .type(ButtonType.Normal)
-        .width(40).height(40)
-        .padding({ left: 8, right: 8 })
+        .width(32).height(36)
+        .padding(8)
         .fontColor(this.themeColor('#8A95A3'))
         .backgroundColor(Color.Transparent)
         .borderRadius(6)
@@ -2783,8 +2971,8 @@ struct Index {
       }
         .accessibilityText(imageUrl.length > 0 ? '分享图片' : '分享')
         .type(ButtonType.Normal)
-        .width(40).height(40)
-        .padding({ left: 8, right: 8 })
+        .width(32).height(36)
+        .padding(8)
         .fontColor(this.theme().accent)
         .backgroundColor(Color.Transparent)
         .borderRadius(6)
@@ -2803,9 +2991,9 @@ struct Index {
     Row({ space: 4 }) {
       Button(this.isSessionEntryFolded(entry) ? `展开全文（${this.sessionEntryFoldLength(entry)} 字）` : '收起')
         .type(ButtonType.Normal)
-        .height(24)
+        .constraintSize({ minHeight: 32 })
         .padding({ left: 0, right: 6 })
-        .fontSize(this.scaledFontSize(9))
+        .fontFamily(CONVERSATION_FONT_FAMILY).fontSize(this.scaledFontSize(13))
         .fontColor(this.themeColor('#1F6FEB'))
         .backgroundColor(Color.Transparent)
         .onClick(() => {
@@ -2816,32 +3004,32 @@ struct Index {
   }
 
   @Builder
-  SessionSystemNoticeView(entry: CodexSessionEntry) {
+  SessionSystemNoticeView($$: SessionEntryViewParams) {
     Column({ space: 3 }) {
       Row({ space: 6 }) {
         Text('系统')
-          .fontSize(this.scaledFontSize(9))
+          .fontFamily(CONVERSATION_FONT_FAMILY).fontSize(this.scaledFontSize(9))
           .fontColor(this.themeColor('#8A95A3'))
           .fontWeight(FontWeight.Medium)
-        Text(this.sessionEntryTimeText(entry))
-          .fontSize(this.scaledFontSize(8))
+        Text(this.sessionEntryTimeText($$.entry))
+          .fontFamily(CONVERSATION_FONT_FAMILY).fontSize(this.scaledFontSize(8))
           .fontColor(this.themeColor('#A0A8B2'))
       }
       .width('100%')
       .alignItems(VerticalAlign.Center)
 
       Column({ space: 3 }) {
-        Text(this.isSessionEntryFolded(entry)
-          ? this.sessionEntryFoldPreviewText(entry)
-          : this.sessionEntryVisibleText(entry))
-          .fontSize(this.scaledFontSize(10))
+        Text(this.isSessionEntryFolded($$.entry)
+          ? this.sessionEntryFoldPreviewText($$.entry)
+          : this.sessionEntryVisibleText($$.entry))
+          .fontFamily(CONVERSATION_FONT_FAMILY).fontSize(this.scaledFontSize(10))
           .fontColor(this.themeColor('#475467'))
           .fontStyle(FontStyle.Italic)
           .lineHeight(this.scaledLineHeight(15))
           .width('100%')
           .copyOption(CopyOptions.LocalDevice)
-        if (this.isSessionEntryFoldCandidate(entry)) {
-          this.SessionEntryFoldToggleView(entry)
+        if (this.isSessionEntryFoldCandidate($$.entry)) {
+          this.SessionEntryFoldToggleView($$.entry)
         }
       }
       .width('100%')
@@ -2854,79 +3042,82 @@ struct Index {
   }
 
   @Builder
-  SessionAgentEventItemView(entry: CodexSessionEntry, item: SessionToolPresentationItem) {
+  SessionAgentEventItemView($$: SessionAgentItemParams) {
     Column({ space: 2 }) {
       Row({ space: 6 }) {
-        if (item.status === 'running') {
-          LoadingProgress()
-            .width(12)
-            .height(12)
-            .color(this.sessionAgentStatusColor(item.status))
-        } else {
-          Row()
-            .width(8)
-            .height(8)
-            .backgroundColor(this.sessionAgentStatusColor(item.status))
-            .borderRadius(4)
-        }
+        this.SessionAgentAvatar(this.sessionAgentItemName($$.toolItem))
 
-        Text(this.sessionAgentVerbLabel(item))
-          .fontSize(this.scaledFontSize(9))
-          .fontColor(this.sessionAgentStatusColor(item.status))
-          .fontWeight(FontWeight.Medium)
-          .lineHeight(this.scaledLineHeight(13))
+        Text(this.sessionAgentVerbLabel($$.toolItem))
+          .fontFamily(CONVERSATION_FONT_FAMILY).fontSize(this.scaledFontSize(15))
+          .fontColor(this.sessionAgentStatusColor(this.sessionAgentDisplayStatus($$.toolItem)))
+          .fontWeight(FontWeight.Regular)
+          .lineHeight(this.scaledLineHeight(22.5))
 
-        Text(this.sessionAgentItemTaskName(item))
-          .fontSize(this.scaledFontSize(9))
+        Text(this.sessionAgentItemName($$.toolItem))
+          .fontFamily(CONVERSATION_FONT_FAMILY).fontSize(this.scaledFontSize(15))
           .fontColor(this.themeColor('#475467'))
-          .lineHeight(this.scaledLineHeight(13))
+          .lineHeight(this.scaledLineHeight(22.5))
           .layoutWeight(1)
           .maxLines(1)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
-          .copyOption(CopyOptions.LocalDevice)
 
-        Text(this.sessionAgentStatusText(item.status))
-          .fontSize(this.scaledFontSize(8))
-          .fontColor(this.sessionAgentStatusColor(item.status))
-          .lineHeight(this.scaledLineHeight(12))
+        Text(this.sessionAgentStatusText(this.sessionAgentDisplayStatus($$.toolItem)))
+          .fontFamily(CONVERSATION_FONT_FAMILY).fontSize(this.scaledFontSize(15))
+          .fontColor(this.sessionAgentStatusColor(this.sessionAgentDisplayStatus($$.toolItem)))
+          .lineHeight(this.scaledLineHeight(22.5))
 
-        if (this.hasSessionAgentItemDetail(item)) {
-          Text(this.isSessionToolItemExpanded(entry, item) ? '⌃' : '⌄')
-            .fontSize(this.scaledFontSize(10))
+        if (this.hasSessionAgentItemDetail($$.toolItem)) {
+          Text(this.isSessionToolItemExpanded($$.entry, $$.toolItem) ? '⌃' : '⌄')
+            .fontFamily(CONVERSATION_FONT_FAMILY).fontSize(this.scaledFontSize(15))
             .fontColor(this.themeColor('#8A949F'))
             .width(14)
             .textAlign(TextAlign.Center)
         }
       }
       .width('100%')
-      .height(28)
+      .constraintSize({ minHeight: 36 })
       .alignItems(VerticalAlign.Center)
       .onClick(() => {
-        if (this.hasSessionAgentItemDetail(item)) {
-          this.toggleSessionToolItem(entry, item);
+        if (this.hasSessionAgentItemDetail($$.toolItem)) {
+          this.toggleSessionToolItem($$.entry, $$.toolItem);
         }
       })
 
-      if (this.hasSessionAgentItemDetail(item) && this.isSessionToolItemExpanded(entry, item)) {
-        this.SessionAgentEventDetailView(item)
+      if (this.hasSessionAgentItemDetail($$.toolItem) && this.isSessionToolItemExpanded($$.entry, $$.toolItem)) {
+        this.SessionAgentEventDetailView({ toolItem: $$.toolItem })
       }
     }
     .width('100%')
   }
 
   @Builder
-  SessionAgentEventDetailView(item: SessionToolPresentationItem) {
+  SessionAgentAvatar(name: string) {
+    Text(this.sessionAgentAvatarText(name))
+      .fontFamily(CONVERSATION_FONT_FAMILY).fontSize(this.scaledFontSize(11)).fontWeight(FontWeight.Medium)
+      .fontColor(this.theme().textPrimary).textAlign(TextAlign.Center)
+      .width(24).height(24).borderRadius(12)
+      .backgroundColor(this.theme().accentSurface)
+      .accessibilityText(`协作者 ${name}`)
+  }
+
+  @Builder
+  SessionAgentEventDetailView($$: SessionAgentDetailParams) {
     Column({ space: 6 }) {
-      if (String(item.args ?? '').trim().length > 0) {
+      if (($$.toolItem.model ?? '').length > 0) {
+        Text([$$.toolItem.model ?? '', $$.toolItem.reasoningEffort ?? ''].filter((value: string) => value.length > 0).join(' · '))
+          .fontFamily(CONVERSATION_FONT_FAMILY).fontSize(this.scaledFontSize(15)).fontColor(this.theme().textSecondary)
+          .copyOption(CopyOptions.LocalDevice)
+      }
+      if (this.sessionAgentInstructionText($$.toolItem).length > 0) {
         Column({ space: 3 }) {
           Text('委派指令')
-            .fontSize(this.scaledFontSize(8))
+            .fontFamily(CONVERSATION_FONT_FAMILY).fontSize(this.scaledFontSize(15))
             .fontColor(this.themeColor('#8A95A3'))
-            .fontWeight(FontWeight.Medium)
-          Text(item.args ?? '')
-            .fontSize(this.scaledFontSize(8))
+            .fontWeight(FontWeight.Regular)
+          Text(this.sessionAgentInstructionText($$.toolItem))
+            .fontFamily(CONVERSATION_FONT_FAMILY).fontSize(this.scaledFontSize(15))
             .fontColor(this.themeColor('#344054'))
-            .lineHeight(this.scaledLineHeight(12))
+            .lineHeight(this.scaledLineHeight(22.5))
             .width('100%')
             .copyOption(CopyOptions.LocalDevice)
         }
@@ -2934,35 +3125,34 @@ struct Index {
         .alignItems(HorizontalAlign.Start)
       }
 
-      ForEach(item.agents ?? [], (agent: CodexSessionAgentRef) => {
+      if ($$.toolItem.rawType === 'collabAgentToolCall' && ($$.toolItem.agents?.length ?? 0) > 0) {
+        Text('子代理状态（本次调用时）').fontFamily(CONVERSATION_FONT_FAMILY).fontSize(this.scaledFontSize(15)).fontColor(this.theme().textSecondary)
+      }
+      ForEach($$.toolItem.agents ?? [], (agent: CodexSessionAgentRef) => {
         Column({ space: 3 }) {
           Row({ space: 6 }) {
-            Row()
-              .width(6)
-              .height(6)
-              .backgroundColor(this.sessionAgentStatusColor(agent.status))
-              .borderRadius(3)
-            Text(agent.name)
-              .fontSize(this.scaledFontSize(9))
+            this.SessionAgentAvatar(agent.displayName ?? agent.name)
+            Text(agent.displayName ?? agent.name)
+              .fontFamily(CONVERSATION_FONT_FAMILY).fontSize(this.scaledFontSize(15))
               .fontColor(this.themeColor('#344054'))
-              .fontWeight(FontWeight.Medium)
-              .lineHeight(this.scaledLineHeight(13))
+              .fontWeight(FontWeight.Regular)
+              .lineHeight(this.scaledLineHeight(22.5))
               .maxLines(1)
               .textOverflow({ overflow: TextOverflow.Ellipsis })
             Blank()
             Text(this.sessionAgentStatusText(agent.status))
-              .fontSize(this.scaledFontSize(8))
+              .fontFamily(CONVERSATION_FONT_FAMILY).fontSize(this.scaledFontSize(15))
               .fontColor(this.sessionAgentStatusColor(agent.status))
-              .lineHeight(this.scaledLineHeight(12))
+              .lineHeight(this.scaledLineHeight(22.5))
           }
           .width('100%')
           .alignItems(VerticalAlign.Center)
 
           if (String(agent.report ?? '').trim().length > 0) {
             Text(agent.report ?? '')
-              .fontSize(this.scaledFontSize(8))
+              .fontFamily(CONVERSATION_FONT_FAMILY).fontSize(this.scaledFontSize(15))
               .fontColor(this.themeColor('#475467'))
-              .lineHeight(this.scaledLineHeight(12))
+              .lineHeight(this.scaledLineHeight(22.5))
               .width('100%')
               .maxLines(60)
               .textOverflow({ overflow: TextOverflow.Ellipsis })
@@ -2971,49 +3161,46 @@ struct Index {
         }
         .width('100%')
         .alignItems(HorizontalAlign.Start)
-      }, (agent: CodexSessionAgentRef, index: number) => `${index}-${agent.name}`)
+      }, (agent: CodexSessionAgentRef, index: number): string => JSON.stringify([index, agent]))
     }
     .width('100%')
-    .padding({ left: 10, right: 8, top: 6, bottom: 8 })
-    .backgroundColor(this.themeColor('#F2F7FF'))
+    .padding(8)
+    .backgroundColor(this.theme().surfaceSubtle)
     .borderRadius(7)
   }
 
   @Builder
-  SessionToolEntryView(entry: CodexSessionEntry) {
+  SessionToolEntryView($$: SessionEntryViewParams) {
     Column({ space: 1 }) {
-      if (this.isSessionToolGroup(entry)) {
+      if (this.isSessionToolGroup($$.entry)) {
         Row({ space: 8 }) {
-          if (this.sessionToolGroupIsRunning(entry)) {
+          if (this.sessionToolGroupIsRunning($$.entry)) {
             LoadingProgress()
               .width(11)
               .height(11)
-              .color(this.sessionToolGroupColor(entry))
+              .color(this.sessionToolGroupColor($$.entry))
           } else {
-            Text('●')
-              .fontSize(this.scaledFontSize(7))
-              .fontColor(this.sessionToolGroupColor(entry))
-              .width(11)
-              .textAlign(TextAlign.Center)
+            Image($r('app.media.conversation_terminal'))
+              .width(14).height(14).fillColor(this.theme().textTertiary)
           }
 
-          Text(this.sessionToolGroupTitle(entry))
-            .fontSize(this.scaledFontSize(9))
+          Text(this.sessionToolGroupTitle($$.entry))
+            .fontFamily(CONVERSATION_FONT_FAMILY).fontSize(this.scaledFontSize(15))
             .fontColor(this.themeColor('#667085'))
-            .fontWeight(FontWeight.Medium)
-            .lineHeight(this.scaledLineHeight(13))
+            .fontWeight(FontWeight.Regular)
+            .lineHeight(this.scaledLineHeight(22.5))
             .layoutWeight(1)
 
-          if (this.sessionToolGroupIsCollapsible(entry)) {
-            Button(this.isSessionToolGroupExpanded(entry) ? '收起' : '全部展开')
+          if (this.sessionToolGroupIsCollapsible($$.entry)) {
+            Button(this.isSessionToolGroupExpanded($$.entry) ? '收起' : '全部展开')
               .type(ButtonType.Normal)
-              .height(24)
-              .fontSize(this.scaledFontSize(8))
+              .height(32)
+              .fontFamily(CONVERSATION_FONT_FAMILY).fontSize(this.scaledFontSize(15))
               .fontColor(this.themeColor('#667085'))
               .backgroundColor(Color.Transparent)
               .padding({ left: 4, right: 4 })
               .onClick(() => {
-                this.toggleSessionToolGroup(entry);
+                this.toggleSessionToolGroup($$.entry);
               })
           }
         }
@@ -3021,135 +3208,160 @@ struct Index {
         .alignItems(VerticalAlign.Center)
       }
 
-      if (this.shouldShowSessionToolGroupItems(entry)) {
-        ForEach(sessionToolPresentationItems(entry), (item: SessionToolPresentationItem) => {
+      if (this.shouldShowSessionToolGroupItems($$.entry)) {
+        ForEach(sessionToolPresentationItems($$.entry), (toolItem: SessionToolPresentationItem) => {
           Column({ space: 2 }) {
-            if (this.isSessionAgentToolItem(item)) {
-              this.SessionAgentEventItemView(entry, item)
+            if (this.isSessionAgentToolItem(toolItem)) {
+              this.SessionAgentEventItemView({ entry: $$.entry, toolItem: toolItem })
             } else {
               Row({ space: 5 }) {
-                if (item.status === 'running') {
+                if (toolItem.status === 'running') {
                   LoadingProgress()
                     .width(12)
                     .height(12)
                     .color(this.themeColor('#8A949F'))
                 } else {
-                  Text(this.sessionToolItemMark(item))
-                    .fontSize(this.scaledFontSize(10))
-                    .fontColor(this.sessionToolItemColor(item))
-                    .width(14)
-                    .textAlign(TextAlign.Center)
+                  Image($r('app.media.conversation_terminal'))
+                    .width(14).height(14).fillColor(this.theme().textTertiary)
                 }
 
-                Text(this.sessionToolVerbLabel(item))
-                  .fontSize(this.scaledFontSize(9))
-                  .fontColor(this.sessionToolItemColor(item))
-                  .fontWeight(FontWeight.Medium)
-                  .lineHeight(this.scaledLineHeight(13))
+                Text(this.sessionToolVerbLabel(toolItem))
+                  .fontFamily(CONVERSATION_FONT_FAMILY).fontSize(this.scaledFontSize(15))
+                  .fontColor(this.theme().textSecondary)
+                  .fontWeight(FontWeight.Regular)
+                  .lineHeight(this.scaledLineHeight(22.5))
 
-                Text(item.target)
-                  .fontSize(this.scaledFontSize(9))
-                  .fontColor(this.themeColor('#667085'))
-                  .fontFamily('monospace')
-                  .lineHeight(this.scaledLineHeight(13))
+                Text(toolItem.target)
+                  .fontSize(this.scaledFontSize(15))
+                  .fontColor(this.theme().textSecondary)
+                  .fontFamily(toolItem.name === 'commandExecution' ? CONVERSATION_MONOSPACE_FONT_FAMILY : CONVERSATION_FONT_FAMILY)
+                  .lineHeight(this.scaledLineHeight(22.5))
                   .layoutWeight(1)
                   .maxLines(1)
                   .textOverflow({ overflow: TextOverflow.Ellipsis })
-                  .copyOption(CopyOptions.LocalDevice)
 
-                Text(this.sessionToolItemStatusText(item))
-                  .fontSize(this.scaledFontSize(8))
-                  .fontColor(this.sessionToolItemColor(item))
-                  .lineHeight(this.scaledLineHeight(12))
+                if (toolItem.status === 'failed' || toolItem.status === 'stopped' || (toolItem.retryCount ?? 0) > 0) {
+                  Text(this.sessionToolItemStatusText(toolItem))
+                    .fontFamily(CONVERSATION_FONT_FAMILY).fontSize(this.scaledFontSize(13))
+                    .fontColor(this.sessionToolItemColor(toolItem))
+                    .lineHeight(this.scaledLineHeight(22.5))
+                }
 
-                if (this.hasExpandableSessionToolItem(item)) {
-                  Text(this.isSessionToolItemExpanded(entry, item) ? '⌃' : '⌄')
-                    .fontSize(this.scaledFontSize(10))
-                    .fontColor(this.themeColor('#8A949F'))
-                    .width(14)
-                    .textAlign(TextAlign.Center)
+                if (this.hasExpandableSessionToolItem(toolItem)) {
+                  SymbolGlyph(this.isSessionToolItemExpanded($$.entry, toolItem) ? $r('sys.symbol.chevron_up') : $r('sys.symbol.chevron_down'))
+                    .fontSize(11).fontColor([this.theme().textTertiary])
                 }
               }
               .width('100%')
-              .height(24)
+              .constraintSize({ minHeight: 32 })
               .alignItems(VerticalAlign.Center)
               .onClick(() => {
-                if (this.hasExpandableSessionToolItem(item)) {
-                  this.toggleSessionToolItem(entry, item);
+                if (this.hasExpandableSessionToolItem(toolItem)) {
+                  this.toggleSessionToolItem($$.entry, toolItem);
                 }
               })
 
-              if (this.isSessionToolItemExpanded(entry, item)) {
+              if (this.isSessionToolItemExpanded($$.entry, toolItem)) {
                 Column({ space: 5 }) {
-                  Text(item.target)
-                    .fontSize(this.scaledFontSize(8))
-                    .fontColor(this.themeColor('#475467'))
-                    .fontFamily('monospace')
-                    .lineHeight(this.scaledLineHeight(12))
-                    .width('100%')
-                    .copyOption(CopyOptions.LocalDevice)
-
-                  if (item.detail.length > 0) {
-                    Text(item.detail)
-                      .fontSize(this.scaledFontSize(8))
-                      .fontColor(this.themeColor('#667085'))
-                      .lineHeight(this.scaledLineHeight(12))
+                  if (toolItem.name === 'commandExecution') {
+                    Text('Shell').fontFamily(CONVERSATION_FONT_FAMILY).fontSize(this.scaledFontSize(15)).fontColor(this.theme().textSecondary).width('100%')
+                    Text(`$ ${toolItem.displayCommand || toolItem.args || toolItem.target}`)
+                      .fontSize(this.scaledFontSize(15)).lineHeight(this.scaledLineHeight(22.5)).fontFamily(CONVERSATION_MONOSPACE_FONT_FAMILY)
+                      .fontColor(this.theme().textSecondary).width('100%').copyOption(CopyOptions.LocalDevice)
+                  } else if ((toolItem.args ?? '').trim().length > 0) {
+                    Text(toolItem.args ?? '').fontSize(this.scaledFontSize(15)).lineHeight(this.scaledLineHeight(22.5)).fontFamily(CONVERSATION_MONOSPACE_FONT_FAMILY)
+                      .fontColor(this.theme().textSecondary).width('100%').copyOption(CopyOptions.LocalDevice)
+                  }
+                  if (toolItem.name !== 'commandExecution' && (toolItem.args ?? '').trim().length === 0) {
+                    Text(toolItem.target)
+                      .fontSize(this.scaledFontSize(15))
+                      .fontColor(this.themeColor('#475467'))
+                      .fontFamily(CONVERSATION_MONOSPACE_FONT_FAMILY)
+                      .lineHeight(this.scaledLineHeight(22.5))
                       .width('100%')
                       .copyOption(CopyOptions.LocalDevice)
                   }
 
-                  Button('复制')
-                    .type(ButtonType.Normal)
-                    .height(24)
-                    .fontSize(this.scaledFontSize(8))
-                    .fontColor(this.themeColor('#1F6FEB'))
-                    .backgroundColor(Color.Transparent)
-                    .padding({ left: 0, right: 6 })
-                    .onClick(() => {
-                      void this.copySessionPresentationText(item.target, '工具目标');
-                    })
+                  if (toolItem.detail.length > 0) {
+                    Text(toolItem.detail.trimEnd())
+                      .fontSize(this.scaledFontSize(15)).fontFamily(CONVERSATION_MONOSPACE_FONT_FAMILY)
+                      .fontColor(this.themeColor('#667085'))
+                      .lineHeight(this.scaledLineHeight(22.5))
+                      .width('100%')
+                      .copyOption(CopyOptions.LocalDevice)
+                  }
+
+                  Row({ space: 8 }) {
+                    Button() {
+                      Image($r('app.media.action_copy')).width(14).height(14).fillColor(this.theme().textSecondary)
+                    }
+                      .type(ButtonType.Normal).width(32).height(32)
+                      .backgroundColor(Color.Transparent).padding(0).accessibilityText('复制工具命令')
+                      .onClick(() => { void this.copySessionPresentationText(toolItem.args || toolItem.target, '工具命令'); })
+                    Blank()
+                    Text(toolItem.status === 'completed' ? '✓ 成功' : this.sessionToolItemStatusText(toolItem))
+                      .fontFamily(CONVERSATION_FONT_FAMILY).fontSize(this.scaledFontSize(13)).fontColor(this.sessionToolItemColor(toolItem))
+                  }.width('100%').alignItems(VerticalAlign.Center)
                 }
                 .width('100%')
-                .padding({ left: 21, right: 6, top: 2, bottom: 7 })
-                .backgroundColor(this.themeColor('#F8FAFC'))
+                .padding({ left: 8, right: 8, top: 8, bottom: 8 })
+                .backgroundColor(this.theme().surfaceMuted)
+                .border({ width: 1, color: this.theme().border })
                 .borderRadius(7)
               }
             }
           }
           .width('100%')
-          .border({ width: { top: 1 }, color: this.themeColor('#E4E7EC') })
-        }, (item: SessionToolPresentationItem) => this.sessionToolItemKey(entry, item))
+        }, (item: SessionToolPresentationItem): string => JSON.stringify([this.sessionToolItemKey($$.entry, item), item]))
       }
     }
-    .width('88%')
-    .padding({ left: 12, right: 0, top: 2, bottom: 3 })
+    .width('100%')
+    .alignItems(HorizontalAlign.Start)
+    .padding({ left: 0, right: 0, top: 2, bottom: 3 })
   }
 
   @Builder
-  SessionMarkdownContent(entry: CodexSessionEntry, isUser: boolean) {
-    Column({ space: 10 }) {
-      ForEach(this.sessionEntryMarkdownBlocks(entry), (block: SessionMarkdownBlock) => {
-        this.SessionMarkdownBlockView(entry, block, isUser)
-      }, (block: SessionMarkdownBlock) => block.id)
+  SessionMarkdownContent($$: SessionMarkdownContentParams) {
+    Column({ space: 8 }) {
+      ForEach(this.sessionEntryMarkdownBlocks($$.entry), (blockItem: SessionMarkdownBlock) => {
+          this.SessionMarkdownBlockView({ entry: $$.entry, blockItem: blockItem, isUser: $$.isUser, rowKey: $$.rowKey })
+        }, (block: SessionMarkdownBlock): string => JSON.stringify(block))
     }
     .width('100%')
   }
 
   @Builder
-  SessionMarkdownBlockView(entry: CodexSessionEntry, block: SessionMarkdownBlock, isUser: boolean) {
-    if (block.kind === 'heading') {
-      this.SessionMarkdownInlineText(
-        block.text,
-        isUser,
-        this.markdownHeadingFontSize(block.level, isUser),
-        this.markdownHeadingLineHeight(block.level, isUser),
-        true
-      )
-    } else if (block.kind === 'code') {
+  SessionMarkdownBlockView($$: SessionMarkdownBlockViewParams) {
+    if ($$.blockItem.kind === 'heading') {
+      this.SessionMarkdownInlineText({
+        text: $$.blockItem.text,
+        isUser: $$.isUser,
+        fontSize: this.markdownHeadingFontSize($$.blockItem.level, $$.isUser),
+        lineHeight: this.markdownHeadingLineHeight($$.blockItem.level, $$.isUser),
+        isHeading: true
+      })
+    } else if (this.isSessionMermaidBlock($$.blockItem)) {
+      if (this.shouldDeferSessionMermaid($$.entry)) {
+        Text('图表生成中…')
+          .fontFamily(CONVERSATION_FONT_FAMILY).fontSize(this.scaledFontSize(13))
+          .fontColor(this.theme().textSecondary)
+          .width('100%')
+          .padding(14)
+          .backgroundColor(this.theme().surfaceMuted)
+          .borderRadius(12)
+      } else {
+        MermaidDiagram({
+          source: $$.blockItem.text,
+          darkMode: this.usesDarkTheme(),
+          fontScaleMode: this.fontScaleMode,
+          landscape: this.isLandscapeSessionLayout()
+        })
+      }
+    } else if ($$.blockItem.kind === 'code') {
       Column({ space: 3 }) {
         Row({ space: 6 }) {
-          Text(block.language.length > 0 ? block.language : '代码')
-            .fontSize(this.scaledFontSize(8))
+          Text($$.blockItem.language.length > 0 ? $$.blockItem.language : '代码')
+            .fontFamily(CONVERSATION_FONT_FAMILY).fontSize(this.scaledFontSize(13))
             .fontColor(this.themeColor('#667085'))
             .fontWeight(FontWeight.Regular)
 
@@ -3157,32 +3369,32 @@ struct Index {
 
           Button('复制')
             .type(ButtonType.Normal)
-            .height(22)
-            .fontSize(this.scaledFontSize(8))
+            .constraintSize({ minHeight: 32 })
+            .fontFamily(CONVERSATION_FONT_FAMILY).fontSize(this.scaledFontSize(13))
             .fontColor(this.themeColor('#1F6FEB'))
             .backgroundColor(Color.Transparent)
             .padding({ left: 4, right: 4 })
             .onClick(() => {
-              void this.copySessionPresentationText(block.text, '代码');
+              void this.copySessionPresentationText($$.blockItem.text, '代码');
             })
         }
         .width('100%')
         .alignItems(VerticalAlign.Center)
 
-        Text(block.text)
-          .fontSize(this.scaledFontSize(13))
+        Text($$.blockItem.text)
+          .fontSize(this.scaledFontSize(15))
           .fontColor(this.themeColor('#101828'))
-          .fontFamily('monospace')
-          .lineHeight(this.scaledLineHeight(21))
+          .fontFamily(CONVERSATION_MONOSPACE_FONT_FAMILY)
+          .lineHeight(this.scaledLineHeight(22.5))
           .width('100%')
           .copyOption(CopyOptions.LocalDevice)
       }
       .width('100%')
       .padding({ left: 8, right: 8, top: 6, bottom: 6 })
-      .backgroundColor(isUser ? this.themeColor('#DDEEFF') : this.themeColor('#F2F4F7'))
-      .border({ width: 1, color: isUser ? this.themeColor('#C2DAF8') : this.themeColor('#E4E7EC') })
+      .backgroundColor($$.isUser ? this.themeColor('#DDEEFF') : this.themeColor('#F2F4F7'))
+      .border({ width: 1, color: $$.isUser ? this.themeColor('#C2DAF8') : this.themeColor('#E4E7EC') })
       .borderRadius(7)
-    } else if (block.kind === 'quote') {
+    } else if ($$.blockItem.kind === 'quote') {
       Row({ space: 7 }) {
         Column()
           .width(3)
@@ -3190,50 +3402,65 @@ struct Index {
           .backgroundColor(this.themeColor('#98A2B3'))
           .borderRadius(2)
         Column() {
-          this.SessionMarkdownInlineText(block.text, isUser, 14, 23, false)
+          this.SessionMarkdownInlineText({ text: $$.blockItem.text, isUser: $$.isUser, fontSize: 16, lineHeight: 26, isHeading: false })
         }
         .layoutWeight(1)
       }
       .width('100%')
       .padding({ top: 2, bottom: 2 })
-    } else if (block.kind === 'list') {
+    } else if ($$.blockItem.kind === 'list') {
       Row({ space: 6 }) {
-        Text(block.ordered ? `${block.level}.` : '•')
-          .fontSize(this.scaledFontSize(isUser ? 11 : 10))
-          .fontColor(isUser ? this.themeColor('#426384') : this.themeColor('#667085'))
-          .width(16)
-          .textAlign(TextAlign.Center)
+        Text($$.blockItem.ordered ? `${$$.blockItem.level}.` : '•')
+          .fontFamily(CONVERSATION_FONT_FAMILY).fontSize(this.scaledFontSize(16))
+          .fontColor($$.isUser ? this.themeColor('#426384') : this.themeColor('#667085'))
+          .lineHeight(this.scaledLineHeight(26))
+          .constraintSize({ minWidth: 16 })
+          .textAlign(TextAlign.End)
         Column() {
-          this.SessionMarkdownInlineText(block.text, isUser, 15, 25, false)
+          this.SessionMarkdownInlineText({ text: $$.blockItem.text, isUser: $$.isUser, fontSize: 16, lineHeight: 26, isHeading: false })
         }
         .layoutWeight(1)
       }
       .width('100%')
       .alignItems(VerticalAlign.Top)
-    } else if (block.kind === 'task') {
+    } else if ($$.blockItem.kind === 'task') {
       Row({ space: 6 }) {
-        Text(block.checked ? '☑' : '☐')
-          .fontSize(this.scaledFontSize(isUser ? 11 : 10))
-          .fontColor(block.checked ? this.themeColor('#1F6FEB') : this.themeColor('#8A95A3'))
-          .width(16)
-          .textAlign(TextAlign.Center)
+        Text($$.blockItem.checked ? '☑' : '☐')
+          .fontFamily(CONVERSATION_FONT_FAMILY).fontSize(this.scaledFontSize(16))
+          .fontColor($$.blockItem.checked ? this.themeColor('#1F6FEB') : this.themeColor('#8A95A3'))
+          .lineHeight(this.scaledLineHeight(26))
+          .constraintSize({ minWidth: 16 })
+          .textAlign(TextAlign.End)
         Column() {
-          this.SessionMarkdownInlineText(block.text, isUser, 15, 25, false)
+          this.SessionMarkdownInlineText({ text: $$.blockItem.text, isUser: $$.isUser, fontSize: 16, lineHeight: 26, isHeading: false })
         }
         .layoutWeight(1)
       }
       .width('100%')
       .alignItems(VerticalAlign.Top)
-    } else if (block.kind === 'table') {
-      this.SessionMarkdownTableView(block, isUser)
-    } else if (block.kind === 'codex_directive') {
-      this.CodexDirectiveBlockView(entry, block)
-    } else if (block.kind === 'directive') {
+    } else if ($$.blockItem.kind === 'table') {
+      this.SessionMarkdownTableView({ block: $$.blockItem, isUser: $$.isUser })
+    } else if ($$.blockItem.kind === 'codex_directive') {
+      this.CodexDirectiveBlockView($$.entry, $$.blockItem)
+    } else if ($$.blockItem.kind === 'directive' && $$.entry.role === 'assistant'
+      && parseSessionHeartbeatResult($$.blockItem.text) !== null) {
+      this.SessionHeartbeatResultView($$.entry, $$.blockItem, parseSessionHeartbeatResult($$.blockItem.text) as SessionHeartbeatResult, $$.rowKey)
+    } else if ($$.blockItem.kind === 'directive' && $$.blockItem.language === 'oai-mem-citation') {
+      Column({ space: 4 }) {
+        Row({ space: 6 }) {
+          Text('记忆引用').fontFamily(CONVERSATION_FONT_FAMILY).fontSize(this.scaledFontSize(11)).fontColor(this.theme().textSecondary).layoutWeight(1)
+          SymbolGlyph(this.isSessionMarkdownBlockExpanded($$.entry, $$.blockItem) ? $r('sys.symbol.chevron_up') : $r('sys.symbol.chevron_down'))
+            .fontSize(11).fontColor([this.theme().textSecondary])
+        }.width('100%').constraintSize({ minHeight: 32 })
+          .onClick(() => { this.toggleSessionMarkdownBlock($$.entry, $$.blockItem); })
+        if (this.isSessionMarkdownBlockExpanded($$.entry, $$.blockItem)) { this.MarkdownDirectiveDetailView($$.blockItem) }
+      }.width('100%')
+    } else if ($$.blockItem.kind === 'directive') {
       Column({ space: 4 }) {
         Row({ space: 6 }) {
           Column() {
             Text('<>')
-              .fontSize(this.scaledFontSize(9))
+              .fontFamily(CONVERSATION_FONT_FAMILY).fontSize(this.scaledFontSize(9))
               .fontColor(this.themeColor('#1F6FEB'))
               .fontWeight(FontWeight.Medium)
           }
@@ -3244,26 +3471,26 @@ struct Index {
           .backgroundColor(this.themeColor('#EAF4FF'))
           .borderRadius(8)
 
-          Text(this.markdownDirectiveTitle(block.language))
-            .fontSize(this.scaledFontSize(10))
+          Text(this.markdownDirectiveTitle($$.blockItem.language))
+            .fontFamily(CONVERSATION_FONT_FAMILY).fontSize(this.scaledFontSize(10))
             .fontColor(this.themeColor('#344054'))
             .fontWeight(FontWeight.Medium)
             .layoutWeight(1)
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
 
-          SymbolGlyph(this.isSessionMarkdownBlockExpanded(entry, block) ? $r('sys.symbol.chevron_up') : $r('sys.symbol.chevron_down'))
+          SymbolGlyph(this.isSessionMarkdownBlockExpanded($$.entry, $$.blockItem) ? $r('sys.symbol.chevron_up') : $r('sys.symbol.chevron_down'))
             .fontSize(14)
             .fontColor([this.themeColor('#667085')])
         }
         .width('100%')
         .alignItems(VerticalAlign.Center)
 
-        if (this.isSessionMarkdownBlockExpanded(entry, block)) {
-          this.MarkdownDirectiveDetailView(block)
+        if (this.isSessionMarkdownBlockExpanded($$.entry, $$.blockItem)) {
+          this.MarkdownDirectiveDetailView($$.blockItem)
         } else {
-          Text(this.markdownDirectiveSummary(block))
-            .fontSize(this.scaledFontSize(9))
+          Text(this.markdownDirectiveSummary($$.blockItem))
+            .fontFamily(CONVERSATION_FONT_FAMILY).fontSize(this.scaledFontSize(9))
             .fontColor(this.themeColor('#667085'))
             .lineHeight(this.scaledLineHeight(13))
             .width('100%')
@@ -3278,29 +3505,23 @@ struct Index {
       .border({ width: 1, color: this.themeColor('#E4E7EC') })
       .borderRadius(8)
       .onClick(() => {
-        this.toggleSessionMarkdownBlock(entry, block);
+        this.toggleSessionMarkdownBlock($$.entry, $$.blockItem);
       })
-    } else if (block.kind === 'rule') {
+    } else if ($$.blockItem.kind === 'rule') {
       Row()
         .height(1)
         .width('100%')
-        .backgroundColor(isUser ? this.themeColor('#CFE3FF') : this.themeColor('#E4E7EC'))
+        .backgroundColor($$.isUser ? this.themeColor('#CFE3FF') : this.themeColor('#E4E7EC'))
         .margin({ top: 3, bottom: 3 })
     } else {
-      this.SessionMarkdownInlineText(block.text, isUser, 15, 25, false)
+      this.SessionMarkdownInlineText({ text: $$.blockItem.text, isUser: $$.isUser, fontSize: 16, lineHeight: 26, isHeading: false })
     }
   }
 
   @Builder
-  SessionMarkdownInlineText(
-    text: string,
-    isUser: boolean,
-    fontSize: number,
-    lineHeight: number,
-    isHeading: boolean
-  ) {
+  SessionMarkdownInlineText($$: SessionMarkdownInlineTextParams) {
     Text() {
-      ForEach(parseSessionMarkdownInline(text), (segment: SessionMarkdownInlineSegment) => {
+      ForEach(parseSessionMarkdownInline($$.text), (segment: SessionMarkdownInlineSegment) => {
         if (segment.kind === 'strong') {
           Span(segment.text)
             .fontWeight(FontWeight.Bold)
@@ -3312,10 +3533,10 @@ struct Index {
             .decoration({ type: TextDecorationType.LineThrough })
         } else if (segment.kind === 'code') {
           Span(segment.text)
-            .fontFamily('monospace')
-            .fontColor(isUser ? this.themeColor('#173B63') : this.themeColor('#344054'))
+            .fontFamily(CONVERSATION_MONOSPACE_FONT_FAMILY)
+            .fontColor($$.isUser ? this.themeColor('#173B63') : this.themeColor('#344054'))
             .textBackgroundStyle({
-              color: isUser ? this.themeColor('#CFE3FF') : this.themeColor('#F2F4F7'),
+              color: $$.isUser ? this.themeColor('#CFE3FF') : this.themeColor('#F2F4F7'),
               radius: 4
             })
         } else if (segment.kind === 'link') {
@@ -3328,43 +3549,43 @@ struct Index {
         } else {
           Span(segment.text)
         }
-      }, (segment: SessionMarkdownInlineSegment) => segment.id)
+      }, (segment: SessionMarkdownInlineSegment): string => JSON.stringify(segment))
     }
-    .fontSize(this.scaledFontSize(fontSize))
-    .fontColor(isUser ? this.themeColor('#17202A') : this.themeColor('#22272E'))
-    .fontWeight(isHeading ? FontWeight.Medium : FontWeight.Regular)
-    .lineHeight(this.scaledLineHeight(lineHeight))
+    .fontFamily(CONVERSATION_FONT_FAMILY).fontSize(this.scaledFontSize($$.fontSize))
+    .fontColor($$.isUser ? this.themeColor('#17202A') : this.themeColor('#22272E'))
+    .fontWeight($$.isHeading ? FontWeight.Medium : FontWeight.Regular)
+    .lineHeight(this.scaledLineHeight($$.lineHeight))
     .width('100%')
     .copyOption(CopyOptions.LocalDevice)
   }
 
   @Builder
-  SessionMarkdownTableView(block: SessionMarkdownBlock, isUser: boolean) {
+  SessionMarkdownTableView($$: SessionMarkdownTableViewParams) {
     Column() {
       Scroll() {
         Column({ space: 0 }) {
           Row() {
-            ForEach(parseSessionMarkdownTable(block.text).headers, (cell: string) => {
+            ForEach(parseSessionMarkdownTable($$.block.text).headers, (cell: string) => {
               Column() {
-                this.SessionMarkdownInlineText(cell, isUser, isUser ? 10 : 9, isUser ? 15 : 14, true)
+                this.SessionMarkdownInlineText({ text: cell, isUser: $$.isUser, fontSize: 14, lineHeight: 22, isHeading: true })
               }
-              .width(this.sessionMarkdownTableColumnWidth(block))
+              .width(this.sessionMarkdownTableColumnWidth($$.block))
               .constraintSize({ minHeight: 34 })
               .alignSelf(ItemAlign.Stretch)
               .padding({ left: 7, right: 7, top: 6, bottom: 6 })
               .justifyContent(FlexAlign.Center)
               .border({ width: 1, color: this.themeColor('#D0D5DD') })
-              .backgroundColor(isUser ? this.themeColor('#DDEEFF') : this.themeColor('#F2F4F7'))
+              .backgroundColor($$.isUser ? this.themeColor('#DDEEFF') : this.themeColor('#F2F4F7'))
             }, (cell: string, index: number) => `table-header-${index}-${cell}`)
           }
 
-          ForEach(parseSessionMarkdownTable(block.text).rows, (row: string[], rowIndex: number) => {
+          ForEach(parseSessionMarkdownTable($$.block.text).rows, (row: string[], rowIndex: number) => {
             Row() {
               ForEach(row, (cell: string, cellIndex: number) => {
                 Column() {
-                  this.SessionMarkdownInlineText(cell, isUser, isUser ? 10 : 9, isUser ? 15 : 14, false)
+                  this.SessionMarkdownInlineText({ text: cell, isUser: $$.isUser, fontSize: 14, lineHeight: 22, isHeading: false })
                 }
-                .width(this.sessionMarkdownTableColumnWidth(block))
+                .width(this.sessionMarkdownTableColumnWidth($$.block))
                 .constraintSize({ minHeight: 34 })
                 .alignSelf(ItemAlign.Stretch)
                 .padding({ left: 7, right: 7, top: 6, bottom: 6 })
@@ -3410,7 +3631,7 @@ struct Index {
 
         Column({ space: 2 }) {
           Text(this.codexDirectiveTitle(block.language))
-            .fontSize(this.scaledFontSize(11))
+            .fontFamily(CONVERSATION_FONT_FAMILY).fontSize(this.scaledFontSize(11))
             .fontColor(this.themeColor('#1F2937'))
             .fontWeight(FontWeight.Medium)
             .maxLines(1)
@@ -3418,7 +3639,7 @@ struct Index {
             .width('100%')
 
           Text(this.codexDirectiveSummary(block))
-            .fontSize(this.scaledFontSize(9))
+            .fontFamily(CONVERSATION_FONT_FAMILY).fontSize(this.scaledFontSize(9))
             .fontColor(this.themeColor('#667085'))
             .lineHeight(this.scaledLineHeight(13))
             .maxLines(1)
@@ -3473,7 +3694,7 @@ struct Index {
         .fontColor([this.codexDirectiveAccentColor(name)])
     } else {
       Text('<>')
-        .fontSize(this.scaledFontSize(10))
+        .fontFamily(CONVERSATION_FONT_FAMILY).fontSize(this.scaledFontSize(10))
         .fontColor(this.codexDirectiveAccentColor(name))
         .fontWeight(FontWeight.Medium)
     }
@@ -3506,7 +3727,7 @@ struct Index {
     Column({ space: 2 }) {
       Row({ space: 5 }) {
         Text(field.label)
-          .fontSize(this.scaledFontSize(8))
+          .fontFamily(CONVERSATION_FONT_FAMILY).fontSize(this.scaledFontSize(8))
           .fontColor(this.structuredFieldLabelColor(field.kind))
           .fontWeight(FontWeight.Medium)
           .padding({ left: 5, right: 5, top: 1, bottom: 1 })
@@ -3514,7 +3735,7 @@ struct Index {
           .borderRadius(5)
 
         Text(field.value)
-          .fontSize(this.scaledFontSize(field.kind === 'code' || field.kind === 'path' ? 9 : 10))
+          .fontFamily(CONVERSATION_FONT_FAMILY).fontSize(this.scaledFontSize(field.kind === 'code' || field.kind === 'path' ? 9 : 10))
           .fontColor(this.themeColor('#1F2937'))
           .fontWeight(FontWeight.Regular)
           .layoutWeight(1)
@@ -3526,7 +3747,7 @@ struct Index {
 
       if (field.meta.length > 0) {
         Text(field.meta)
-          .fontSize(this.scaledFontSize(9))
+          .fontFamily(CONVERSATION_FONT_FAMILY).fontSize(this.scaledFontSize(9))
           .fontColor(this.themeColor('#667085'))
           .lineHeight(this.scaledLineHeight(13))
           .width('100%')
@@ -3812,109 +4033,85 @@ struct Index {
       if (this.shouldShowSlashCommandPanel()) {
         this.SlashCommandPanel()
       }
-
       if (this.hasActiveComposerToken()) {
         this.ActiveComposerTokenChip()
       }
-
       this.PendingSessionImageStrip()
       this.PendingSessionFileStrip()
-
-      Column({ space: 4 }) {
-        Column({ space: 6 }) {
+      Stack({ alignContent: Alignment.BottomStart }) {
+        if (this.composerActionMenuExpanded) {
+          Row() { this.ComposerActionPopup() }
+            .position({ x: 0, y: -234 })
+            .alignItems(VerticalAlign.Top)
+            .zIndex(1)
+        }
+        Row({ space: 2 }) {
+          Button() {
+            SymbolGlyph($r('sys.symbol.plus'))
+              .fontSize(18)
+              .fontColor([this.composerActionMenuExpanded ? this.theme().accent : this.theme().textSecondary])
+          }
+          .accessibilityText('添加图片、文件或操作')
+          .width(44).height(44)
+          .backgroundColor(Color.Transparent)
+          .borderRadius(22)
+          .enabled(this.canOpenComposerActionMenu())
+          .onClick(() => {
+            if (this.shouldIgnoreComposerActionToggle()) return;
+            this.composerActionMenuExpanded = !this.composerActionMenuExpanded;
+            if (this.composerActionMenuExpanded) this.slashCommandPanelVisible = false;
+            this.log('info', 'ui.composer_action_menu.toggle', `expanded=${this.composerActionMenuExpanded}; sessionId=${this.selectedSession?.id ?? ''}; isNewSession=${this.isNewSessionDraft}`);
+          })
           TextArea({ text: this.sessionMessage, placeholder: '发送消息…', controller: this.sessionTextAreaController })
             .height(this.sessionComposerTextAreaHeight())
-            .fontSize(this.scaledFontSize(15))
-            .fontColor(this.themeColor('#17202A'))
+            .fontSize(this.scaledFontSize(16))
+            .fontColor(this.theme().textPrimary)
             .backgroundColor(Color.Transparent)
-            .border({ width: this.hasActiveComposerToken() ? 1 : 0, color: this.hasActiveComposerToken() ? this.themeColor('#1F6FEB') : this.themeColor('#FFFFFF') })
             .borderRadius(8)
-            .padding({ left: 10, right: 10, top: 6, bottom: 6 })
-            .width('100%')
+            .padding({ left: 4, right: 4, top: 10, bottom: 10 })
+            .layoutWeight(1)
             .onFocus(() => {
               this.sessionComposerFocused = true;
               this.scrollSessionToBottom();
             })
-            .onBlur(() => {
-              this.sessionComposerFocused = false;
-            })
+            .onBlur(() => { this.sessionComposerFocused = false; })
             .onChange((value: string) => {
               this.sessionMessage = value;
               this.composerActionMenuExpanded = false;
               this.slashCommandPanelVisible = this.shouldOpenSlashCommandPanel(value);
             })
-
-          Stack({ alignContent: Alignment.BottomStart }) {
-            if (this.composerActionMenuExpanded) {
-              Row() {
-                this.ComposerActionPopup()
+          Button() { this.SessionPrimaryActionSymbol() }
+            .accessibilityText(this.sessionPrimaryActionAccessibilityText())
+            .width(44).height(44)
+            .backgroundColor(this.sessionPrimaryActionColor())
+            .borderRadius(22)
+            .enabled(this.canUseSessionPrimaryAction())
+            .onClick(() => {
+              if (this.sessionPrimaryActionMode() === 'continue') {
+                void this.continueSelectedSession();
+              } else if (this.shouldUseSessionInterruptAction()) {
+                this.log('info', 'ui.click.session_primary_interrupt', `sessionId=${this.selectedSession?.id ?? ''}; taskId=${this.selectedSessionInterruptTaskId()}`);
+                this.confirmSelectedSessionInterrupt();
+              } else {
+                this.log('info', 'ui.click.session_primary_send', `sessionId=${this.selectedSession?.id ?? ''}; images=${this.pendingSessionImages.length}`);
+                this.slashCommandPanelVisible = false;
+                this.composerActionMenuExpanded = false;
+                void this.sendMessageToSelectedSession();
               }
-                .translate({ x: 0, y: -234 })
-                .alignItems(VerticalAlign.Top)
-                .zIndex(1)
-            }
-
-            Row({ space: 8 }) {
-              Button() {
-                SymbolGlyph($r('sys.symbol.plus'))
-                  .fontSize(16)
-                  .fontColor([this.composerActionMenuExpanded ? this.themeColor('#1F6FEB') : this.themeColor('#17202A')])
-              }
-                .width(40)
-                .height(40)
-                .backgroundColor(this.composerActionMenuExpanded ? this.themeColor('#EAF2FF') : this.themeColor('#FFFFFF'))
-                .border({ width: 1, color: this.composerActionMenuExpanded ? this.themeColor('#BBD2FF') : this.themeColor('#DDE3EA') })
-                .borderRadius(10)
-                .enabled(this.canOpenComposerActionMenu())
-                .onClick(() => {
-                  if (this.shouldIgnoreComposerActionToggle()) {
-                    return;
-                  }
-                  this.composerActionMenuExpanded = !this.composerActionMenuExpanded;
-                  if (this.composerActionMenuExpanded) {
-                    this.slashCommandPanelVisible = false;
-                  }
-                  this.log('info', 'ui.composer_action_menu.toggle', `expanded=${this.composerActionMenuExpanded}; sessionId=${this.selectedSession?.id ?? ''}; isNewSession=${this.isNewSessionDraft}`);
-                })
-
-              Blank()
-              Button() {
-                this.SessionPrimaryActionSymbol()
-              }
-                .width(40)
-                .height(40)
-                .backgroundColor(this.sessionPrimaryActionColor())
-                .borderRadius(10)
-                .enabled(this.canUseSessionPrimaryAction())
-                .onClick(() => {
-                  if (this.shouldUseSessionInterruptAction()) {
-                    this.log('info', 'ui.click.session_primary_interrupt', `sessionId=${this.selectedSession?.id ?? ''}; taskId=${this.selectedSessionInterruptTaskId()}`);
-                    this.confirmSelectedSessionInterrupt();
-                  } else {
-                    this.log('info', 'ui.click.session_primary_send', `sessionId=${this.selectedSession?.id ?? ''}; prompt=${this.sessionMessage}; images=${this.pendingSessionImages.length}`);
-                    this.slashCommandPanelVisible = false;
-                    this.composerActionMenuExpanded = false;
-                    void this.sendMessageToSelectedSession();
-                  }
-                })
-            }
-            .width('100%')
-            .alignItems(VerticalAlign.Center)
-            .zIndex(2)
-          }
-          .width('100%')
-          .height(40)
+            })
         }
         .width('100%')
-        .alignItems(HorizontalAlign.Start)
+        .alignItems(VerticalAlign.Bottom)
+        .zIndex(2)
       }
       .width('100%')
+      .height(this.sessionComposerTextAreaHeight())
     }
     .width('100%')
-    .padding({ left: 10, right: 10, top: 8, bottom: 8 })
-    .backgroundColor(this.themeColor('#F7F8FA'))
-    .border({ width: 1, color: this.theme().border })
-    .borderRadius(14)
+    .padding({ left: 6, right: 6, top: 5, bottom: 5 })
+    .backgroundColor(this.theme().surfaceSubtle)
+    .border({ width: 1, color: this.hasActiveComposerToken() ? this.theme().accent : this.theme().border })
+    .borderRadius(26)
     .margin({ bottom: this.sessionComposerBottomMargin() })
     .translate({ y: this.sessionComposerBottomShift() })
   }
@@ -4120,11 +4317,14 @@ struct Index {
 
   @Builder
   SessionPrimaryActionSymbol() {
-    if (this.sessionPrimaryActionMode() === 'interrupt') {
-      SymbolGlyph($r('sys.symbol.xmark'))
-        .fontSize(18)
-        .fontColor([this.theme().textOnAccent])
-    } else if (this.sessionPrimaryActionMode() === 'sending' || this.sessionPrimaryActionMode() === 'interrupting') {
+    if (this.sessionPrimaryActionMode() === 'continue') {
+      SymbolGlyph($r('sys.symbol.play_fill')).fontSize(18).fontColor([this.theme().textOnAccent])
+    } else if (this.sessionPrimaryActionMode() === 'interrupt') {
+      Row().width(12).height(12)
+        .border({ width: 1.5, color: this.theme().textOnAccent })
+        .borderRadius(2)
+    } else if (this.sessionPrimaryActionMode() === 'sending' || this.sessionPrimaryActionMode() === 'interrupting'
+      || this.sessionPrimaryActionMode() === 'continuing') {
       LoadingProgress()
         .width(18)
         .height(18)
@@ -4413,7 +4613,7 @@ struct Index {
             Column({ space: 8 }) {
               ForEach(this.outboxItems, (item: BridgeOutboxItem) => {
                 this.OutboxItemCard(item)
-              }, (item: BridgeOutboxItem) => item.id)
+              }, (item: BridgeOutboxItem) => JSON.stringify(item))
             }
             .width('100%')
           }
@@ -4484,21 +4684,23 @@ struct Index {
         Button('上移')
           .height(30)
           .fontSize(this.scaledFontSize(9))
+          .enabled(item.status === 'queued' || item.status === 'failed')
           .onClick(() => {
             void this.moveOutboxItem(item, 'up');
           })
         Button('下移')
           .height(30)
           .fontSize(this.scaledFontSize(9))
+          .enabled(item.status === 'queued' || item.status === 'failed')
           .onClick(() => {
             void this.moveOutboxItem(item, 'down');
           })
-        if (item.status === 'failed' || item.status === 'uncertain') {
-          Button('重试')
+        if (item.status === 'failed' || item.status === 'uncertain' || item.status === 'held') {
+          Button(item.status === 'held' || item.status === 'uncertain' ? '核对后重试' : '重试')
             .height(30)
             .fontSize(this.scaledFontSize(9))
             .onClick(() => {
-              void this.retryOutboxItem(item);
+              this.confirmRetryOutboxItem(item);
             })
         }
         Button('取消')
@@ -4615,7 +4817,7 @@ struct Index {
           .backgroundColor(project.id === this.selectedProjectId ? this.themeColor('#1F6FEB') : this.themeColor('#F0F2F5'))
           .borderRadius(6)
           .onClick(() => {
-            this.selectedProjectId = project.id;
+            this.selectComposerProject(project.id);
           })
         }, (project: BridgeProject) => project.id)
       }
@@ -4853,6 +5055,10 @@ struct Index {
     const targetSessionId = this.selectedSession.id;
     const targetSessionTitle = this.selectedSession.title;
     const targetProjectLabel = this.selectedSession.projectLabel ?? '未归类';
+    const targetProjectId = this.selectedProjectId;
+    const draftScope = this.currentSessionDraftScope();
+    const bridgeUrl = this.normalizedBridgeUrl();
+    const bridgeToken = this.bridgeToken;
     const outgoing = this.sessionMessage.trim();
     const draftImages = this.pendingSessionImages.slice();
     const draftFiles = this.pendingSessionFiles.slice();
@@ -4860,18 +5066,20 @@ struct Index {
     let targetFingerprint: CodexSessionFingerprint | null = this.selectedSessionFingerprint();
     const submissionId = this.submissionIdForRetry(retryFailedMessageId);
     let sent = false;
+    let sendFailure = '';
     this.isSendingSessionMessage = true;
     this.sendingSessionTargetId = targetSessionId;
     this.beginOptimisticSessionSend(
       targetSessionId,
       false,
-      this.selectedProjectId,
+      targetProjectId,
       submissionId,
       outgoing,
       draftImages,
       draftFiles,
       retryFailedMessageId
     );
+    this.dismissSessionKeyboardAfterSend('send_session');
     try {
       await this.guard('sendSessionMessage', async () => {
         if (this.selectedSession === null || this.selectedSession.id !== targetSessionId) {
@@ -4883,67 +5091,66 @@ struct Index {
           ? `正在追加引导：${targetProjectLabel} / ${targetSessionTitle}`
           : `正在发送到 Codex 官方会话：${targetProjectLabel} / ${targetSessionTitle}`;
         if (targetFingerprint === null || targetFingerprint.filePath.length === 0) {
-          const refreshed = await BridgeClient.getSession(this.normalizedBridgeUrl(), targetSessionId, this.bridgeToken);
-          if (this.selectedSession === null || this.selectedSession.id !== targetSessionId) {
-            this.message = '会话目标已变化，已阻止发送。请重新确认当前会话。';
-            this.log('warn', 'session.send.blocked', `reason=session_changed_after_fingerprint_refresh; targetSessionId=${targetSessionId}; currentSessionId=${this.selectedSession?.id ?? ''}`);
-            return;
-          }
-          this.selectedSession = refreshed;
+          const refreshed = await BridgeClient.getSession(bridgeUrl, targetSessionId, bridgeToken);
+          // This verification read does not own the visible history.
           targetFingerprint = this.sessionFingerprintFromDetail(refreshed);
           this.log('info', 'session.fingerprint.refreshed', `sessionId=${targetSessionId}; filePath=${targetFingerprint.filePath}; entryCount=${targetFingerprint.entryCount}`);
         }
         if (targetFingerprint === null || targetFingerprint.filePath.length === 0) {
-          this.message = '当前会话缺少本地文件指纹，已阻止发送。请重新打开会话后再试。';
           this.log('error', 'session.send.blocked', `reason=missing_fingerprint; sessionId=${targetSessionId}`);
-          return;
+          throw new Error('当前会话缺少本地文件指纹，请重新打开会话后再试。');
         }
-        const requiresDesktopLive = await this.requiresDesktopLiveForSend(targetSessionId, 'send_session');
-        if (requiresDesktopLive) {
-          const desktopReady = await this.ensureDesktopLiveReadyForSend(targetSessionId, 'send_session');
-          if (!desktopReady) {
-            this.log('warn', 'session.send.blocked', `reason=desktop_live_not_ready_after_mobile_repair; sessionId=${targetSessionId}; state=${this.desktopLiveState}; verified=${this.desktopLiveSessionVerified}`);
-            return;
-          }
-        }
-        const composed = await this.composeOutgoingSessionMessage(outgoing, draftImages, draftFiles);
+        // The Bridge durably accepts this submission and owns readiness,
+        // target verification and ordered dispatch in its existing outbox.
+        const composed = await this.composeOutgoingSessionMessage(outgoing, draftImages, draftFiles, bridgeUrl, bridgeToken);
         const messageText = composed.text;
         this.clearLocalRunningOverride(targetSessionId);
-        const receivedTask = await BridgeClient.sendCodexThreadMessage(
-          this.normalizedBridgeUrl(),
-          targetSessionId,
-          messageText,
-          this.selectedProjectId,
-          this.bridgeToken,
-          targetFingerprint,
-          this.sessionReasoningEffort,
-          this.sessionModel,
-          submissionId
-        );
-        if (this.isSubmittedOutboxReceipt(receivedTask) && (this.readSessionNavigation().revision !== navigation.revision
-          || this.selectedSession?.id !== targetSessionId)) {
-          this.completeOptimisticSessionSend(submissionId);
-          sent = true;
-          this.log('info', 'session.receipt.send.stale_ignored', `taskId=${receivedTask.id}`);
-          return;
+        let receivedTask: BridgeTask;
+        try {
+          receivedTask = await BridgeClient.sendCodexThreadMessage(
+            bridgeUrl,
+            targetSessionId,
+            messageText,
+            targetProjectId,
+            bridgeToken,
+            targetFingerprint,
+            undefined,
+            undefined,
+            submissionId
+          );
+        } catch (error) {
+          const recoveredTask = this.isBridgeRequestTimeout(this.errorText(error))
+            ? await this.adoptTaskAfterSendTimeout(targetSessionId, 'sendSessionMessage', submissionId, bridgeUrl, bridgeToken)
+            : null;
+          if (recoveredTask === null) throw new Error(this.errorText(error));
+          receivedTask = recoveredTask;
         }
-        this.currentTask = receivedTask;
-        this.completeOptimisticSessionSend(submissionId);
-        this.applyTaskExecutionContract(this.currentTask, targetSessionId, 'send_session_created');
+        this.acknowledgeOptimisticSessionSend(submissionId, receivedTask, messageText);
         sent = true;
-        this.lastDesktopSyncWarningTaskId = '';
-        this.activeSessionTaskId = this.currentTask.id;
-        this.activeSessionTaskTitle = targetSessionTitle;
-        this.rememberPendingSessionSend(this.currentTask.id, {
+        this.rememberPendingSessionSend(receivedTask.id, {
           sessionId: targetSessionId,
           isNewSession: false,
-          projectId: this.selectedProjectId,
+          projectId: targetProjectId,
           submissionId,
           text: outgoing,
           images: draftImages,
           files: draftFiles,
           retryFailedMessageId
-        });
+        }, receivedTask);
+        this.restoreUnsentSessionAttachments(composed.failedImages, composed.failedFiles, draftScope,
+          targetSessionId, false, targetProjectId);
+        if (this.readSessionNavigation().revision !== navigation.revision
+          || this.selectedSession?.id !== targetSessionId) {
+          sent = true;
+          this.log('info', 'session.receipt.send.stale_ignored', `taskId=${receivedTask.id}`);
+          return;
+        }
+        this.currentTask = receivedTask;
+        this.applyTaskExecutionContract(this.currentTask, targetSessionId, 'send_session_created');
+        sent = true;
+        this.lastDesktopSyncWarningTaskId = '';
+        this.activeSessionTaskId = this.currentTask.id;
+        this.activeSessionTaskTitle = targetSessionTitle;
         this.rememberTaskForSession(targetSessionId, this.currentTask.id, this.currentTask.status);
         if (!this.isSubmittedOutboxReceipt(this.currentTask)) this.markSessionRunning(targetSessionId);
         this.message = this.currentTask.runtime?.kind === 'durable_outbox'
@@ -4951,20 +5158,21 @@ struct Index {
           : guidanceSend
             ? `引导已提交，正在确认 Codex 接收`
             : `消息已提交，正在确认 Codex 接收`;
-        this.sessionMessage = '';
-        this.restoreUnsentSessionAttachments(composed.failedImages, composed.failedFiles);
         if (composed.failedImages.length > 0 || composed.failedFiles.length > 0) {
           this.message = `文字已发送，${composed.failedImages.length} 张图片、${composed.failedFiles.length} 个文件上传失败，附件已保留`;
         }
-        this.dismissSessionKeyboardAfterSend('send_session');
         this.showTaskEventDetails = false;
         this.log('info', 'session.message.sent', `taskId=${this.currentTask.id}; sessionId=${targetSessionId}; project=${targetProjectLabel}; title=${targetSessionTitle}; status=${this.currentTask.status}; mode=${guidanceSend ? 'guidance_send' : 'send'}; model=${this.sessionModel || 'auto'}; effort=${this.sessionReasoningEffort || 'auto'}; uploadedImages=${composed.uploadedImages.length}; failedImages=${composed.failedImages.length}`);
-        this.scrollSessionToBottom();
+        this.scrollSessionToBottomIfFollowing('send_receipt');
         if (this.isSubmittedOutboxReceipt(this.currentTask)) {
           await this.settleSubmittedOutboxReceipt(this.currentTask);
         } else {
           this.startPolling();
         }
+      }, (error: string) => {
+        sendFailure = error;
+        if (this.readSessionNavigation().revision === navigation.revision
+          && this.selectedSession?.id === targetSessionId) this.message = error;
       });
       if (sent) {
         if (retryFailedMessageId.length > 0) {
@@ -4973,17 +5181,16 @@ struct Index {
         return true;
       }
       if (!sent) {
-        this.completeOptimisticSessionSend(submissionId);
         this.rememberFailedSessionMessageAfterSendFailure({
           failedId: retryFailedMessageId,
           sessionId: targetSessionId,
           isNewSession: false,
-          projectId: this.selectedProjectId,
+          projectId: targetProjectId,
           submissionId,
           text: outgoing,
           images: draftImages,
           files: draftFiles,
-          error: this.message
+          error: sendFailure || this.message
         });
       }
       return false;
@@ -5002,78 +5209,100 @@ struct Index {
       this.log('info', 'session.new.blocked', `reason=empty_or_task_active; currentTaskId=${this.currentTask?.id ?? ''}`);
       return false;
     }
+    const targetProjectId = this.selectedProjectId;
+    const draftScope = this.currentSessionDraftScope();
+    const bridgeUrl = this.normalizedBridgeUrl();
+    const bridgeToken = this.bridgeToken;
+    const targetModel = this.sessionModel;
+    const targetReasoningEffort = this.sessionReasoningEffort;
+    const targetServiceTier = this.sessionServiceTier;
     const outgoing = this.sessionMessage.trim();
     const draftImages = this.pendingSessionImages.slice();
     const draftFiles = this.pendingSessionFiles.slice();
     const submissionId = this.submissionIdForRetry(retryFailedMessageId);
     const navigationRevision = this.readSessionNavigation().revision;
     let sent = false;
+    let sendFailure = '';
     this.isSendingSessionMessage = true;
     this.sendingSessionTargetId = '__new_session__';
     this.beginOptimisticSessionSend(
       '__new_session__',
       true,
-      this.selectedProjectId,
+      targetProjectId,
       submissionId,
       outgoing,
       draftImages,
       draftFiles,
       retryFailedMessageId
     );
+    this.dismissSessionKeyboardAfterSend('send_new_session');
     try {
       const guardOk = await this.guard('sendNewSessionMessage', async () => {
         this.message = '正在创建 Codex 官方会话';
-        const composed = await this.composeOutgoingSessionMessage(outgoing, draftImages, draftFiles);
+        const composed = await this.composeOutgoingSessionMessage(outgoing, draftImages, draftFiles, bridgeUrl, bridgeToken);
         const messageText = composed.text;
-        const receivedTask = await BridgeClient.startCodexThread(
-          this.normalizedBridgeUrl(),
-          this.selectedProjectId,
-          messageText,
-          this.bridgeToken,
-          this.sessionReasoningEffort,
-          this.sessionModel,
-          submissionId
-        );
-        if (this.isSubmittedOutboxReceipt(receivedTask) && (this.readSessionNavigation().revision !== navigationRevision
-          || !this.isNewSessionDraft)) {
-          this.completeOptimisticSessionSend(submissionId);
-          sent = true;
-          this.log('info', 'session.receipt.new.stale_ignored', `taskId=${receivedTask.id}`);
-          return;
+        let receivedTask: BridgeTask;
+        try {
+          receivedTask = await BridgeClient.startCodexThread(
+            bridgeUrl,
+            targetProjectId,
+            messageText,
+            bridgeToken,
+            targetReasoningEffort,
+            targetModel,
+            submissionId,
+            targetServiceTier || undefined
+          );
+        } catch (error) {
+          const recoveredTask = this.isBridgeRequestTimeout(this.errorText(error))
+            ? await this.adoptTaskAfterSendTimeout('__new_session__', 'sendNewSessionMessage', submissionId, bridgeUrl, bridgeToken)
+            : null;
+          if (recoveredTask === null) throw new Error(this.errorText(error));
+          receivedTask = recoveredTask;
         }
-        this.currentTask = receivedTask;
-        this.completeOptimisticSessionSend(submissionId);
+        this.acknowledgeOptimisticSessionSend(submissionId, receivedTask, messageText);
         sent = true;
-        this.lastDesktopSyncWarningTaskId = '';
-        this.rememberPendingSessionSend(this.currentTask.id, {
+        this.rememberPendingSessionSend(receivedTask.id, {
           sessionId: '__new_session__',
           isNewSession: true,
-          projectId: this.selectedProjectId,
+          projectId: targetProjectId,
           submissionId,
           text: outgoing,
           images: draftImages,
           files: draftFiles,
           retryFailedMessageId
-        });
+        }, receivedTask);
+        this.restoreUnsentSessionAttachments(composed.failedImages, composed.failedFiles, draftScope,
+          '__new_session__', true, targetProjectId);
+        if (this.readSessionNavigation().revision !== navigationRevision
+          || !this.isNewSessionDraft || this.selectedProjectId !== targetProjectId) {
+          sent = true;
+          this.log('info', 'session.receipt.new.stale_ignored', `taskId=${receivedTask.id}`);
+          return;
+        }
+        this.currentTask = receivedTask;
+        sent = true;
+        this.lastDesktopSyncWarningTaskId = '';
         this.message = '新会话已发送，正在唤醒 Codex';
-        this.sessionMessage = '';
-        this.restoreUnsentSessionAttachments(composed.failedImages, composed.failedFiles);
         if (composed.failedImages.length > 0 || composed.failedFiles.length > 0) {
           this.message = `新会话文字已发送，${composed.failedImages.length} 张图片、${composed.failedFiles.length} 个文件上传失败，附件已保留`;
         }
-        this.dismissSessionKeyboardAfterSend('send_new_session');
         this.newSessionTaskId = this.currentTask.id;
         this.activeSessionTaskId = this.currentTask.id;
         this.activeSessionTaskTitle = '新建会话';
         this.syncSessionTaskMarkers(this.currentTask);
         this.showTaskEventDetails = false;
         this.log('info', 'session.new.sent', `taskId=${this.currentTask.id}; status=${this.currentTask.status}; model=${this.sessionModel || 'auto'}; effort=${this.sessionReasoningEffort || 'auto'}; uploadedImages=${composed.uploadedImages.length}; failedImages=${composed.failedImages.length}`);
-        this.scrollSessionToBottom();
+        this.scrollSessionToBottomIfFollowing('new_send_receipt');
         if (this.isSubmittedOutboxReceipt(this.currentTask)) {
           await this.settleSubmittedOutboxReceipt(this.currentTask);
         } else {
           this.startPolling();
         }
+      }, (error: string) => {
+        sendFailure = error;
+        if (this.readSessionNavigation().revision === navigationRevision
+          && this.isNewSessionDraft && this.selectedProjectId === targetProjectId) this.message = error;
       });
       if (sent) {
         if (retryFailedMessageId.length > 0) {
@@ -5082,17 +5311,16 @@ struct Index {
         return true;
       }
       if (!guardOk) {
-        this.completeOptimisticSessionSend(submissionId);
         this.rememberFailedSessionMessageAfterSendFailure({
           failedId: retryFailedMessageId,
           sessionId: '__new_session__',
           isNewSession: true,
-          projectId: this.selectedProjectId,
+          projectId: targetProjectId,
           submissionId,
           text: outgoing,
           images: draftImages,
           files: draftFiles,
-          error: this.message
+          error: sendFailure || this.message
         });
       }
       return false;
@@ -5109,6 +5337,7 @@ struct Index {
     const activeTask = this.currentTask;
     const activeTaskId = activeTask.id;
     const activeSessionId = this.taskSessionId(activeTask);
+    const navigationRevision = this.readSessionNavigation().revision;
     const afterSeq = this.currentTaskEventCursor(activeTask);
     let task: BridgeTask;
     try {
@@ -5117,13 +5346,14 @@ struct Index {
         : await BridgeClient.getTask(this.normalizedBridgeUrl(), activeTaskId, this.bridgeToken, afterSeq);
     } catch (error) {
       if (this.errorText(error).indexOf('Unknown task') >= 0 || this.errorText(error).indexOf('HTTP 404') >= 0) {
-        if (this.currentTask === null || this.currentTask.id !== activeTaskId) {
+        if (this.currentTask === null || this.currentTask.id !== activeTaskId
+          || this.readSessionNavigation().revision !== navigationRevision
+          || this.currentTaskEventCursor(this.currentTask) !== afterSeq) {
           this.log('info', 'task.refresh.missing_ignored', `taskId=${activeTaskId}; sessionId=${activeSessionId}; reason=stale_request`);
           return;
         }
-        if (activeSessionId.length > 0) {
-          this.markSessionRunningLocallyCleared(activeSessionId);
-        }
+        // Losing bridge bookkeeping is not a native turn terminal receipt.
+        // Preserve the native activity while discarding this missing task.
         this.currentTask = null;
         this.activeSessionTaskId = '';
         this.activeSessionTaskTitle = '';
@@ -5135,7 +5365,9 @@ struct Index {
       }
       throw new Error(this.errorText(error));
     }
-    if (this.currentTask === null || this.currentTask.id !== activeTaskId) {
+    if (this.currentTask === null || this.currentTask.id !== activeTaskId
+      || this.readSessionNavigation().revision !== navigationRevision
+      || this.currentTaskEventCursor(this.currentTask) !== afterSeq) {
       this.log('info', 'task.refresh.result_ignored', `taskId=${activeTaskId}; sessionId=${activeSessionId}; reason=stale_request`);
       return;
     }
@@ -5152,9 +5384,15 @@ struct Index {
         await this.loadSessionDetail(activeSessionId);
       }
     }
+    if (this.currentTask === null || this.currentTask.id !== activeTaskId
+      || this.readSessionNavigation().revision !== navigationRevision
+      || this.currentTaskEventCursor(this.currentTask) !== afterSeq) {
+      return;
+    }
     const previousStatus = this.currentTask.status;
     const previousEventCount = this.currentTaskEventCount(this.currentTask);
     this.currentTask = task;
+    if (this.taskStreamRepairId === task.id && task.hasMoreEvents !== true) this.taskStreamRepairId = '';
     this.applyTaskExecutionContract(task, activeSessionId, 'task_refresh');
     this.syncSessionTaskMarkers(task);
     this.message = `任务${this.statusLabel(task.status)}：${this.currentTaskSummaryText()}`;
@@ -5162,7 +5400,8 @@ struct Index {
     const taskChanged = previousStatus !== task.status || nextEventCount !== previousEventCount;
     this.updateTaskPollCadence(taskChanged, task.status, nextEventCount);
     if (task.hasMoreEvents === true) {
-      this.taskPollDelayMs = 50;
+      // A repeated/empty page must not become a 50ms retry loop.
+      this.taskPollDelayMs = this.currentTaskEventCursor(task) > afterSeq ? 50 : 2000;
     }
     if (nextEventCount !== previousEventCount) {
       this.scrollSessionToBottomIfFollowing('task_events');
@@ -5176,12 +5415,26 @@ struct Index {
       void this.publishTaskAttentionNotification(task, previousStatus);
     }
     if (this.isTaskTerminalStatus(task.status)) {
-      this.markSessionRunningLocallyCleared(this.taskSessionId(task));
-      void this.handleTaskTerminalForSession(task, previousStatus, 'refreshTask');
+      if (this.taskTerminalPreviousStatusById[task.id] === undefined
+        && this.taskTerminalHandledIds.indexOf(task.id) < 0) {
+        this.taskTerminalPreviousStatusById[task.id] = previousStatus;
+      }
+      if (task.hasMoreEvents === true) {
+        return;
+      }
       this.stopPolling();
+      if (this.taskTerminalHandledIds.indexOf(task.id) >= 0) {
+        return;
+      }
+      const terminalPreviousStatus = this.taskTerminalPreviousStatusById[task.id] ?? previousStatus;
+      this.taskTerminalPreviousStatusById[task.id] = undefined;
+      this.taskTerminalHandledIds = [...this.taskTerminalHandledIds, task.id];
+      this.markSessionRunningLocallyCleared(this.taskSessionId(task));
+      void this.handleTaskTerminalForSession(task, terminalPreviousStatus, 'refreshTask');
       const appliedLiveSession = this.applyTaskSessionSnapshot(task);
-      if (previousStatus !== task.status && this.isNewSessionDraft && task.createdCodexSessionId && task.createdCodexSessionId.length > 0) {
+      if (this.isNewSessionDraft && task.createdCodexSessionId && task.createdCodexSessionId.length > 0) {
         this.log('info', 'session.new.created.open', `taskId=${task.id}; sessionId=${task.createdCodexSessionId}; status=${task.status}`);
+        this.commitSessionNavigation('session', task.createdCodexSessionId, 'new_task_completed');
         this.isNewSessionDraft = false;
         this.newSessionTaskId = '';
         this.activeSessionTaskId = '';
@@ -5192,16 +5445,19 @@ struct Index {
         }
         return;
       }
-      if (previousStatus !== task.status && task.codexSessionId && this.selectedSession !== null && task.codexSessionId === this.selectedSession.id) {
+      if (task.codexSessionId && this.selectedSession !== null && task.codexSessionId === this.selectedSession.id) {
         this.log('info', 'session.task.finished.refresh', `taskId=${task.id}; sessionId=${this.selectedSession.id}; status=${task.status}`);
         if (!appliedLiveSession) {
           await this.loadSessionDetail(this.selectedSession.id);
         }
       }
+    } else {
+      this.taskTerminalPreviousStatusById[task.id] = undefined;
     }
   }
 
   private applyTaskSessionSnapshot(task: BridgeTask): boolean {
+    if (this.selectedSession?.sync?.source === 'desktop-official' && !this.isNewSessionDraft) return false;
     if (!task.session || !Array.isArray(task.session.entries) || task.session.entries.length === 0) {
       return false;
     }
@@ -5221,6 +5477,7 @@ struct Index {
     }
     if (this.selectedSession !== null && task.codexSessionId === this.selectedSession.id) {
       this.selectedSession = this.mergeSessionDetailPreservingHistory(this.selectedSession, task.session);
+      this.reconcileVisibleSessionMessages();
       this.markSessionRead(task.session.id);
       this.message = `已同步会话：${task.session.title}`;
       this.log('info', 'session.live_snapshot.applied', `taskId=${task.id}; sessionId=${task.session.id}; entries=${task.session.entryCount}; mode=resume`);
@@ -5267,15 +5524,20 @@ struct Index {
       return;
     }
     const taskId = this.currentTask.id;
+    const navigationRevision = this.readSessionNavigation().revision;
+    const bridgeUrl = this.normalizedBridgeUrl();
+    const bridgeToken = this.bridgeToken;
     this.isInterruptingTask = true;
     try {
       await this.guard('interruptTask', async () => {
         this.message = '正在中断当前会话';
         const interrupted = this.currentTask !== null && this.taskUsesCodexRunApi(this.currentTask)
-          ? await BridgeClient.interruptCodexRun(this.normalizedBridgeUrl(), taskId, this.bridgeToken)
-          : await BridgeClient.interruptTask(this.normalizedBridgeUrl(), taskId, this.bridgeToken);
-        this.currentTask = interrupted;
+          ? await BridgeClient.interruptCodexRun(bridgeUrl, taskId, bridgeToken)
+          : await BridgeClient.interruptTask(bridgeUrl, taskId, bridgeToken);
         this.syncSessionTaskMarkers(interrupted);
+        if (this.readSessionNavigation().revision !== navigationRevision || this.currentTask?.id !== taskId
+          || this.normalizedBridgeUrl() !== bridgeUrl || this.bridgeToken !== bridgeToken) return;
+        this.currentTask = interrupted;
         if (this.isTaskTerminalStatus(interrupted.status)) {
           this.stopPolling();
         } else {
@@ -5283,10 +5545,12 @@ struct Index {
         }
         this.message = this.interruptResultMessage(interrupted);
         this.log('info', 'task.interrupted.client', `taskId=${interrupted.id}; status=${interrupted.status}`);
-        this.scrollSessionToBottom();
+        this.scrollSessionToBottomIfFollowing('interrupt_receipt');
         if (this.selectedSession !== null && interrupted.codexSessionId === this.selectedSession.id) {
           await this.refreshSelectedSessionDetail();
         }
+      }, (error: string) => {
+        if (this.readSessionNavigation().revision === navigationRevision && this.currentTask?.id === taskId) this.message = error;
       });
     } finally {
       this.isInterruptingTask = false;
@@ -5302,6 +5566,10 @@ struct Index {
     }
     const targetSessionId = this.selectedSession?.id ?? '';
     const taskId = this.selectedSessionInterruptTaskId();
+    const navigationRevision = this.readSessionNavigation().revision;
+    const previousTaskId = this.currentTask?.id ?? '';
+    const bridgeUrl = this.normalizedBridgeUrl();
+    const bridgeToken = this.bridgeToken;
     if (taskId.length === 0 && !this.isSelectedSessionActivityRunning()) {
       this.message = '当前会话还没有进入可中断阶段，正在刷新状态';
       this.log('info', 'session.interrupt.no_ready_task', `sessionId=${targetSessionId}`);
@@ -5311,21 +5579,13 @@ struct Index {
     this.isInterruptingTask = true;
     this.interruptingSessionTargetId = targetSessionId;
     try {
-      await this.guard('interruptSelectedSessionTask', async () => {
         this.message = '正在中断当前会话';
-        let interrupted: BridgeTask;
-        if (this.currentTask !== null && taskId.length > 0 && this.currentTask.id === taskId) {
-          interrupted = this.taskUsesCodexRunApi(this.currentTask)
-            ? await BridgeClient.interruptCodexRun(this.normalizedBridgeUrl(), taskId, this.bridgeToken)
-            : await BridgeClient.interruptTask(this.normalizedBridgeUrl(), taskId, this.bridgeToken);
-        } else if (taskId.length > 0) {
-          const taskSummary = this.tasks.find((task: BridgeTaskSummary) => task.id === taskId);
-          interrupted = taskSummary !== undefined && this.taskUsesCodexRunApi(taskSummary)
-            ? await BridgeClient.interruptCodexRun(this.normalizedBridgeUrl(), taskId, this.bridgeToken)
-            : await BridgeClient.interruptTask(this.normalizedBridgeUrl(), taskId, this.bridgeToken);
-        } else {
-          interrupted = await BridgeClient.interruptCodexThread(this.normalizedBridgeUrl(), targetSessionId, this.bridgeToken);
-        }
+        const interrupted = await BridgeClient.interruptCodexThread(bridgeUrl, targetSessionId, bridgeToken);
+        if (this.normalizedBridgeUrl() !== bridgeUrl || this.bridgeToken !== bridgeToken) return;
+        this.taskStatusById[interrupted.id] = interrupted.status;
+        this.taskSessionById[interrupted.id] = targetSessionId;
+        if (this.readSessionNavigation().revision !== navigationRevision || this.selectedSession?.id !== targetSessionId
+          || (this.currentTask?.id ?? '') !== previousTaskId) return;
         this.currentTask = interrupted;
         this.activeSessionTaskId = interrupted.id;
         this.syncSessionTaskMarkers(interrupted);
@@ -5346,7 +5606,17 @@ struct Index {
         if (this.selectedSession !== null && this.selectedSession.id === targetSessionId) {
           await this.refreshSelectedSessionDetail();
         }
-      });
+    } catch (error) {
+      if (this.normalizedBridgeUrl() !== bridgeUrl || this.bridgeToken !== bridgeToken
+        || this.readSessionNavigation().revision !== navigationRevision || this.selectedSession?.id !== targetSessionId
+        || (this.currentTask?.id ?? '') !== previousTaskId) return;
+      const message = this.errorText(error);
+      if (this.isEndedTaskInterruptConflict(message)) {
+        await this.clearSelectedSessionRunningAfterEndedInterruptConflict();
+      } else {
+        this.message = message;
+        this.log('error', 'session.interrupt.failed', `sessionId=${targetSessionId}; message=${message}`);
+      }
     } finally {
       this.isInterruptingTask = false;
       this.interruptingSessionTargetId = '';
@@ -5355,7 +5625,7 @@ struct Index {
 
   @Builder
   SessionHistoryLoader() {
-    if (this.selectedSession?.sync?.hasMoreBefore === true) {
+    if (this.sessionTimelineStartKey.length > 0 || this.selectedSession?.sync?.hasMoreBefore === true) {
       Row({ space: 8 }) {
         if (this.isLoadingOlderSessionEntries) {
           LoadingProgress()
@@ -5365,10 +5635,10 @@ struct Index {
         }
         Text(this.isLoadingOlderSessionEntries ? '正在加载更早消息' : '加载更早消息')
           .fontSize(this.scaledFontSize(12))
-          .fontColor(this.themeColor('#1F6FEB'))
+          .fontColor(this.theme().textSecondary)
       }
       .width('100%')
-      .height(38)
+      .height(44)
       .justifyContent(FlexAlign.Center)
       .onClick(() => {
         void this.loadOlderSessionEntries('history_button');
@@ -5538,7 +5808,8 @@ struct Index {
     this.pendingSessionImages = this.pendingSessionImages.filter((image: PendingSessionImage) => sentIds.indexOf(image.id) < 0);
   }
 
-  private async composeOutgoingSessionMessage(text: string, images: PendingSessionImage[], files: PickedMobileFile[]): Promise<ComposedSessionMessage> {
+  private async composeOutgoingSessionMessage(text: string, images: PendingSessionImage[], files: PickedMobileFile[],
+    bridgeUrl: string = this.normalizedBridgeUrl(), bridgeToken: string = this.bridgeToken): Promise<ComposedSessionMessage> {
     const parts: string[] = [];
     const uploadedImages: PendingSessionImage[] = [];
     const failedImages: PendingSessionImage[] = [];
@@ -5554,11 +5825,11 @@ struct Index {
         try {
           const base64 = this.readPendingImageAsBase64(image.uri);
           const uploaded: MobileImageUpload = await BridgeClient.uploadMobileImage(
-            this.normalizedBridgeUrl(),
+            bridgeUrl,
             image.fileName,
             image.mimeType,
             base64,
-            this.bridgeToken
+            bridgeToken
           );
           parts.push(uploaded.messageText);
           uploadedImages.push(image);
@@ -5578,11 +5849,11 @@ struct Index {
       try {
         this.message = `正在上传文件 ${index + 1}/${files.length}`;
         const uploaded: MobileFileUpload = await BridgeClient.uploadMobileFile(
-          this.normalizedBridgeUrl(),
+          bridgeUrl,
           file.fileName,
           file.mimeType,
           AttachmentService.readAsBase64(file.uri),
-          this.bridgeToken
+          bridgeToken
         );
         parts.push(uploaded.messageText);
         uploadedFiles.push(file);
@@ -5728,7 +5999,7 @@ struct Index {
     return 'png';
   }
 
-  private async guard(name: string, action: () => Promise<void>): Promise<boolean> {
+  private async guard(name: string, action: () => Promise<void>, onError?: (message: string) => void): Promise<boolean> {
     this.isBusy = true;
     this.log('info', 'action.started', `name=${name}`);
     try {
@@ -5736,6 +6007,12 @@ struct Index {
       this.log('info', 'action.completed', `name=${name}`);
       return true;
     } catch (err) {
+      if (onError !== undefined) {
+        const message = this.errorText(err);
+        onError(message);
+        this.log('error', 'action.failed', `name=${name}; message=${message}`);
+        return false;
+      }
       const recovered = await this.recoverAfterGuardError(name, err);
       if (recovered) {
         this.log('warn', 'action.recovered', `name=${name}; message=${this.errorText(err)}`);
@@ -5785,15 +6062,45 @@ struct Index {
       text,
       images: images.slice(),
       files: files.map((file: PickedMobileFile): OptimisticSessionFile => ({ id: file.id, fileName: file.fileName })),
-      createdAt: new Date().toISOString()
+      createdAt: new Date().toISOString(),
+      state: 'sending',
+      baselineEntryKeys: this.selectedSession?.id === sessionId
+        ? stableCanonicalMessageKeys(this.selectedSession.entries) : []
     };
     this.optimisticSessionMessages = appendOptimisticSessionMessage(this.optimisticSessionMessages, optimistic);
+    // Ownership moves to the recoverable optimistic/outbox message. Do not
+    // restore the same text into the composer while that submission is pending.
+    const draftScope = this.currentSessionDraftScope();
+    if (draftScope !== null) this.sessionDraftStore.remove(draftScope);
     this.sessionMessage = '';
     this.pendingSessionImages = [];
     this.pendingSessionFiles = [];
     this.log('info', 'session.message.optimistic.created', `submissionId=${submissionId}; sessionId=${sessionId}; isNew=${isNewSession}; images=${images.length}`);
     this.scrollSessionToBottom();
     return optimistic.id;
+  }
+
+  private acknowledgeOptimisticSessionSend(submissionId: string, task: BridgeTask, text: string): void {
+    const previous = this.optimisticSessionMessages.find((message: OptimisticSessionMessage) => message.submissionId === submissionId);
+    this.optimisticSessionMessages = markOptimisticSessionSubmitted(this.optimisticSessionMessages, submissionId, {
+      sessionId: this.taskSessionId(task) || previous?.sessionId || '',
+      taskId: task.id,
+      turnId: task.activeCodexTurnId ?? undefined,
+      deliveryAttemptAt: task.runtime?.kind === 'durable_outbox' ? undefined : task.createdAt,
+      text
+    });
+    this.reconcileVisibleSessionMessages();
+  }
+
+  private reconcileVisibleSessionMessages(): void {
+    if (this.selectedSession === null) return;
+    this.sessionStreamEntries = pruneSessionLiveEntries(this.sessionStreamEntries, this.selectedSession.id,
+      this.selectedSession.sync?.completedTurnIds ?? []);
+    const reconciled = reconcileOptimisticSessionMessages(this.optimisticSessionMessages,
+      this.selectedSession.id, this.selectedSession.entries);
+    if (JSON.stringify(reconciled) !== JSON.stringify(this.optimisticSessionMessages)) {
+      this.optimisticSessionMessages = reconciled;
+    }
   }
 
   private completeOptimisticSessionSend(submissionId: string): void {
@@ -5804,12 +6111,58 @@ struct Index {
     }
   }
 
-  private restoreUnsentSessionAttachments(images: PendingSessionImage[], files: PickedMobileFile[]): void {
-    this.pendingSessionImages = images.slice();
-    this.pendingSessionFiles = files.slice();
+  private restoreUnsentSessionAttachments(images: PendingSessionImage[], files: PickedMobileFile[],
+    scope: SessionDraftScope | null = null, sessionId: string = '', isNewSession: boolean = false,
+    projectId: string = ''): void {
+    if (images.length === 0 && files.length === 0) return;
+    const currentScope = this.currentSessionDraftScope();
+    const sameScope = scope === null || (currentScope !== null
+      && scope.bridgeUrl === currentScope.bridgeUrl && scope.bridgeToken === currentScope.bridgeToken
+      && scope.sessionId === currentScope.sessionId && scope.projectId === currentScope.projectId);
+    if (sameScope) {
+      this.pendingSessionImages = this.pendingSessionImages.concat(images.filter((image: PendingSessionImage) =>
+        !this.pendingSessionImages.some((current: PendingSessionImage) => current.id === image.id)));
+      this.pendingSessionFiles = this.pendingSessionFiles.concat(files.filter((file: PickedMobileFile) =>
+        !this.pendingSessionFiles.some((current: PickedMobileFile) => current.id === file.id)));
+      return;
+    }
+    if (scope === null) return;
+    const previous = this.sessionDraftStore.load(scope);
+    const previousImages = previous?.images ?? [];
+    const previousFiles = previous?.files ?? [];
+    const saved = this.sessionDraftStore.save(scope, {
+      text: previous?.text ?? '',
+      images: previousImages.concat(images.filter((image: PendingSessionImage) =>
+        !previousImages.some((current: PendingSessionImage) => current.id === image.id))),
+      files: previousFiles.concat(files.filter((file: PickedMobileFile) =>
+        !previousFiles.some((current: PickedMobileFile) => current.id === file.id)))
+    });
+    if (saved) return;
+    // The text was delivered. Retain only failed attachment URIs under a fresh
+    // submission, with manual retry, when the bounded draft store cannot save.
+    const recovery: FailedSessionMessage = {
+      id: `failed-attachments-${Date.now()}-${Math.floor(Math.random() * 100000)}`,
+      sessionId,
+      isNewSession,
+      projectId,
+      submissionId: this.createSessionSubmissionId(),
+      text: '',
+      images: images.slice(),
+      files: files.slice(),
+      error: '文字已发送，未上传附件已保留，请手动重试附件',
+      createdAt: new Date().toISOString(),
+      retrying: false,
+      retryCount: 0,
+      retryLimit: this.failedSessionAutoRetryLimit,
+      autoRetryEnabled: false,
+      nextRetryAt: ''
+    };
+    this.failedSessionMessages = this.failedSessionMessages.concat([recovery]);
+    this.log('warn', 'session.attachments.draft_capacity_recovery', `sessionId=${sessionId}; isNew=${isNewSession}; images=${images.length}; files=${files.length}`);
   }
 
   private rememberFailedSessionMessageAfterSendFailure(input: FailedSessionMessageRecordInput): void {
+    const original = this.optimisticSessionMessages.find((message: OptimisticSessionMessage) => message.submissionId === input.submissionId);
     if (input.failedId.length > 0) {
       if (this.isFailedSessionRetryCanceled(input.failedId)) {
         this.clearFailedSessionRetryTimer(input.failedId);
@@ -5832,7 +6185,11 @@ struct Index {
       images: input.images.slice(),
       files: input.files.slice(),
       error: input.error,
-      createdAt: new Date().toISOString(),
+      createdAt: original?.createdAt ?? new Date().toISOString(),
+      submittedText: original?.submittedText,
+      baselineEntryKeys: original?.baselineEntryKeys,
+      turnId: original?.turnId,
+      itemId: original?.itemId,
       retrying: false,
       retryCount: 0,
       retryLimit: this.failedSessionAutoRetryLimit,
@@ -5843,56 +6200,96 @@ struct Index {
       ...this.failedSessionMessages,
       failed
     ];
-    this.sessionMessage = '';
-    this.pendingSessionImages = [];
-    this.pendingSessionFiles = [];
-    this.message = '发送失败，已保留消息，将自动重传，点 X 可取消';
+    this.completeOptimisticSessionSend(input.submissionId);
+    const visible = input.isNewSession
+      ? this.isNewSessionDraft && this.selectedProjectId === input.projectId
+      : this.selectedSession?.id === input.sessionId;
+    if (visible) this.message = '发送失败，已保留消息，将自动重传，点 X 可取消';
     this.log('warn', 'session.message.failed.remembered', `failedId=${id}; sessionId=${input.sessionId}; isNew=${input.isNewSession}; images=${input.images.length}; error=${input.error}`);
     this.scheduleFailedSessionAutoRetry(id, 'new_failure');
-    this.scrollSessionToBottom();
+    if (visible) this.scrollSessionToBottomIfFollowing('send_failure');
   }
 
-  private rememberPendingSessionSend(taskId: string, pending: PendingSessionSend): void {
+  private rememberPendingSessionSend(taskId: string, pending: PendingSessionSend, task?: BridgeTask): void {
     if (taskId.length === 0) {
       return;
     }
-    this.pendingSessionSendsByTaskId[taskId] = pending;
+    const current = this.pendingSessionSendsByTaskId[taskId] ?? [];
+    const index = current.findIndex((item: PendingSessionSend) => item.submissionId === pending.submissionId);
+    this.pendingSessionSendsByTaskId[taskId] = index < 0 ? current.concat([pending])
+      : current.map((item: PendingSessionSend, at: number) => at === index ? pending : item);
+    if (task !== undefined) this.recordSessionInputAcknowledgements(task);
     this.log('info', 'session.message.pending.remembered', `taskId=${taskId}; sessionId=${pending.sessionId}; isNew=${pending.isNewSession}; images=${pending.images.length}`);
   }
 
   private handoffPendingSessionSend(previousTaskId: string, task: BridgeTask): void {
-    if (previousTaskId.length === 0 || task.id.length === 0 || previousTaskId === task.id) {
+    if (task.id.length === 0) {
       return;
     }
-    const pending = this.pendingSessionSendsByTaskId[previousTaskId];
-    if (!pending) {
+    // A dashboard can discover the real task before polling its outbox receipt.
+    // Recover that transition by submission identity, never by equal text.
+    const sessionId = this.taskSessionId(task);
+    const submissionId = task.submissionId ?? '';
+    let sourceTaskId = previousTaskId;
+    if (sourceTaskId.length === 0 || sourceTaskId === task.id) {
+      const originatingMessage = this.optimisticSessionMessages.find((message: OptimisticSessionMessage) =>
+        submissionId.length > 0 && message.submissionId === submissionId
+        && (message.sessionId === sessionId || message.isNewSession));
+      sourceTaskId = originatingMessage?.taskId ?? '';
+      if (sourceTaskId.length === 0) {
+        sourceTaskId = Object.keys(this.pendingSessionSendsByTaskId).find((id: string) => {
+          return (this.pendingSessionSendsByTaskId[id] ?? []).some((pending: PendingSessionSend) =>
+            submissionId.length > 0 && pending.submissionId === submissionId
+            && (pending.sessionId === sessionId || pending.isNewSession));
+        }) ?? '';
+      }
+    }
+    if (sourceTaskId.length === 0 || sourceTaskId === task.id) return;
+    this.optimisticSessionMessages = this.optimisticSessionMessages.map((message: OptimisticSessionMessage) => {
+      if (message.taskId !== sourceTaskId) return message;
+      return markOptimisticSessionSubmitted([message], message.submissionId, {
+        sessionId: this.taskSessionId(task) || message.sessionId,
+        taskId: task.id,
+        turnId: message.turnId ?? task.activeCodexTurnId ?? undefined,
+        deliveryAttemptAt: task.runtime?.kind === 'durable_outbox' ? undefined : task.createdAt,
+        text: message.submittedText ?? message.text
+      })[0];
+    });
+    this.reconcileVisibleSessionMessages();
+    const pending = this.pendingSessionSendsByTaskId[sourceTaskId] ?? [];
+    if (pending.length === 0) {
       return;
     }
-    const next: Record<string, PendingSessionSend> = {};
+    const next: Record<string, PendingSessionSend[]> = {};
     Object.keys(this.pendingSessionSendsByTaskId).forEach((id: string) => {
-      if (id !== previousTaskId) {
+      if (id !== sourceTaskId) {
         next[id] = this.pendingSessionSendsByTaskId[id];
       }
     });
-    next[task.id] = pending;
     this.pendingSessionSendsByTaskId = next;
-    if (this.activeSessionTaskId === previousTaskId) {
+    pending.forEach((item: PendingSessionSend) => { this.rememberPendingSessionSend(task.id, item); });
+    this.recordSessionInputAcknowledgements(task);
+    if (this.activeSessionTaskId === sourceTaskId) {
       this.activeSessionTaskId = task.id;
     }
-    if (this.newSessionTaskId === previousTaskId) {
+    if (this.newSessionTaskId === sourceTaskId) {
       this.newSessionTaskId = task.id;
     }
-    this.log('info', 'session.message.pending.handed_off', `previousTaskId=${previousTaskId}; taskId=${task.id}; sessionId=${pending.sessionId}`);
+    this.log('info', 'session.message.pending.handed_off', `previousTaskId=${sourceTaskId}; taskId=${task.id}; sessionId=${pending[0].sessionId}; submissions=${pending.length}`);
   }
 
-  private clearPendingSessionSend(taskId: string): void {
+  private clearPendingSessionSend(taskId: string, submissionId: string = ''): void {
     if (taskId.length === 0 || !this.pendingSessionSendsByTaskId[taskId]) {
       return;
     }
-    const next: Record<string, PendingSessionSend> = {};
+    const next: Record<string, PendingSessionSend[]> = {};
     Object.keys(this.pendingSessionSendsByTaskId).forEach((id: string) => {
       if (id !== taskId) {
         next[id] = this.pendingSessionSendsByTaskId[id];
+      } else if (submissionId.length > 0) {
+        const remaining = this.pendingSessionSendsByTaskId[id]
+          .filter((pending: PendingSessionSend) => pending.submissionId !== submissionId);
+        if (remaining.length > 0) next[id] = remaining;
       }
     });
     this.pendingSessionSendsByTaskId = next;
@@ -5930,9 +6327,12 @@ struct Index {
 
   private async settleSubmittedOutboxReceipt(task: BridgeTask): Promise<void> {
     if (!this.isSubmittedOutboxReceipt(task)) return;
-    const pending = this.pendingSessionSendsByTaskId[task.id];
-    this.clearPendingSessionSend(task.id);
-    if (pending && pending.retryFailedMessageId.length > 0) this.removeFailedSessionMessage(pending.retryFailedMessageId);
+    const pending = (this.pendingSessionSendsByTaskId[task.id] ?? [])
+      .filter((item: PendingSessionSend) => !task.submissionId || item.submissionId === task.submissionId);
+    this.clearPendingSessionSend(task.id, task.submissionId ?? '');
+    pending.forEach((item: PendingSessionSend) => {
+      if (item.retryFailedMessageId.length > 0) this.removeFailedSessionMessage(item.retryFailedMessageId);
+    });
     if (this.currentTask?.id !== task.id) return;
     this.stopPolling();
     const sessionId = this.taskSessionId(task);
@@ -5952,11 +6352,13 @@ struct Index {
       }
       if (newDraft) {
         this.selectedSession = detail;
+        this.reconcileVisibleSessionMessages();
         this.activeSessionId = sessionId;
         this.commitSessionNavigation('session', sessionId, 'delivery_receipt');
         this.isNewSessionDraft = false;
       } else if (this.selectedSession !== null) {
         this.selectedSession = this.mergeSessionDetailPreservingHistory(this.selectedSession, detail);
+        this.reconcileVisibleSessionMessages();
       }
       this.applySessionActivitySnapshot(detail, 'delivery_receipt');
       this.clearSubmittedOutboxReceiptIfVisible(task);
@@ -5983,21 +6385,35 @@ struct Index {
     }, 5000);
   }
 
+  private recordSessionInputAcknowledgements(task: BridgeTask): void {
+    (this.pendingSessionSendsByTaskId[task.id] ?? []).forEach((pending: PendingSessionSend) => {
+      if (pending.deliveryAccepted || (!pending.isNewSession && this.taskSessionId(task) !== pending.sessionId)) return;
+      pending.deliveryAccepted = (task.events ?? []).some((event: BridgeEvent) => {
+        if (event.taskId && event.taskId !== task.id) return false;
+        if (event.type === 'task.guidance.accepted') {
+          return event.payload['submissionId'] === pending.submissionId && !!event.payload['turnId'];
+        }
+        const turn = event.payload['turn'] as Record<string, Object> | undefined;
+        return event.type === 'codex.app_server.turn.started'
+          && task.submissionId === pending.submissionId && !!turn?.['id'];
+      });
+    });
+  }
+
   private rememberFailedSessionMessageForTerminalTask(task: BridgeTask): void {
-    const pending = this.pendingSessionSendsByTaskId[task.id];
-    if (!pending) {
-      return;
-    }
+    this.recordSessionInputAcknowledgements(task);
+    const submissions = this.pendingSessionSendsByTaskId[task.id] ?? [];
+    submissions.forEach((pending: PendingSessionSend) => {
     if (pending.retryFailedMessageId.length > 0 && this.isFailedSessionRetryCanceled(pending.retryFailedMessageId)) {
-      this.clearPendingSessionSend(task.id);
+      this.clearPendingSessionSend(task.id, pending.submissionId);
       this.log('info', 'session.message.failed.retry_canceled_ignore_terminal', `taskId=${task.id}; failedId=${pending.retryFailedMessageId}; status=${task.status}`);
       return;
     }
-    if (task.status === 'completed') {
+    if (pending.deliveryAccepted === true) {
       if (pending.retryFailedMessageId.length > 0) {
         this.removeFailedSessionMessage(pending.retryFailedMessageId);
       }
-      this.clearPendingSessionSend(task.id);
+      this.clearPendingSessionSend(task.id, pending.submissionId);
       return;
     }
     if (pending.retryFailedMessageId.length > 0) {
@@ -6020,10 +6436,13 @@ struct Index {
       };
       if (this.failedSessionMessageHasCanonicalEntry(canonicalCandidate)) {
         this.removeFailedSessionMessage(pending.retryFailedMessageId);
-        this.clearPendingSessionSend(task.id);
+        this.clearPendingSessionSend(task.id, pending.submissionId);
         return;
       }
     }
+    // No ACK is different from a proven non-delivery. Keep uncertain inputs
+    // attached to their submission; only an unattempted delivery is retryable.
+    if (task.deliveryAttempted !== false) return;
     const error = task.status === 'failed'
       ? this.taskFailureMessage(task)
       : `任务已${this.statusLabel(task.status)}，消息没有完成投递`;
@@ -6038,7 +6457,8 @@ struct Index {
       files: pending.files,
       error
     });
-    this.clearPendingSessionSend(task.id);
+    this.clearPendingSessionSend(task.id, pending.submissionId);
+    });
   }
 
   private taskFailureMessage(task: BridgeTask): string {
@@ -6124,6 +6544,10 @@ struct Index {
         files: message.files,
         error: message.error,
         createdAt: message.createdAt,
+        submittedText: message.submittedText,
+        baselineEntryKeys: message.baselineEntryKeys,
+        turnId: message.turnId,
+        itemId: message.itemId,
         retrying: message.retrying,
         retryCount: message.retryCount,
         retryLimit: message.retryLimit,
@@ -6174,6 +6598,10 @@ struct Index {
       files: message.files.slice(),
       error: message.error,
       createdAt: message.createdAt,
+      submittedText: message.submittedText,
+      baselineEntryKeys: message.baselineEntryKeys,
+      turnId: message.turnId,
+      itemId: message.itemId,
       retrying: true,
       retryCount: message.retryCount + 1,
       retryLimit: message.retryLimit,
@@ -6228,6 +6656,10 @@ struct Index {
         files: message.files,
         error: error.length > 0 ? error : message.error,
         createdAt: message.createdAt,
+        submittedText: message.submittedText,
+        baselineEntryKeys: message.baselineEntryKeys,
+        turnId: message.turnId,
+        itemId: message.itemId,
         retrying,
         retryCount: message.retryCount,
         retryLimit: message.retryLimit,
@@ -6250,6 +6682,11 @@ struct Index {
     if (this.isBusy && source === 'manual') {
       return;
     }
+    if (message.isNewSession && (!this.isNewSessionDraft || this.selectedProjectId !== message.projectId)) {
+      this.message = '请先回到这条失败消息所属项目的新会话页面后再重试';
+      this.log('info', 'session.message.failed.retry_wrong_project', `failedId=${message.id}; source=${source}`);
+      return;
+    }
     const attempt = this.beginFailedSessionRetryAttempt(message.id, source);
     if (attempt === null) {
       return;
@@ -6260,42 +6697,45 @@ struct Index {
       this.scheduleFailedSessionAutoRetry(attempt.id, 'wrong_session');
       return;
     }
+    if (!this.preserveCurrentSessionDraft()) {
+      this.updateFailedSessionMessage(attempt.id, false, this.message);
+      return;
+    }
+    const navigationRevision = this.readSessionNavigation().revision;
+    const draftScope = this.currentSessionDraftScope();
     const previousText = this.sessionMessage;
     const previousImages = this.pendingSessionImages.slice();
     const previousFiles = this.pendingSessionFiles.slice();
+    const retryImages = attempt.images.slice();
+    const retryFiles = attempt.files.slice();
     this.sessionMessage = attempt.text;
-    this.pendingSessionImages = attempt.images.slice();
-    this.pendingSessionFiles = attempt.files.slice();
+    this.pendingSessionImages = retryImages;
+    this.pendingSessionFiles = retryFiles;
     this.log('info', 'session.message.failed.retry', `failedId=${attempt.id}; source=${source}; sessionId=${attempt.sessionId}; isNew=${attempt.isNewSession}; images=${attempt.images.length}; files=${attempt.files.length}`);
-    const ok = attempt.isNewSession
-      ? await this.sendNewSessionMessage(attempt.id)
-      : await this.sendMessageToSelectedSession(attempt.id);
-    if (!ok) {
+    const sending = attempt.isNewSession
+      ? this.sendNewSessionMessage(attempt.id)
+      : this.sendMessageToSelectedSession(attempt.id);
+    // Both sends capture input synchronously. Release the borrowed composer
+    // before yielding; a late result must never write over subsequent edits.
+    if (this.readSessionNavigation().revision === navigationRevision
+      && JSON.stringify(this.currentSessionDraftScope()) === JSON.stringify(draftScope)
+      && this.sessionMessage === attempt.text
+      && JSON.stringify(this.pendingSessionImages) === JSON.stringify(retryImages)
+      && JSON.stringify(this.pendingSessionFiles) === JSON.stringify(retryFiles)) {
       this.sessionMessage = previousText;
       this.pendingSessionImages = previousImages;
       this.pendingSessionFiles = previousFiles;
+    }
+    const ok = await sending;
+    if (!ok) {
       this.updateFailedSessionMessage(attempt.id, false, this.message);
       this.scheduleFailedSessionAutoRetry(attempt.id, 'retry_failed');
     }
   }
 
   private async recoverAfterGuardError(name: string, error: Object): Promise<boolean> {
-    const message = this.errorText(error);
-    if (name === 'interruptSelectedSessionTask' && this.isEndedTaskInterruptConflict(message)) {
-      await this.clearSelectedSessionRunningAfterEndedInterruptConflict();
-      return true;
-    }
-    if (name !== 'sendSessionMessage' && name !== 'sendNewSessionMessage') {
-      return false;
-    }
-    if (!this.isBridgeRequestTimeout(message)) {
-      return false;
-    }
-    const targetSessionId = this.sendingSessionTargetId;
-    const adopted = await this.adoptTaskAfterSendTimeout(targetSessionId, name);
-    if (adopted) {
-      return true;
-    }
+    // Send timeouts are recovered at the submitting Bridge call, where the
+    // immutable submission identity and navigation snapshot are still owned.
     return false;
   }
 
@@ -6339,54 +6779,518 @@ struct Index {
     }
   }
 
-  private async adoptTaskAfterSendTimeout(targetSessionId: string, source: string): Promise<boolean> {
+  private async adoptTaskAfterSendTimeout(targetSessionId: string, source: string, submissionId: string,
+    bridgeUrl: string = this.normalizedBridgeUrl(), bridgeToken: string = this.bridgeToken): Promise<BridgeTask | null> {
+    if (submissionId.length === 0) return null;
     try {
-      const tasks = await BridgeClient.listTasks(this.normalizedBridgeUrl(), this.bridgeToken);
-      this.tasks = tasks;
-      this.reconcileSessionTaskMonitor(tasks);
-      const summary = this.latestTaskSummaryForSession(tasks, targetSessionId);
+      const tasks = await BridgeClient.listTasks(bridgeUrl, bridgeToken);
+      const summary = tasks.find((candidate: BridgeTaskSummary) => candidate.submissionId === submissionId
+        && (targetSessionId === '__new_session__' || candidate.codexSessionId === targetSessionId
+          || candidate.createdCodexSessionId === targetSessionId)) ?? null;
       if (summary === null) {
         this.log('warn', 'task.timeout_adopt.none', `source=${source}; targetSessionId=${targetSessionId}`);
-        return false;
+        return null;
       }
       const task = this.taskUsesCodexRunApi(summary)
-        ? await BridgeClient.getCodexRun(this.normalizedBridgeUrl(), summary.id, this.bridgeToken)
-        : await BridgeClient.getTask(this.normalizedBridgeUrl(), summary.id, this.bridgeToken);
-      this.handoffPendingSessionSend(summary.id, task);
-      this.currentTask = task;
-      this.activeSessionTaskId = task.id;
-      this.activeSessionTaskTitle = this.activeTaskTitleFromSummary(summary);
-      this.syncSessionTaskMarkers(task);
-      this.message = this.isTaskTerminalStatus(task.status) ? '消息已提交，已同步完成状态' : '消息已提交，已恢复运行状态';
-      this.showTaskEventDetails = false;
-      if (this.isTaskTerminalStatus(task.status)) {
-        await this.handleTaskTerminalForSession(task, '', 'timeout_adopt');
-        const appliedLiveSession = this.applyTaskSessionSnapshot(task);
-        if (!appliedLiveSession && targetSessionId.length > 0 && targetSessionId !== '__new_session__') {
-          await this.loadSessionDetail(targetSessionId);
-        }
-      } else {
-        this.startPolling();
+        ? await BridgeClient.getCodexRun(bridgeUrl, summary.id, bridgeToken)
+        : await BridgeClient.getTask(bridgeUrl, summary.id, bridgeToken);
+      if (task.id !== summary.id || task.submissionId !== submissionId
+        || (targetSessionId !== '__new_session__' && this.taskSessionId(task) !== targetSessionId)) {
+        this.log('warn', 'task.timeout_adopt.identity_mismatch', `source=${source}; targetSessionId=${targetSessionId}`);
+        return null;
       }
       this.log('warn', 'task.timeout_adopted', `source=${source}; taskId=${task.id}; status=${task.status}; sessionId=${this.taskSessionId(task)}`);
-      return true;
+      return task;
     } catch (adoptError) {
       this.log('error', 'task.timeout_adopt.failed', `source=${source}; targetSessionId=${targetSessionId}; message=${this.errorText(adoptError)}`);
-      return false;
+      return null;
     }
   }
 
   private startPolling(): void {
-    this.stopPolling();
+    if (this.pollTimer >= 0) clearTimeout(this.pollTimer);
+    this.pollTimer = -1;
     this.taskPollStartedAt = Date.now();
     this.taskPollLastStatus = this.currentTask?.status ?? '';
     this.taskPollLastEventCount = this.currentTaskEventCount(this.currentTask);
     this.taskPollDelayMs = 2000;
+    this.syncTaskEventStream();
     this.scheduleNextTaskPoll(250);
   }
 
+  private stopTaskEventStream(): void {
+    this.taskStreamUiBatch?.cancel();
+    this.taskStreamUiBatch = null;
+    this.taskEventStream?.stop();
+    this.taskEventStream = null;
+    this.taskEventStreamKey = '';
+    this.taskEventStreamHealthy = false;
+  }
+
+  private syncTaskEventStream(): void {
+    this.syncSessionEventStream();
+    const task = this.currentTask;
+    const navigation = this.readSessionNavigation();
+    if (task !== null && this.taskStreamRepairId === task.id) return;
+    if (task !== null && this.taskStreamRepairId !== task.id) this.taskStreamRepairId = '';
+    if (task === null || !this.isTaskRunningStatus(task.status) || task.runtime?.kind === 'durable_outbox'
+      || this.companionSelected || (this.activeTab === 'sessions' && (navigation.mode === 'home'
+        || navigation.mode === 'session' && navigation.sessionId !== this.taskSessionId(task))) || (this.selectedSession !== null
+        && this.taskSessionId(task) !== this.selectedSession.id)) {
+      this.stopTaskEventStream();
+      return;
+    }
+    const key = JSON.stringify([this.normalizedBridgeUrl(), this.bridgeToken, task.id, this.taskUsesCodexRunApi(task)]);
+    if (this.taskEventStreamKey === key && this.taskEventStream !== null) return;
+    this.stopTaskEventStream();
+    this.taskEventStreamKey = key;
+    const path = this.taskUsesCodexRunApi(task) ? `/api/codex/runs/${encodeURIComponent(task.id)}/events`
+      : `/tasks/${encodeURIComponent(task.id)}/events`;
+    let lastDiagnosticAt: number = 0;
+    let diagnosticItemId: string = '';
+    let acceptedCursor: number = this.currentTaskEventCursor(task);
+    const acceptedIds: Set<string> = new Set<string>(task.events.map((event: BridgeEvent) => event.id));
+    let acceptedEvents: BridgeEvent[] = task.events;
+    let firstTextItem: string = '';
+    const batch = new StreamUiBatch<BridgeEvent>((events: BridgeEvent[]) => {
+      const active = this.currentTask;
+      if (key !== this.taskEventStreamKey || this.taskStreamUiBatch !== batch || active === null || active.id !== task.id
+        || this.readSessionNavigation().revision !== navigation.revision) return;
+      // A concurrent snapshot can already cover part or all of the pending batch.
+      if (active.events !== acceptedEvents) {
+        active.events.forEach((previous: BridgeEvent) => { acceptedIds.add(previous.id); });
+      }
+      const cursor = this.currentTaskEventCursor(active);
+      const fresh = events.filter((event: BridgeEvent) => (event.seq ?? 0) > cursor);
+      if (fresh.length === 0) return;
+      const seq = fresh[fresh.length - 1].seq ?? cursor;
+      this.currentTask = taskWithStreamEvents(active, active.events.concat(fresh), seq);
+      acceptedEvents = this.currentTask.events;
+      this.scrollSessionToBottomIfFollowing('task_stream');
+      fresh.forEach((event: BridgeEvent) => {
+        if (event.payload['method'] !== 'item/agentMessage/delta') return;
+        const params = event.payload['params'] as Record<string, Object>;
+        const itemId = typeof params['itemId'] === 'string' ? params['itemId'] as string : '';
+        if (lastDiagnosticAt === 0 || diagnosticItemId !== itemId || Date.now() - lastDiagnosticAt >= 1000) {
+          lastDiagnosticAt = Date.now();
+          diagnosticItemId = itemId;
+          this.logTaskStreamPresentation(seq);
+        }
+      });
+    });
+    this.taskStreamUiBatch = batch;
+    this.taskEventStream = new BridgeEventStream({
+      url: `${this.normalizedBridgeUrl()}${path}`, token: this.bridgeToken,
+      afterSeq: () => this.currentTask?.id === task.id
+        ? Math.max(acceptedCursor, this.currentTaskEventCursor(this.currentTask)) : 0,
+      onFrame: (frame: SseFrame) => {
+        if (key !== this.taskEventStreamKey || this.taskStreamUiBatch !== batch || this.currentTask?.id !== task.id
+          || this.readSessionNavigation().revision !== navigation.revision) return;
+        if (frame.event === 'stream.control') {
+          const control = JSON.parse(frame.data) as BridgeStreamControl;
+          this.log('info', 'task.stream.control', `clientAtMs=${Date.now()}; taskId=${task.id}; reason=${control.reason}; cursor=${this.currentTaskEventCursor(this.currentTask)}`);
+          if (control.reason === 'terminal' || control.reason === 'gap') {
+            batch.flush();
+            this.stopTaskEventStream();
+            this.taskStreamRepairId = task.id;
+            if (control.reason === 'gap' && this.currentTask !== null) {
+              this.currentTask = taskWithStreamEvents(this.currentTask, [], 0);
+            }
+            void this.recoverTaskEventStream();
+          }
+          return;
+        }
+        const event = JSON.parse(frame.data) as BridgeEvent;
+        const active = this.currentTask;
+        if (active === null || event.taskId !== task.id || !Number.isInteger(event.seq)
+          || (event.seq ?? 0) < 1 || typeof event.id !== 'string' || typeof event.type !== 'string'
+          || event.payload === null || typeof event.payload !== 'object') return;
+        if (active.events !== acceptedEvents) {
+          active.events.forEach((previous: BridgeEvent) => { acceptedIds.add(previous.id); });
+          acceptedEvents = active.events;
+        }
+        const cursor = Math.max(acceptedCursor, this.currentTaskEventCursor(active));
+        const seq = event.seq ?? 0;
+        if (seq <= cursor || acceptedIds.has(event.id)) return;
+        if (seq > cursor + 1) {
+          batch.flush();
+          this.stopTaskEventStream();
+          this.taskStreamRepairId = task.id;
+          void this.recoverTaskEventStream();
+          return;
+        }
+        acceptedCursor = seq;
+        acceptedIds.add(event.id);
+        const method = event.payload['method'];
+        const needsSnapshot = taskStreamNeedsSnapshot(event);
+        let immediate = needsSnapshot || method === 'item/completed'
+          || event.type === 'codex.exec.event' && event.payload['type'] === 'item.completed';
+        if (method === 'item/agentMessage/delta') {
+          const params = event.payload['params'] as Record<string, Object>;
+          const item = JSON.stringify([params['turnId'] ?? '', params['itemId'] ?? '']);
+          if (typeof params['delta'] === 'string' && (params['delta'] as string).length > 0 && firstTextItem !== item) {
+            firstTextItem = item;
+            this.log('info', 'task.stream.first_text_received', `taskId=${task.id}; itemId=${params['itemId'] ?? ''}; seq=${seq}`);
+            immediate = true;
+          }
+        } else if (method === 'item/completed') {
+          firstTextItem = '';
+        }
+        batch.enqueue(event, immediate);
+        if (needsSnapshot) void this.recoverTaskEventStream();
+      },
+      onState: (state: string) => {
+        if (key !== this.taskEventStreamKey || this.taskStreamUiBatch !== batch) return;
+        this.taskEventStreamHealthy = state === 'open';
+        this.log('info', 'task.stream.state', `clientAtMs=${Date.now()}; taskId=${task.id}; state=${state}; cursor=${this.currentTaskEventCursor(this.currentTask)}`);
+        if (state === 'auth_error' || state === 'unavailable') {
+          this.log('warn', 'task.stream.fallback', `taskId=${task.id}; state=${state}`);
+        }
+      },
+      onReconnect: () => {
+        if (key !== this.taskEventStreamKey || this.taskStreamUiBatch !== batch) return;
+        batch.flush();
+        void this.recoverTaskEventStream();
+      }
+    });
+    this.taskEventStream.start();
+  }
+
+  private logTaskStreamPresentation(seq: number): void {
+    const task = this.currentTask;
+    if (task === null) return;
+    const visible = this.selectedVisibleTask();
+    const rows = this.sessionTimelineRows();
+    const rowIndex = rows.findIndex((row: SessionTimelineRow) => row.entry?.type === 'live_agent_streaming');
+    const live = rowIndex >= 0 ? rows[rowIndex].entry : undefined;
+    this.log('info', 'task.stream.presentation', `clientAtMs=${Date.now()}; taskId=${task.id}; seq=${seq}; visible=${visible?.id === task.id}; streamLength=${this.streamingAgentTextForTask(task).length}; rowLength=${live?.text.length ?? 0}; rowIndex=${rowIndex}; rowCount=${rows.length}; timestamp=${live?.timestamp ?? ''}; autoFollow=${this.sessionAutoFollowBottom}`);
+  }
+
+  private async recoverTaskEventStream(): Promise<void> {
+    if (this.taskStreamRecovering) return;
+    this.taskStreamRecovering = true;
+    try { await this.refreshTask(); }
+    catch (_) { return; /* Existing bounded polling owns snapshot retry. */ }
+    finally { this.taskStreamRecovering = false; }
+    this.syncSessionEventStream();
+    if (this.currentTask !== null && this.isTaskRunningStatus(this.currentTask.status)) this.syncTaskEventStream();
+  }
+
+  private stopSessionEventStream(): void {
+    this.selectedControlStreamHealthy = false;
+    this.selectedSessionControl = null;
+    this.continueStatusRequestSequence += 1;
+    this.sessionStreamUiBatch?.cancel();
+    this.sessionStreamUiBatch = null;
+    this.sessionEventStream?.stop();
+    this.sessionEventStream = null;
+    this.sessionEventStreamKey = '';
+    this.sessionStreamRefreshGeneration += 1;
+    this.sessionStreamRefreshing = false;
+    this.sessionStreamRefreshPending = false;
+  }
+
+  private sessionStreamDiagnosticMatch(incoming: CodexSessionEntry, candidate: CodexSessionEntry): boolean {
+    if (incoming.threadId && candidate.threadId && incoming.threadId !== candidate.threadId) return false;
+    if (incoming.syncId && candidate.syncId) return incoming.syncId === candidate.syncId;
+    if (!incoming.itemId || incoming.itemId !== candidate.itemId) return false;
+    return !incoming.turnId || !candidate.turnId || incoming.turnId === candidate.turnId;
+  }
+
+  private stopRuntimeEventStream(): void {
+    this.runtimeEventStreamKey = '';
+    this.runtimeEventStream?.stop();
+    this.runtimeEventStream = null;
+    this.runtimeDesktopConnected = false;
+    this.runtimeConnectionState = 'connecting';
+    this.selectedSessionControl = null;
+    this.continueStatusRequestSequence += 1;
+  }
+
+  private syncRuntimeEventStream(): void {
+    const baseUrl = this.normalizedBridgeUrl();
+    const token = this.bridgeToken;
+    if (!baseUrl || !token) { this.stopRuntimeEventStream(); return; }
+    const key = JSON.stringify([baseUrl, token]);
+    if (this.runtimeEventStreamKey === key && this.runtimeEventStream?.isRunning()) return;
+    this.stopRuntimeEventStream();
+    this.runtimeEventStreamKey = key;
+    this.runtimeEventStream = new BridgeEventStream({
+      url: `${baseUrl}/api/codex/runtime-events`, token,
+      afterSeq: () => 0, cursorEnabled: false,
+      onFrame: (frame: SseFrame) => {
+        if (key !== this.runtimeEventStreamKey || baseUrl !== this.normalizedBridgeUrl() || token !== this.bridgeToken) return;
+        if (frame.event === 'runtime.transition') {
+          const transition = JSON.parse(frame.data) as CodexContinueStatus;
+          if (transition.threadId && transition.turnId && ['completed', 'failed'].includes(transition.state)) {
+            void this.publishNativeTurnCompletion(transition);
+          }
+          return;
+        }
+        if (frame.event !== 'runtime.snapshot') return;
+        const value = JSON.parse(frame.data) as CodexLiveRuntimeFrame;
+        if (!value.desktop || typeof value.desktop.connected !== 'boolean') return;
+        this.runtimeDesktopConnected = value.desktop.connected === true;
+        const runtime = value.snapshot;
+        if (runtime === null) { this.sessionRuntimeStore.markStale(); return; }
+        if (runtime.schemaVersion !== 1 || !runtime.epoch || !Number.isInteger(runtime.revision)
+          || !Array.isArray(runtime.sessions) || !Number.isFinite(Date.parse(runtime.generatedAt))) return;
+        if (!this.sessionRuntimeStore.apply(runtime)) return;
+        this.latestRuntimeSnapshot = this.sessionRuntimeStore.snapshot();
+        if (!runtime.stale) {
+          const runtimeSessions = this.sessionRuntimeStore.mergeSessions(this.sessions);
+          const sessions = reconcileSessionSidebar(this.sessions, runtimeSessions,
+            this.shouldFreezeSessionList(runtimeSessions.length));
+          if (JSON.stringify(sessions) !== JSON.stringify(this.sessions)) {
+            this.sessions = sessions;
+            this.reconcileSessionActivityMonitor(sessions);
+          }
+        }
+      },
+      onState: (state: string) => {
+        if (key !== this.runtimeEventStreamKey) return;
+        this.runtimeConnectionState = state;
+        if (state !== 'open') {
+          this.runtimeDesktopConnected = false;
+          this.sessionRuntimeStore.markStale();
+        }
+      },
+      onReconnect: () => { /* The new handshake sends one canonical snapshot. */ }
+    });
+    this.runtimeEventStream.start();
+  }
+
+  private liveDesktopLabel(): string {
+    if (this.runtimeDesktopConnected && this.runtimeConnectionState === 'open') return '桌面在线';
+    if (this.runtimeConnectionState === 'connecting') return '桌面连接中';
+    if (this.runtimeConnectionState === 'auth_error') return '连接待验证';
+    return '桌面未连接';
+  }
+
+  private liveSessionLabel(): string {
+    const sessionId = this.selectedSession?.id ?? '';
+    if (this.sessionContinueBusyId === sessionId && sessionId.length > 0) return '正在继续';
+    if (this.sessionContinueUncertainIds.includes(sessionId)) return '继续结果待确认';
+    if (!this.runtimeDesktopConnected) return '状态待同步';
+    const runtime = this.latestRuntimeSnapshot?.stale !== true
+      ? this.latestRuntimeSnapshot?.sessions.find((item: CodexRuntimeSession) => item.threadId === sessionId) : undefined;
+    if (runtime && ['running', 'waiting_input', 'waiting_approval', 'recovering'].includes(runtime.state)) {
+      return sessionControlStateLabel(runtime.state);
+    }
+    if (this.selectedSessionControl?.threadId === sessionId) return sessionControlStateLabel(this.selectedSessionControl.state);
+    if (runtime?.nativeState === 'notLoaded') return '会话未加载';
+    if (runtime?.nativeState === 'systemError') return '会话连接异常';
+    return sessionControlStateLabel(runtime?.state ?? 'unknown');
+  }
+
+  private applySessionControlStatus(status: CodexContinueStatus): void {
+    if (!status || status.threadId !== this.selectedSession?.id || typeof status.turnId !== 'string'
+      || typeof status.canContinue !== 'boolean' || typeof status.state !== 'string') return;
+    this.continueStatusRequestSequence += 1;
+    this.selectedSessionControl = status;
+    const uncertainTurn = this.continueUncertainTurnIds[status.threadId];
+    if (uncertainTurn && status.turnId.length > 0 && status.turnId !== uncertainTurn) {
+      this.sessionContinueUncertainIds = this.sessionContinueUncertainIds.filter((id: string) => id !== status.threadId);
+      this.continueUncertainTurnIds[status.threadId] = '';
+    }
+  }
+
+  private async refreshContinueStatus(): Promise<void> {
+    const threadId = this.selectedSession?.id ?? '';
+    if (!threadId || this.isNewSessionDraft || this.companionSelected) return;
+    const baseUrl = this.normalizedBridgeUrl();
+    const token = this.bridgeToken;
+    const navigation = this.readSessionNavigation();
+    const sequence = ++this.continueStatusRequestSequence;
+    try {
+      const status = await BridgeClient.getContinueStatus(baseUrl, threadId, token);
+      if (sequence !== this.continueStatusRequestSequence || baseUrl !== this.normalizedBridgeUrl()
+        || token !== this.bridgeToken || navigation.revision !== this.readSessionNavigation().revision) return;
+      this.applySessionControlStatus(status);
+    } catch (_) { /* A status read never starts or resumes the conversation. */ }
+  }
+
+  private canContinueSelectedSession(): boolean {
+    if (this.isNewSessionDraft || this.companionSelected || this.selectedSessionControl?.threadId !== this.selectedSession?.id) return false;
+    const sessionId = this.selectedSession?.id ?? '';
+    return canContinueNativeSession(this.selectedSessionControl,
+      this.runtimeDesktopConnected && this.runtimeConnectionState === 'open' && this.selectedControlStreamHealthy,
+      this.hasSessionDraftContent(), this.sessionContinueBusyId.length > 0,
+      this.sessionContinueUncertainIds.includes(sessionId));
+  }
+
+  private async continueSelectedSession(): Promise<void> {
+    if (!this.canContinueSelectedSession() || this.selectedSessionControl === null) return;
+    const threadId = this.selectedSessionControl.threadId;
+    const turnId = this.selectedSessionControl.turnId;
+    const navigation = this.readSessionNavigation();
+    const baseUrl = this.normalizedBridgeUrl();
+    const token = this.bridgeToken;
+    const operationId = util.generateRandomUUID(true);
+    this.sessionContinueBusyId = threadId;
+    try {
+      const result = await BridgeClient.continueSession(baseUrl, threadId, token, operationId, turnId);
+      if (result.state === 'uncertain') {
+        this.continueUncertainTurnIds[threadId] = turnId;
+        this.sessionContinueUncertainIds = Array.from(new Set<string>([...this.sessionContinueUncertainIds, threadId]));
+      }
+      if (baseUrl !== this.normalizedBridgeUrl() || token !== this.bridgeToken
+        || navigation.revision !== this.readSessionNavigation().revision || this.selectedSession?.id !== threadId) return;
+      this.selectedSessionControl = { threadId, turnId: result.turnId || turnId, canContinue: false,
+        reason: result.reason, state: result.active ? 'active' : 'unknown' };
+      this.message = result.state === 'confirmed' ? '已继续当前会话'
+        : result.state === 'uncertain' ? '继续结果待确认，正在同步状态' : '当前回合已变化，请等待状态同步';
+      void this.refreshContinueStatus();
+      void this.refreshSelectedSessionDetail();
+    } catch (_) {
+      // A lost write response is not evidence that nothing happened. Do not
+      // generate a second operation merely because the phone reconnected.
+      this.continueUncertainTurnIds[threadId] = turnId;
+      this.sessionContinueUncertainIds = Array.from(new Set<string>([...this.sessionContinueUncertainIds, threadId]));
+      if (baseUrl === this.normalizedBridgeUrl() && token === this.bridgeToken
+        && navigation.revision === this.readSessionNavigation().revision && this.selectedSession?.id === threadId) {
+        this.message = '继续结果待确认，请等待状态同步';
+      }
+    } finally {
+      if (this.sessionContinueBusyId === threadId) this.sessionContinueBusyId = '';
+    }
+  }
+
+  private sessionPrimaryActionAccessibilityText(): string {
+    const mode = this.sessionPrimaryActionMode();
+    if (mode === 'continue') return '继续当前会话';
+    if (mode === 'continuing') return '正在继续当前会话';
+    return this.shouldUseSessionInterruptAction() ? '停止回复' : '发送消息';
+  }
+
+  private claimNativeTurnCompletion(threadId: string, turnId: string): boolean {
+    if (!turnId) return true;
+    const key = `${threadId}:${turnId}`;
+    if (this.notifiedNativeTurnIds.includes(key)) return false;
+    this.notifiedNativeTurnIds = [...this.notifiedNativeTurnIds, key].slice(-300);
+    return true;
+  }
+
+  private async publishNativeTurnCompletion(status: CodexContinueStatus): Promise<void> {
+    if (!['completed', 'failed'].includes(status.state)) return;
+    if (!this.claimNativeTurnCompletion(status.threadId, status.turnId)) return;
+    if (!this.isSessionCurrentlyRead(status.threadId)) this.markSessionUnreadCompleted(status.threadId);
+    await this.publishBasicCompletionNotification(status.threadId, '', status.state === 'failed', 'running', 'desktop-runtime');
+  }
+
+  private syncSessionEventStream(): void {
+    const session = this.selectedSession;
+    const navigation = this.readSessionNavigation();
+    const task = this.selectedVisibleTask();
+    const taskOwnsText = task !== null && this.isTaskRunningStatus(task.status)
+      && session?.sync?.source !== 'desktop-official'
+      && task.runtime?.kind !== 'durable_outbox' && this.taskSessionId(task) === session?.id;
+    if (this.activeTab !== 'sessions' || this.companionSelected || this.isNewSessionDraft
+      || session === null || taskOwnsText || navigation.mode !== 'session' || navigation.sessionId !== session.id) {
+      this.stopSessionEventStream();
+      return;
+    }
+    const streamUrl = this.normalizedBridgeUrl();
+    const streamToken = this.bridgeToken;
+    const key = JSON.stringify([streamUrl, streamToken, session.id]);
+    if (key === this.sessionEventStreamKey && this.sessionEventStream !== null) return;
+    this.stopSessionEventStream();
+    this.sessionStreamEntries = this.sessionStreamEntries.filter((entry: CodexSessionEntry) => entry.threadId === session.id);
+    this.sessionEventStreamKey = key;
+    void this.refreshContinueStatus();
+    const seenItems: Set<string> = new Set<string>();
+    const batch = new StreamUiBatch<CodexSessionEntry>((updates: CodexSessionEntry[]) => {
+      if (key !== this.sessionEventStreamKey || this.sessionStreamUiBatch !== batch
+        || streamUrl !== this.normalizedBridgeUrl() || streamToken !== this.bridgeToken
+        || this.readSessionNavigation().revision !== navigation.revision
+        || this.selectedSession?.id !== session.id || this.activeTab !== 'sessions' || this.companionSelected) return;
+      let entries = this.sessionStreamEntries;
+      updates.forEach((entry: CodexSessionEntry) => { entries = upsertSessionLiveEntry(entries, entry); });
+      entries = pruneSessionLiveEntries(entries, session.id, this.selectedSession.sync?.completedTurnIds ?? []);
+      if (entries === this.sessionStreamEntries) return;
+      this.sessionStreamEntries = entries;
+      this.scrollSessionToBottomIfFollowing('session_stream');
+      if (Date.now() - this.sessionStreamDiagnosticAt >= 1000) {
+        this.sessionStreamDiagnosticAt = Date.now();
+        const entry = updates[updates.length - 1];
+        const committed = this.sessionStreamEntries.find((candidate: CodexSessionEntry) => this.sessionStreamDiagnosticMatch(entry, candidate));
+        const history = this.selectedSession?.entries.find((candidate: CodexSessionEntry) => this.sessionStreamDiagnosticMatch(entry, candidate));
+        const visible = this.visibleSessionEntries().find((candidate: CodexSessionEntry) => this.sessionStreamDiagnosticMatch(entry, candidate));
+        this.log('info', 'session.stream.message', `clientAtMs=${Date.now()}; sessionId=${session.id}; itemId=${entry.itemId}; length=${entry.text.length}; phase=${entry.liveKind}; committedLength=${committed?.text.length ?? -1}; committedPhase=${committed?.liveKind ?? ''}; historyLength=${history?.text.length ?? -1}; historyPhase=${history?.liveKind ?? ''}; visibleLength=${visible?.text.length ?? -1}; visiblePhase=${visible?.liveKind ?? ''}; autoFollow=${this.sessionAutoFollowBottom}`);
+      }
+    });
+    this.sessionStreamUiBatch = batch;
+    this.sessionEventStream = new BridgeEventStream({
+      url: `${this.normalizedBridgeUrl()}/api/codex/threads/${encodeURIComponent(session.id)}/events`,
+      token: this.bridgeToken, cursorEnabled: false, afterSeq: () => 0,
+      onFrame: (frame: SseFrame) => {
+        if (key !== this.sessionEventStreamKey || this.sessionStreamUiBatch !== batch
+          || streamUrl !== this.normalizedBridgeUrl() || streamToken !== this.bridgeToken
+          || this.readSessionNavigation().revision !== navigation.revision
+          || this.selectedSession?.id !== session.id
+          || this.activeTab !== 'sessions' || this.companionSelected) return;
+        if (frame.event === 'session.status') {
+          this.applySessionControlStatus(JSON.parse(frame.data) as CodexContinueStatus);
+          return;
+        }
+        if (frame.event === 'session.invalidate') {
+          batch.flush();
+          void this.refreshSessionEventHistory(key);
+          return;
+        }
+        if (frame.event !== 'session.message') return;
+        const entry = (JSON.parse(frame.data) as SessionStreamMessage).entry;
+        if (!entry || entry.threadId !== session.id || !entry.itemId || !entry.turnId
+          || (entry.role !== 'assistant' && entry.role !== 'tool')
+          || typeof entry.text !== 'string' || !entry.timestamp) return;
+        if (entry.role === 'tool' && (entry.toolItems?.length ?? 0) === 0) return;
+        if (entry.role === 'assistant') entry.type = entry.liveKind === 'streaming' ? 'live_agent_streaming' : 'agentMessage';
+        const item = JSON.stringify([entry.turnId, entry.itemId]);
+        const immediate = entry.role === 'tool' || entry.liveKind !== 'streaming' || entry.text.length > 0 && !seenItems.has(item);
+        if (entry.role === 'assistant' && entry.text.length > 0 && !seenItems.has(item)) {
+          this.log('info', 'session.stream.first_text_received', `sessionId=${session.id}; itemId=${entry.itemId}; phase=${entry.liveKind}`);
+        }
+        if (entry.text.length > 0) seenItems.add(item);
+        batch.enqueue(entry, immediate);
+      },
+      onState: (state: string) => {
+        if (key === this.sessionEventStreamKey && this.sessionStreamUiBatch === batch) {
+          this.selectedControlStreamHealthy = state === 'open';
+          this.log('info', 'session.stream.state', `clientAtMs=${Date.now()}; sessionId=${session.id}; state=${state}`);
+        }
+      },
+      onReconnect: () => {
+        if (key !== this.sessionEventStreamKey || this.sessionStreamUiBatch !== batch) return;
+        batch.flush();
+        void this.refreshSessionEventHistory(key);
+      }
+    });
+    this.sessionEventStream.start();
+  }
+
+  private async refreshSessionEventHistory(key: string): Promise<void> {
+    if (key !== this.sessionEventStreamKey) return;
+    if (this.sessionStreamRefreshing) {
+      this.sessionStreamRefreshPending = true;
+      return;
+    }
+    const generation = this.sessionStreamRefreshGeneration;
+    this.sessionStreamRefreshing = true;
+    try {
+      do {
+        this.sessionStreamRefreshPending = false;
+        try { await this.refreshSelectedSessionDetail(); }
+        catch (_) { /* Dashboard polling remains the bounded history recovery path. */ }
+      } while (generation === this.sessionStreamRefreshGeneration
+        && key === this.sessionEventStreamKey && this.sessionStreamRefreshPending);
+    } finally {
+      if (generation === this.sessionStreamRefreshGeneration) this.sessionStreamRefreshing = false;
+    }
+  }
+
   private scheduleNextTaskPoll(delayMs: number): void {
-    if (this.currentTask === null || !this.isTaskRunningStatus(this.currentTask.status)) {
+    if (this.currentTask === null
+      || (!this.isTaskRunningStatus(this.currentTask.status) && this.currentTask.hasMoreEvents !== true)) {
       this.stopPolling();
       return;
     }
@@ -6396,16 +7300,19 @@ struct Index {
     this.pollTimer = setTimeout(() => {
       this.pollTimer = -1;
       void this.refreshTaskFromTimer();
-    }, delayMs);
+    }, this.taskEventStreamHealthy ? Math.max(10000, delayMs) : delayMs);
   }
 
   private async refreshTaskFromTimer(): Promise<void> {
+    this.syncTaskEventStream();
     try {
       await this.refreshTask();
     } catch (error) {
       this.log('warn', 'task.poll.failed', `taskId=${this.currentTask?.id ?? ''}; message=${this.errorText(error)}`);
+      this.taskPollDelayMs = Math.max(2000, this.taskPollDelayMs);
     }
-    if (this.currentTask !== null && this.isTaskRunningStatus(this.currentTask.status)) {
+    if (this.currentTask !== null
+      && (this.isTaskRunningStatus(this.currentTask.status) || this.currentTask.hasMoreEvents === true)) {
       this.scheduleNextTaskPoll(this.taskPollDelayMs);
     }
   }
@@ -6413,6 +7320,29 @@ struct Index {
   onPageShow(): void {
     this.guardianPageVisible = true;
     this.startGuardianRefresh();
+    if (this.appForeground) this.appForegroundChanged();
+  }
+
+  private appForegroundChanged(): void {
+    this.log('info', 'app.foreground.changed', `foreground=${this.appForeground}`);
+    if (!this.appForeground) return;
+    void this.applyPendingNotificationNavigation();
+    this.syncRuntimeEventStream();
+    // Healthy Codex subscriptions survive backgrounding; only retired stream
+    // owners need replacement when the Ability becomes visible again.
+    if (this.taskEventStream !== null && !this.taskEventStream.isRunning()) this.stopTaskEventStream();
+    if (this.sessionEventStream !== null && !this.sessionEventStream.isRunning()) this.stopSessionEventStream();
+    if (this.companionEventStream !== null && !this.companionEventStream.isRunning()) this.stopCompanionEventStream();
+    this.syncTaskEventStream();
+    if (this.companionSelected) {
+      this.startCompanionPolling();
+      this.syncCompanionEventStream();
+    }
+    this.syncPushRegistration();
+    void this.refreshDashboard(false);
+    if (this.selectedSession !== null && !this.isNewSessionDraft && !this.companionSelected) {
+      void this.refreshSelectedSessionDetail();
+    }
   }
 
   onPageHide(): void {
@@ -6421,6 +7351,8 @@ struct Index {
   }
 
   private guardianCredentialChanged(): void {
+    this.stopRuntimeEventStream();
+    this.syncRuntimeEventStream();
     this.guardianGeneration++;
     this.guardianRequestSequence++;
     this.guardian = null;
@@ -6602,6 +7534,8 @@ struct Index {
       this.reconcileSessionTaskMonitor(this.tasks);
       await this.adoptSelectedSessionTaskFromSummaries(this.tasks);
       await this.adoptRunningTaskFromSummaries(this.tasks);
+      this.syncSessionEventStream();
+      if (this.selectedSession !== null && !this.companionSelected && this.activeTab === 'sessions') void this.loadOutbox();
       if (shouldRefreshSessions) {
         const latestSessions = await this.loadCanonicalSessionSummaries('dashboard');
         this.lastSessionsRefreshAt = now;
@@ -6629,6 +7563,13 @@ struct Index {
       }
     } catch (err) {
       const errorMessage = this.errorText(err);
+      // Startup negotiation can fail before the first session request. Keep
+      // that failure visible instead of presenting an unverified empty list.
+      if (this.sessions.length === 0 && this.sessionsLoadError.length === 0) {
+        this.sessionsLoadError = errorMessage;
+        this.sessionsFailureDiagnosticsAvailable = false;
+        this.sessionsFailureDetailsExpanded = false;
+      }
       this.message = this.sessionsLoadError === errorMessage ? this.sessionConnectionFailure().title : errorMessage;
       this.dashboardFailureCount += 1;
       if (this.dashboardFailureCount === 1) {
@@ -6650,6 +7591,13 @@ struct Index {
         }
       } catch (error) {
         this.log('warn', 'dashboard.session_detail.refresh.skipped', `sessionId=${this.selectedSession?.id ?? ''}; message=${this.errorText(error)}`);
+      }
+    }
+    if (this.activeTab === 'sessions' && !this.isSavingReasoningEffort) {
+      if (this.selectedSession !== null && !this.isNewSessionDraft) {
+        void this.loadSessionReasoningEffort(this.selectedSession.id, force);
+      } else if (this.isNewSessionDraft) {
+        void this.loadDesktopReasoningDefaults(force);
       }
     }
     if (this.hasRunningSessionTask() && this.pollTimer < 0) {
@@ -6743,8 +7691,10 @@ struct Index {
 
   private async loadCanonicalSessionSummaries(source: string): Promise<CodexSessionSummary[]> {
     void this.loadCompanionProfile();
+    const pushSnapshotUrl = this.normalizedBridgeUrl();
+    const pushSnapshotToken = this.bridgeToken;
     const sessionsPromise: Promise<CodexSessionSummary[]> =
-      BridgeClient.listSessions(this.normalizedBridgeUrl(), this.bridgeToken);
+      BridgeClient.listSessions(pushSnapshotUrl, pushSnapshotToken);
     const runtimePromise: Promise<CodexRuntimeSnapshot> =
       BridgeClient.getRuntimeSnapshot(this.normalizedBridgeUrl(), this.bridgeToken);
     let sessions: CodexSessionSummary[];
@@ -6770,6 +7720,26 @@ struct Index {
     this.sessionsLoadError = '';
     this.sessionsFailureDiagnosticsAvailable = false;
     this.sessionsFailureDetailsExpanded = false;
+    if (pushSnapshotUrl === this.normalizedBridgeUrl() && pushSnapshotToken === this.bridgeToken) {
+      const key = JSON.stringify([pushSnapshotUrl, pushSnapshotToken]);
+      const previousPushIds = this.pushSessionSnapshotKey === key ? this.pushThreadIds : [];
+      let pushRuntime: CodexRuntimeSnapshot | null = null;
+      try { pushRuntime = await runtimePromise; } catch (_) {}
+      if (pushSnapshotUrl !== this.normalizedBridgeUrl() || pushSnapshotToken !== this.bridgeToken) {
+        return this.sessionRuntimeStore.mergeSessions(sessions);
+      }
+      const activePushIds = pushRuntime !== null && !pushRuntime.stale && Array.isArray(pushRuntime.sessions)
+        ? pushRuntime.sessions.filter((item: CodexRuntimeSession) =>
+          ['running', 'waiting_input', 'waiting_approval', 'recovering'].includes(item.state))
+          .map((item: CodexRuntimeSession) => item.threadId) : [];
+      const confirmedEmpty = sessions.length === 0 && pushRuntime !== null && !pushRuntime.stale
+        && Array.isArray(pushRuntime.sessions) && pushRuntime.sessions.length === 0;
+      this.pushSessionSnapshotKey = key;
+      this.pushThreadIds = confirmedEmpty ? [] : Array.from(new Set<string>([
+        ...activePushIds, ...sessions.map((session: CodexSessionSummary) => session.id), ...previousPushIds
+      ])).slice(0, 100);
+      this.syncPushRegistration();
+    }
     return this.sessionRuntimeStore.mergeSessions(sessions);
   }
 
@@ -6838,44 +7808,59 @@ struct Index {
   }
 
   private async loadSessionDetail(sessionId: string): Promise<void> {
+    this.pendingSessionLoadError = '';
     const requestSeq = ++this.sessionDetailRequestSeq;
+    const snapshotRevision = this.beginSessionDetailSnapshotRead(sessionId);
+    const navigationRevision = this.readSessionNavigation().revision;
+    const bridgeUrl = this.normalizedBridgeUrl();
+    const bridgeToken = this.bridgeToken;
     try {
       const detail = await BridgeClient.getSessionHistoryPage(
-        this.normalizedBridgeUrl(),
+        bridgeUrl,
         sessionId,
-        this.bridgeToken,
-        160
+        bridgeToken,
+        1
       );
-      if (requestSeq !== this.sessionDetailRequestSeq) {
+      if (requestSeq !== this.sessionDetailRequestSeq || this.sessionDetailSnapshotRevisions.get(sessionId) !== snapshotRevision
+        || !this.isSessionNavigationCurrent(navigationRevision, sessionId)
+        || this.normalizedBridgeUrl() !== bridgeUrl || this.bridgeToken !== bridgeToken) {
         this.log('warn', 'session.detail.stale_ignored', `sessionId=${sessionId}; requestSeq=${requestSeq}; latestSeq=${this.sessionDetailRequestSeq}`);
         return;
       }
       const sameSession = this.selectedSession !== null && this.selectedSession.id === sessionId;
       if (sameSession && this.selectedSession !== null) {
         this.selectedSession = this.mergeSessionDetailPreservingHistory(this.selectedSession, detail);
+        this.reconcileVisibleSessionMessages();
       } else {
         this.sessionAutoFollowBottom = true;
         this.selectedSession = detail;
+        this.reconcileVisibleSessionMessages();
+        this.sessionTimelineStartKey = earlierSessionRenderStartKey(this.allSessionTimelineRows());
       }
       this.activeSessionId = sessionId;
       this.applySessionActivitySnapshot(detail, 'detail');
       const receiptTask = this.currentTask;
       if (receiptTask && this.isSubmittedOutboxReceipt(receiptTask)) this.clearSubmittedOutboxReceiptIfVisible(receiptTask);
       this.lastSelectedSessionDetailRefreshAt = Date.now();
+      this.syncSessionEventStream();
+      void this.loadOutbox();
       this.markSessionRead(sessionId);
       this.message = `已打开会话：${this.selectedSession.title}`;
       this.log('info', 'session.detail.loaded', `sessionId=${sessionId}; entries=${this.selectedSession.entryCount}`);
       this.scrollSessionToBottomIfFollowing('detail_loaded');
       void this.refreshDesktopInteractions();
       if (!sameSession) {
-        await this.loadSessionReasoningEffort(sessionId);
+        void this.loadSessionReasoningEffort(sessionId);
       }
     } catch (err) {
-      if (requestSeq !== this.sessionDetailRequestSeq) {
+      if (requestSeq !== this.sessionDetailRequestSeq || this.sessionDetailSnapshotRevisions.get(sessionId) !== snapshotRevision
+        || !this.isSessionNavigationCurrent(navigationRevision, sessionId)
+        || this.normalizedBridgeUrl() !== bridgeUrl || this.bridgeToken !== bridgeToken) {
         this.log('warn', 'session.detail.stale_error_ignored', `sessionId=${sessionId}; requestSeq=${requestSeq}; latestSeq=${this.sessionDetailRequestSeq}; message=${this.errorText(err)}`);
         return;
       }
       this.message = err instanceof Error ? err.message : String(err);
+      if (this.selectedSession?.id !== sessionId) this.pendingSessionLoadError = this.message;
       this.log('error', 'session.detail.failed', `sessionId=${sessionId}; message=${this.message}`);
     }
   }
@@ -6903,6 +7888,15 @@ struct Index {
   }
 
   private commitSessionNavigation(mode: string, sessionId: string, source: string): void {
+    this.stopTaskEventStream();
+    this.stopSessionEventStream();
+    this.sessionStreamEntries = [];
+    this.sessionTimelineStartKey = '';
+    this.pendingSessionLoadError = '';
+    this.sessionHistoryRequestSeq += 1;
+    this.isLoadingOlderSessionEntries = false;
+    this.historyScrollAnchorKey = '';
+    this.sessionUserScrollActive = false;
     const current = this.readSessionNavigation();
     const next: SessionNavigationSnapshot = {
       revision: current.revision + 1,
@@ -6948,21 +7942,50 @@ struct Index {
     this.log('info', 'session.rotation_restore.completed', `sessionId=${sessionId}; layout=${this.isLandscapeSessionLayout() ? 'landscape' : 'portrait'}`);
   }
 
+  private beginSessionDetailSnapshotRead(sessionId: string): number {
+    const revision = (this.sessionDetailSnapshotRevisions.get(sessionId) ?? 0) + 1;
+    this.sessionDetailSnapshotRevisions.set(sessionId, revision);
+    return revision;
+  }
+
   private async refreshSelectedSessionDetail(): Promise<void> {
     if (this.selectedSession === null) {
       return;
     }
     void this.refreshDesktopInteractions();
     const previousSessionId = this.selectedSession.id;
+    const refreshSeq = ++this.sessionDetailRefreshSeq;
+    const snapshotRevision = this.beginSessionDetailSnapshotRead(previousSessionId);
+    const navigationRevision = this.readSessionNavigation().revision;
+    const bridgeUrl = this.normalizedBridgeUrl();
+    const bridgeToken = this.bridgeToken;
     const previousEntryCount = this.selectedSession.entryCount;
     const previousBottomSignature = this.sessionBottomSignature(this.selectedSession);
-    const refreshed = await BridgeClient.getSession(this.normalizedBridgeUrl(), previousSessionId, this.bridgeToken);
-    this.lastSelectedSessionDetailRefreshAt = Date.now();
-    if (this.selectedSession === null || this.selectedSession.id !== previousSessionId) {
+    let refreshed: CodexSessionDetail;
+    try {
+      refreshed = await BridgeClient.getSession(bridgeUrl, previousSessionId, bridgeToken, 1);
+    } catch (error) {
+      // Foreground restoration is fire-and-forget. A temporarily unavailable
+      // connection must retain the current conversation and settle this read.
+      if (refreshSeq === this.sessionDetailRefreshSeq
+        && this.sessionDetailSnapshotRevisions.get(previousSessionId) === snapshotRevision
+        && this.readSessionNavigation().revision === navigationRevision
+        && this.normalizedBridgeUrl() === bridgeUrl && this.bridgeToken === bridgeToken
+        && this.selectedSession !== null && this.selectedSession.id === previousSessionId) {
+        this.log('warn', 'session.detail.refresh_failed', `sessionId=${previousSessionId}; message=${this.errorText(error)}`);
+      }
       return;
     }
+    if (refreshSeq !== this.sessionDetailRefreshSeq || this.sessionDetailSnapshotRevisions.get(previousSessionId) !== snapshotRevision
+      || this.readSessionNavigation().revision !== navigationRevision
+      || this.normalizedBridgeUrl() !== bridgeUrl || this.bridgeToken !== bridgeToken
+      || this.selectedSession === null || this.selectedSession.id !== previousSessionId) {
+      return;
+    }
+    this.lastSelectedSessionDetailRefreshAt = Date.now();
     const refreshedBottomSignature = this.sessionBottomSignature(refreshed);
     this.selectedSession = this.mergeSessionDetailPreservingHistory(this.selectedSession, refreshed);
+    this.reconcileVisibleSessionMessages();
     this.applySessionActivitySnapshot(refreshed, 'detail_refresh');
     this.markSessionRead(previousSessionId);
     if (refreshed.entryCount !== previousEntryCount || refreshedBottomSignature !== previousBottomSignature) {
@@ -6972,6 +7995,7 @@ struct Index {
   }
 
   private scrollSessionToBottom(): void {
+    this.sessionUserScrollActive = false;
     this.historyScrollAnchorKey = '';
     this.sessionAutoFollowBottom = true;
     this.sessionScroller.scrollTo({ xOffset: 0, yOffset: this.sessionContentHeight, animation: false });
@@ -6992,13 +8016,24 @@ struct Index {
     }
   }
 
+  private beginSessionContentRead(): void {
+    // A manual expansion starts reading at the current viewport. Layout growth
+    // and arriving stream text must not treat it as a request to follow the end.
+    this.sessionAutoFollowBottom = false;
+    this.sessionUserScrollActive = false;
+    this.historyScrollAnchorKey = '';
+  }
+
   private handleSessionWillScroll(yOffset: number, scrollSource: ScrollSource): void {
-    if (scrollSource === ScrollSource.SCROLLER || scrollSource === ScrollSource.SCROLLER_ANIMATION) {
+    if (scrollSource === ScrollSource.SCROLLER || scrollSource === ScrollSource.SCROLLER_ANIMATION
+      || scrollSource === ScrollSource.EDGE_EFFECT) {
+      this.sessionUserScrollActive = false;
       return;
     }
     if (Math.abs(yOffset) < 0.5) {
       return;
     }
+    this.sessionUserScrollActive = true;
     if (this.sessionAutoFollowBottom) {
       this.log('info', 'ui.session_scroll.manual_detach', `source=${scrollSource}; yOffset=${yOffset}`);
     }
@@ -7007,7 +8042,8 @@ struct Index {
 
   private handleSessionScrollEdge(edge: Edge): void {
     if (edge === Edge.Top) {
-      if (!this.sessionAutoFollowBottom) {
+      if (this.sessionUserScrollActive && !this.sessionAutoFollowBottom) {
+        this.sessionUserScrollActive = false;
         void this.loadOlderSessionEntries('scroll_edge_top');
       }
       return;
@@ -7015,6 +8051,8 @@ struct Index {
     if (edge !== Edge.Bottom) {
       return;
     }
+    if (!this.sessionUserScrollActive || !this.sessionScroller.isAtEnd()) return;
+    this.sessionUserScrollActive = false;
     if (!this.sessionAutoFollowBottom) {
       this.log('info', 'ui.session_scroll.follow_resumed', 'edge=bottom');
     }
@@ -7025,26 +8063,43 @@ struct Index {
     if (this.isLoadingOlderSessionEntries || this.selectedSession === null) {
       return;
     }
+    if (this.sessionTimelineStartKey.length > 0) {
+      const rows = this.allSessionTimelineRows();
+      const first = this.sessionTimelineRows()[0];
+      this.historyScrollAnchorKey = first === undefined ? '' : `row:${first.key}`;
+      this.sessionAutoFollowBottom = false;
+      this.sessionTimelineStartKey = earlierSessionRenderStartKey(rows, this.sessionTimelineStartKey);
+      this.log('info', 'session.history.local_revealed', `sessionId=${this.selectedSession.id}; source=${source}`);
+      return;
+    }
     const sessionId = this.selectedSession.id;
+    const navigationRevision = this.readSessionNavigation().revision;
+    const bridgeUrl = this.normalizedBridgeUrl();
+    const bridgeToken = this.bridgeToken;
     const beforeCursor = this.selectedSession.sync?.cursorStart ?? '';
     if (this.selectedSession.sync?.hasMoreBefore !== true || beforeCursor.length === 0) {
       return;
     }
     this.isLoadingOlderSessionEntries = true;
+    const requestSeq = ++this.sessionHistoryRequestSeq;
     this.sessionAutoFollowBottom = false;
     try {
       const older = await BridgeClient.getSessionHistoryPage(
-        this.normalizedBridgeUrl(),
+        bridgeUrl,
         sessionId,
-        this.bridgeToken,
-        120,
+        bridgeToken,
+        1,
         beforeCursor
       );
-      if (this.selectedSession === null || this.selectedSession.id !== sessionId) {
+      if (requestSeq !== this.sessionHistoryRequestSeq || !this.isSessionNavigationCurrent(navigationRevision, sessionId)
+        || this.normalizedBridgeUrl() !== bridgeUrl || this.bridgeToken !== bridgeToken
+        || this.selectedSession === null || this.selectedSession.id !== sessionId
+        || this.selectedSession.sync?.cursorStart !== beforeCursor) {
         return;
       }
       const current = this.selectedSession;
-      const entries = this.mergeSessionEntryPages(older.entries, current.entries);
+      const mergedDetail = this.mergeSessionDetailPreservingHistory(older, current);
+      const entries = mergedDetail.entries;
       const mergedSync: CodexSessionSync | undefined = older.sync ? {
         mode: older.sync.mode,
         source: older.sync.source,
@@ -7055,18 +8110,26 @@ struct Index {
         cursorEnd: current.sync?.cursorEnd ?? older.sync.cursorEnd,
         hasMoreBefore: older.sync.hasMoreBefore,
         hasMoreAfter: current.sync?.hasMoreAfter ?? older.sync.hasMoreAfter,
-        entryCount: entries.length
+        entryCount: entries.length,
+        completedTurnIds: mergedDetail.sync?.completedTurnIds
       } : current.sync;
       const visibleEntries = this.visibleSessionEntries();
-      this.historyScrollAnchorKey = entries.length > current.entries.length && visibleEntries.length > 0
+      this.historyScrollAnchorKey = !this.sessionAutoFollowBottom && entries.length > current.entries.length && visibleEntries.length > 0
         ? this.sessionEntryKey(visibleEntries[0]) : '';
       this.selectedSession = this.sessionDetailWithEntries(current, entries, mergedSync);
+      const rows = this.allSessionTimelineRows();
+      const firstPrevious = visibleEntries[0];
+      const previousRow = firstPrevious === undefined ? undefined : rows.find((row: SessionTimelineRow) =>
+        row.entry !== undefined && this.sessionEntryKey(row.entry) === this.sessionEntryKey(firstPrevious));
+      this.sessionTimelineStartKey = previousRow === undefined ? '' : earlierSessionRenderStartKey(rows, previousRow.key);
       this.log(
         'info',
         'session.history.older_loaded',
         `source=${source}; sessionId=${sessionId}; before=${beforeCursor}; added=${entries.length - current.entries.length}; hasMoreBefore=${this.selectedSession.sync?.hasMoreBefore === true}`
       );
     } catch (error) {
+      if (requestSeq !== this.sessionHistoryRequestSeq || !this.isSessionNavigationCurrent(navigationRevision, sessionId)
+        || this.normalizedBridgeUrl() !== bridgeUrl || this.bridgeToken !== bridgeToken) return;
       this.message = `加载更早消息失败：${this.errorText(error)}`;
       this.log(
         'warn',
@@ -7074,12 +8137,12 @@ struct Index {
         `source=${source}; sessionId=${sessionId}; before=${beforeCursor}; message=${this.errorText(error)}`
       );
     } finally {
-      this.isLoadingOlderSessionEntries = false;
+      if (requestSeq === this.sessionHistoryRequestSeq) this.isLoadingOlderSessionEntries = false;
     }
   }
 
   private restoreHistoryScrollAnchor(key: string, oldArea: Area, newArea: Area): void {
-    if (this.historyScrollAnchorKey !== key) {
+    if (this.sessionAutoFollowBottom || this.historyScrollAnchorKey !== key) {
       return;
     }
     const delta = Number(newArea.position.y) - Number(oldArea.position.y);
@@ -7092,10 +8155,17 @@ struct Index {
     current: CodexSessionDetail,
     refreshed: CodexSessionDetail
   ): CodexSessionDetail {
-    if (!current.sync || current.entries.length === 0) {
+    if (current.sync?.source !== refreshed.sync?.source) return refreshed;
+    if (!current.sync || current.entries.length === 0 && (current.sync.completedTurnIds ?? []).length === 0) {
       return refreshed;
     }
-    const entries = this.mergeSessionEntryPages(current.entries, refreshed.entries);
+    const currentCompleted = current.sync.completedTurnIds ?? [];
+    const refreshedCompleted = refreshed.sync?.completedTurnIds ?? [];
+    // A late active snapshot cannot reopen an already settled official turn.
+    const incoming = current.sync.source === 'desktop-official'
+      ? refreshed.entries.filter((entry: CodexSessionEntry) => currentCompleted.indexOf(entry.turnId ?? '') < 0
+        || refreshedCompleted.indexOf(entry.turnId ?? '') >= 0) : refreshed.entries;
+    const entries = this.mergeSessionEntryPages(current.entries, incoming, refreshedCompleted, current.id);
     const mergedSync: CodexSessionSync = {
       mode: current.sync.mode,
       source: current.sync.source,
@@ -7106,7 +8176,8 @@ struct Index {
       cursorEnd: refreshed.sync?.cursorEnd ?? current.sync.cursorEnd,
       hasMoreBefore: current.sync.hasMoreBefore,
       hasMoreAfter: refreshed.sync?.hasMoreAfter ?? current.sync.hasMoreAfter,
-      entryCount: entries.length
+      entryCount: entries.length,
+      completedTurnIds: Array.from(new Set<string>(currentCompleted.concat(refreshedCompleted)))
     };
     return this.sessionDetailWithEntries(refreshed, entries, mergedSync);
   }
@@ -7138,15 +8209,21 @@ struct Index {
       detailAvailable: base.detailAvailable,
       filePath: base.filePath,
       entries,
-      entryCount: base.entryCount,
+      entryCount: entries.length,
       sync
     };
   }
 
   private mergeSessionEntryPages(
     older: CodexSessionEntry[],
-    newer: CodexSessionEntry[]
+    newer: CodexSessionEntry[],
+    completedTurnIds: string[] = [],
+    threadId: string = ''
   ): CodexSessionEntry[] {
+    if (completedTurnIds.length > 0 || newer.length > 0 && newer.every((entry: CodexSessionEntry) => (entry.syncId ?? '').startsWith('official:'))) {
+      return mergeOfficialSessionEntryPages(older.filter((entry: CodexSessionEntry) => (entry.syncId ?? '').startsWith('official:')),
+        newer, completedTurnIds, threadId);
+    }
     const merged: CodexSessionEntry[] = [];
     const positions: Record<string, number> = {};
     // Activity belongs to the latest snapshot, not to retained message history.
@@ -7163,8 +8240,32 @@ struct Index {
       positions[key] = merged.length;
       merged.push(entry);
     });
+    // Full detail uses a content hash; paged file sync uses byte offsets for the
+    // same record. Prefer file identities, pairing aliases one-to-one so two
+    // actual sends with equal text and timestamps still remain two records.
+    const fileAliases: Map<string, CodexSessionEntry[]> = new Map<string, CodexSessionEntry[]>();
+    merged.forEach((entry: CodexSessionEntry) => {
+      if (!/^\d+:\d+:/.test(entry.syncId ?? '')) return;
+      const signature = JSON.stringify([entry.timestamp, entry.role, entry.type, entry.text]);
+      const aliases = fileAliases.get(signature) ?? [];
+      aliases.push(entry);
+      fileAliases.set(signature, aliases);
+    });
+    const distinct = merged.filter((entry: CodexSessionEntry): boolean => {
+      if (!/^entry:[a-f0-9]{16}$/.test(entry.syncId ?? '')) return true;
+      const signature = JSON.stringify([entry.timestamp, entry.role, entry.type, entry.text]);
+      const aliases = fileAliases.get(signature);
+      if (aliases === undefined) return true;
+      const index = aliases.findIndex((candidate: CodexSessionEntry): boolean =>
+        !(entry.itemId && candidate.itemId && entry.itemId !== candidate.itemId)
+        && !(entry.turnId && candidate.turnId && entry.turnId !== candidate.turnId)
+        && !(entry.threadId && candidate.threadId && entry.threadId !== candidate.threadId));
+      if (index < 0) return true;
+      aliases.splice(index, 1);
+      return false;
+    });
     // A refresh can include history older than the currently loaded recent page.
-    return merged.sort((left: CodexSessionEntry, right: CodexSessionEntry): number =>
+    return distinct.sort((left: CodexSessionEntry, right: CodexSessionEntry): number =>
       Date.parse(left.timestamp) - Date.parse(right.timestamp));
   }
 
@@ -7201,12 +8302,19 @@ struct Index {
   }
 
   private sessionComposerBottomShift(): number {
-    return this.sessionComposerFocused ? 0 : 16;
+    return 0;
   }
 
   private sessionComposerTextAreaHeight(): number {
-    const lines = Math.min(4, Math.max(1, this.sessionMessage.split('\n').length));
-    return Math.max(42, this.scaledLineHeight(24) * lines + 12);
+    const panelWidth = this.isLandscapeSessionLayout() && !this.sessionSidebarUserCollapsed
+      ? this.sessionWindowWidthVp() - this.sessionLandscapeSidebarWidth() : this.sessionWindowWidthVp();
+    const charactersPerLine = Math.max(12, Math.floor((panelWidth - 140) / this.scaledFontSize(16)));
+    let wrappedLines = 0;
+    this.sessionMessage.split('\n').forEach((line: string) => {
+      wrappedLines += Math.max(1, Math.ceil(line.length / charactersPerLine));
+    });
+    const lines = Math.min(4, Math.max(1, wrappedLines));
+    return Math.max(44, this.scaledLineHeight(24) * lines + 16);
   }
 
   private sessionBottomSignature(session: CodexSessionDetail): string {
@@ -7220,6 +8328,17 @@ struct Index {
   private syncSessionTaskMarkers(task: BridgeTask | null): void {
     if (task === null) {
       return;
+    }
+    const officialSessionId = this.taskSessionId(task);
+    if (officialSessionId.length > 0) {
+      this.optimisticSessionMessages = this.optimisticSessionMessages.map((message: OptimisticSessionMessage) => {
+        if (message.taskId !== task.id || message.sessionId !== '__new_session__') return message;
+        return markOptimisticSessionSubmitted([message], message.submissionId, {
+          sessionId: officialSessionId, taskId: task.id, turnId: task.activeCodexTurnId ?? undefined,
+          text: message.submittedText ?? message.text
+        })[0];
+      });
+      this.reconcileVisibleSessionMessages();
     }
     const sessionId = this.taskSessionId(task);
     if (sessionId.length === 0) {
@@ -7357,7 +8476,8 @@ struct Index {
           this.clearStaleCurrentTaskForCompletedSession(session.id, currentUpdatedAt, 'session_activity_completed');
         }
         if (previousStatus.length > 0) {
-          const justCompleted = previousStatus === 'running';
+          const completionKind = sessionCompletionKind(session.activityStatus ?? '', session.terminalReason ?? '');
+          const justCompleted = previousStatus === 'running' && completionKind.length > 0;
           if (justCompleted) {
             void this.publishSessionCompletionNotification(session, currentUpdatedAt, previousStatus);
           }
@@ -7376,6 +8496,7 @@ struct Index {
     this.sessionUpdatedAtById = nextUpdatedAtById;
     this.pruneSessionMonitorRuntimeState(visibleSessionIds, 'activity');
     this.setRunningSessionIds(this.mergeKnownRunningSessionIds(runningIds), 'activity');
+    this.refreshSessionSidebarSnapshot();
   }
 
   private syncRunningSessionMarkersFromTaskSummaries(tasks: BridgeTaskSummary[]): void {
@@ -7438,10 +8559,19 @@ struct Index {
     if (running === null) {
       return;
     }
+    const navigationRevision = this.readSessionNavigation().revision;
+    const bridgeUrl = this.normalizedBridgeUrl();
+    const bridgeToken = this.bridgeToken;
+    const requestSeq = ++this.sessionTaskAdoptionSeq;
+    const previousTaskId = this.currentTask?.id ?? '';
     try {
       const task = this.taskUsesCodexRunApi(running)
-        ? await BridgeClient.getCodexRun(this.normalizedBridgeUrl(), running.id, this.bridgeToken)
-        : await BridgeClient.getTask(this.normalizedBridgeUrl(), running.id, this.bridgeToken);
+        ? await BridgeClient.getCodexRun(bridgeUrl, running.id, bridgeToken)
+        : await BridgeClient.getTask(bridgeUrl, running.id, bridgeToken);
+      if (requestSeq !== this.sessionTaskAdoptionSeq || this.readSessionNavigation().revision !== navigationRevision
+        || this.normalizedBridgeUrl() !== bridgeUrl || this.bridgeToken !== bridgeToken
+        || this.selectedSession !== null || this.isNewSessionDraft
+        || (this.currentTask?.id ?? '') !== previousTaskId) return;
       this.handoffPendingSessionSend(running.id, task);
       this.currentTask = task;
       this.activeSessionTaskId = task.id;
@@ -7483,11 +8613,20 @@ struct Index {
     if (!shouldAdopt) {
       return;
     }
+    const navigationRevision = this.readSessionNavigation().revision;
+    const bridgeUrl = this.normalizedBridgeUrl();
+    const bridgeToken = this.bridgeToken;
+    const requestSeq = ++this.sessionTaskAdoptionSeq;
+    const previousTaskId = this.currentTask?.id ?? '';
     try {
       const task = this.taskUsesCodexRunApi(summary)
-        ? await BridgeClient.getCodexRun(this.normalizedBridgeUrl(), summary.id, this.bridgeToken)
-        : await BridgeClient.getTask(this.normalizedBridgeUrl(), summary.id, this.bridgeToken);
-      if (this.selectedSession === null || this.selectedSession.id !== currentSelected) {
+        ? await BridgeClient.getCodexRun(bridgeUrl, summary.id, bridgeToken)
+        : await BridgeClient.getTask(bridgeUrl, summary.id, bridgeToken);
+      if (requestSeq !== this.sessionTaskAdoptionSeq
+        || !this.isSessionNavigationCurrent(navigationRevision, currentSelected)
+        || this.normalizedBridgeUrl() !== bridgeUrl || this.bridgeToken !== bridgeToken
+        || this.selectedSession === null || this.selectedSession.id !== currentSelected
+        || (this.currentTask?.id ?? '') !== previousTaskId) {
         return;
       }
       if (this.currentTask !== null && this.isSubmittedOutboxReceipt(this.currentTask)
@@ -7623,6 +8762,8 @@ struct Index {
   }
 
   private mergeTaskEventPage(previous: BridgeTask, incoming: BridgeTask): BridgeTask {
+    this.recordSessionInputAcknowledgements(previous);
+    this.recordSessionInputAcknowledgements(incoming);
     if (incoming.eventGap === true) {
       return incoming;
     }
@@ -7635,6 +8776,7 @@ struct Index {
       ids.add(event.id);
       events.push(event);
     });
+    incoming.eventCursor = Math.max(this.currentTaskEventCursor(previous), this.currentTaskEventCursor(incoming));
     incoming.events = events;
     return incoming;
   }
@@ -7842,6 +8984,40 @@ struct Index {
     return false;
   }
 
+  // Text deltas replace currentTask as well. Only its execution identity/state
+  // affects sidebar badges; do not rescan the task list for each text frame.
+  private currentTaskSidebarChanged(): void {
+    const task = this.currentTask;
+    const signature = task === null ? ''
+      : JSON.stringify([task.id, task.status, this.taskSessionId(task), task.createdAt]);
+    if (signature === this.sidebarTaskSignature) return;
+    this.sidebarTaskSignature = signature;
+    this.refreshSessionSidebarSnapshot();
+  }
+
+  private sidebarRuntimeInputsChanged(): void {
+    this.refreshSessionSidebarSnapshot();
+  }
+
+  private refreshSessionSidebarSnapshot(): void {
+    const nextIds: string[] = [];
+    this.sessions.forEach((session: CodexSessionSummary) => {
+      if (this.isSessionRunning(session.id)) nextIds.push(session.id);
+    });
+    nextIds.sort();
+    if (nextIds.join('\n') !== this.sidebarRunningSessionIds.join('\n')) {
+      this.sidebarRunningSessionIds = nextIds;
+    }
+  }
+
+  private isSidebarSessionRunning(sessionId: string): boolean {
+    return this.sidebarRunningSessionIds.indexOf(sessionId) >= 0;
+  }
+
+  private canDisplaySessionDelete(session: CodexSessionSummary): boolean {
+    return this.deletingSessionId.length === 0 && !this.isSidebarSessionRunning(session.id);
+  }
+
   private normalizedSessionActivityStatus(status: string): string {
     const normalized = status.trim().toLowerCase();
     if (normalized === 'running' || normalized === 'inprogress' || normalized === 'in_progress' || normalized === 'queued' || normalized === 'waiting_approval' || normalized === 'waiting_input' || normalized === 'recovering') {
@@ -7898,6 +9074,7 @@ struct Index {
     if (status === 'running' && !this.isLocallyClearedSessionActivity(sessionId, activityUpdatedAt)) {
       this.clearLocalRunningOverride(sessionId);
       this.markSessionRunning(sessionId);
+      this.refreshSessionSidebarSnapshot();
       return;
     }
     if (status === 'completed') {
@@ -7908,6 +9085,7 @@ struct Index {
         this.markSessionRead(sessionId);
       }
     }
+    this.refreshSessionSidebarSnapshot();
   }
 
   private isSelectedSessionActivityRunning(): boolean {
@@ -7932,7 +9110,7 @@ struct Index {
   }
 
   private sessionActivityState(sessionId: string): string {
-    if (this.isSessionRunning(sessionId)) {
+    if (this.isSidebarSessionRunning(sessionId)) {
       return 'running';
     }
     if (this.isSessionUnreadCompleted(sessionId)) {
@@ -7942,7 +9120,9 @@ struct Index {
   }
 
   private sessionSidebarItemKey(session: CodexSessionSummary): string {
-    return `${session.id}:${this.sessionActivityState(session.id)}:${this.sessionMonitorRevision}`;
+    // ForEach closes over the summary, including the fingerprint used on click.
+    // Refresh only the row whose metadata or visible activity actually changed.
+    return JSON.stringify([session, this.sessionActivityState(session.id)]);
   }
 
   private setRunningSessionIds(nextIds: string[], source: string): void {
@@ -8153,11 +9333,11 @@ struct Index {
       this.log('warn', 'sessions.empty_ignored', `source=${source}; current=${this.sessions.length}; lastGood=${this.lastGoodSessionCount}`);
       return;
     }
-    if (source === 'dashboard' && this.shouldFreezeSessionList(latestSessions.length)) {
-      this.lastGoodSessionCount = Math.max(this.lastGoodSessionCount, latestSessions.length);
-      return;
+    const nextSessions = reconcileSessionSidebar(this.sessions, latestSessions,
+      source === 'dashboard' && this.shouldFreezeSessionList(latestSessions.length));
+    if (nextSessions !== this.sessions) {
+      this.sessions = nextSessions;
     }
-    this.sessions = latestSessions;
     if (this.selectedSession !== null) {
       const selectedSessionId = this.selectedSession.id;
       const latestSelected = latestSessions.find((session: CodexSessionSummary) => session.id === selectedSessionId);
@@ -8186,12 +9366,13 @@ struct Index {
 
   private shouldFreezeSessionList(latestCount: number): boolean {
     return this.activeTab === 'sessions'
-      && !this.sessionSidebarCollapsed
+      && this.isSessionSidebarVisible()
       && this.sessions.length > 0
       && latestCount > 0;
   }
 
   private stopPolling(): void {
+    this.stopTaskEventStream();
     if (this.pollTimer >= 0) {
       clearInterval(this.pollTimer);
       this.pollTimer = -1;
@@ -8248,9 +9429,11 @@ struct Index {
   }
 
   private openConfigurationPage(page: string): void {
+    this.stopSessionEventStream();
     this.homeActionMenuVisible = false;
     this.homeActionMenuSource = '';
     this.activeTab = page;
+    if (page === 'settings') void this.refreshMobileControlStatus();
     if (page === 'pairing') {
       this.pairingDraftUrl = this.bridgeUrl;
       this.pairingDraftToken = this.bridgeToken;
@@ -8264,6 +9447,7 @@ struct Index {
     this.pairingCheckGeneration++;
     this.pairingChecking = false;
     this.activeTab = this.activeTab === 'overview' || this.activeTab === 'tasks' ? 'settings' : 'sessions';
+    this.syncSessionEventStream();
   }
 
   private pairingVoiceStatus(): string {
@@ -8390,15 +9574,27 @@ struct Index {
     this.pairingGuideVisible = CredentialRuntime.getRuntimeToken().trim().length === 0;
     this.startBridgeOtpRefresh();
     void this.loadCompanionProfile(true);
+    void this.refreshMobileControlStatus();
+    this.syncPushRegistration();
   }
 
   private applyRuntimeCredential(credential: BridgeCredential, source: string): void {
+    const changed = this.normalizedBridgeUrl() !== credential.bridgeUrl.replace(/\/+$/, '')
+      || this.bridgeToken !== credential.token;
+    if (changed && !this.preserveCurrentSessionDraft()) return;
+    if (changed) HuaweiPushRegistrationService.configure('', '', []);
+    if (changed) { this.stopTaskEventStream(); this.stopCompanionEventStream(); }
     CredentialRuntime.setRuntimeCredential(credential);
     this.bridgeUrl = credential.bridgeUrl;
     this.bridgeToken = credential.token;
     this.pairingDraftUrl = credential.bridgeUrl;
     this.pairingDraftToken = this.bridgeToken;
+    if (changed) this.restoreCurrentSessionDraft();
     void this.refreshBridgeOtp();
+    this.syncPushRegistration();
+    if (source.startsWith('enroll_')) {
+      void HuaweiPushRegistrationService.enable(getContext(this) as common.UIAbilityContext);
+    }
     this.log('info', 'pairing.credential.applied',
       `source=${source}; deviceId=${credential.deviceId}; host=${this.safeBridgeHost(credential.bridgeUrl)}`);
   }
@@ -8518,9 +9714,17 @@ struct Index {
     if (this.pairingBusy) {
       return;
     }
+    if (!this.preserveCurrentSessionDraft()) return;
+    this.stopTaskEventStream();
+    this.stopCompanionEventStream();
     this.pairingCheckGeneration++;
     this.pairingChecking = false;
     this.pairingBusy = true;
+    try {
+      await HuaweiPushRegistrationService.disable(getContext(this) as common.UIAbilityContext);
+    } catch (_) {
+      this.log('warn', 'push.unpair_cleanup_unconfirmed', 'privacy=generic');
+    }
     try {
       const context = getContext(this) as common.UIAbilityContext;
       await BridgeCredentialStore.clearCredential(context);
@@ -8530,6 +9734,7 @@ struct Index {
     CredentialRuntime.setRuntimeCredential(null);
     this.bridgeUrl = DEFAULT_BRIDGE_URL;
     this.bridgeToken = DEFAULT_BRIDGE_TOKEN;
+    this.restoreCurrentSessionDraft();
     this.bridgeOtpCode = '';
     this.pairedDeviceName = '';
     this.pairedDeviceId = '';
@@ -8611,7 +9816,8 @@ struct Index {
         description: option.description ?? '',
         isDefault: option.isDefault === true,
         defaultReasoningEffort: this.normalizeReasoningEffort(option.defaultReasoningEffort ?? ''),
-        supportedReasoningEfforts: option.supportedReasoningEfforts ?? []
+        supportedReasoningEfforts: option.supportedReasoningEfforts ?? [],
+        serviceTiers: option.serviceTiers ?? []
       });
     }
     if (this.desktopDefaultModel.length > 0 && this.availableModels.length === 0) {
@@ -8655,7 +9861,8 @@ struct Index {
         description: option.description ?? '',
         isDefault: option.isDefault === true,
         defaultReasoningEffort: this.normalizeReasoningEffort(option.defaultReasoningEffort ?? ''),
-        supportedReasoningEfforts: option.supportedReasoningEfforts ?? []
+        supportedReasoningEfforts: option.supportedReasoningEfforts ?? [],
+        serviceTiers: option.serviceTiers ?? []
       });
     }
     return result;
@@ -8781,8 +9988,65 @@ struct Index {
     return this.selectedSession?.id ?? '';
   }
 
+  private applyServiceTierSettings(settings: SessionSettings, includeOverride: boolean): void {
+    if (includeOverride) this.sessionServiceTier = settings.serviceTier ?? '';
+    this.desktopDefaultServiceTier = settings.defaultServiceTier ?? '';
+    this.availableServiceTiers = settings.serviceTierOptions ?? [];
+  }
+
+  private advertisedServiceTiers(): CodexServiceTier[] {
+    const modelId = this.sessionModel || this.desktopDefaultModel;
+    const model = this.availableModels.find((option: CodexModelOption) => option.id === modelId);
+    return model !== undefined ? (model.serviceTiers ?? []) : this.availableServiceTiers;
+  }
+
+  private sessionFastModeEnabled(): boolean {
+    return isFastServiceTier(this.sessionServiceTier || this.desktopDefaultServiceTier, this.advertisedServiceTiers());
+  }
+
+  private serviceTierOptionValues(): CodexServiceTier[] {
+    const options: CodexServiceTier[] = [
+      { id: '', name: '跟随桌面', description: '使用桌面会话设置' },
+      { id: 'default', name: '标准', description: '标准速度' }
+    ];
+    this.advertisedServiceTiers().forEach((tier: CodexServiceTier) => {
+      if (tier.id.length > 0 && tier.id !== 'default') options.push({
+        id: tier.id, name: tier.id === 'priority' || tier.id === 'fast' ? '⚡ 快速' : tier.name,
+        description: tier.description
+      });
+    });
+    return options;
+  }
+
+  private async changeServiceTier(value: string): Promise<void> {
+    if (!this.canChangeReasoningEffort()) return;
+    if (!this.serviceTierOptionValues().some((option: CodexServiceTier) => option.id === value)) return;
+    const previous = this.sessionServiceTier;
+    const sessionId = this.reasoningEffortSessionId();
+    const sequence = ++this.modelSettingsRequestSeq;
+    this.modelSettingsLoadingSessionId = '';
+    this.sessionServiceTier = value;
+    this.reasoningEffortMenuVisible = false;
+    if (this.isNewSessionDraft || sessionId === '__new_session__') return;
+    this.isSavingReasoningEffort = true;
+    try {
+      const settings = await BridgeClient.updateSessionSettings(this.normalizedBridgeUrl(), sessionId,
+        { serviceTier: value }, this.bridgeToken);
+      if (sequence !== this.modelSettingsRequestSeq || this.reasoningEffortSessionId() !== sessionId) return;
+      this.applyServiceTierSettings(settings, true);
+      this.reasoningEffortLoadedSessionId = sessionId;
+      this.reasoningEffortLoadedAt = Date.now();
+    } catch (error) {
+      if (sequence !== this.modelSettingsRequestSeq || this.reasoningEffortSessionId() !== sessionId) return;
+      this.sessionServiceTier = previous;
+      this.message = `保存速度设置失败：${this.errorText(error)}`;
+    } finally {
+      this.isSavingReasoningEffort = false;
+    }
+  }
+
   private canChangeReasoningEffort(): boolean {
-    return (this.selectedSession !== null || this.isNewSessionDraft) && !this.isSavingReasoningEffort;
+    return (this.selectedSession !== null || this.isNewSessionDraft) && !this.isSessionDetailPending() && !this.isSavingReasoningEffort;
   }
 
   private shouldShowReasoningEffortMenu(): boolean {
@@ -8790,7 +10054,8 @@ struct Index {
   }
 
   private async loadSessionReasoningEffort(sessionId: string, force: boolean = false): Promise<void> {
-    if (sessionId.length === 0) {
+    if (sessionId.length === 0 || this.isSavingReasoningEffort
+      || this.modelSettingsLoadingSessionId === sessionId) {
       return;
     }
     if (!force
@@ -8798,29 +10063,41 @@ struct Index {
       && Date.now() - this.reasoningEffortLoadedAt < this.modelSettingsCacheTtlMs) {
       return;
     }
+    const requestSeq = ++this.modelSettingsRequestSeq;
+    this.modelSettingsLoadingSessionId = sessionId;
     try {
       const settings = await BridgeClient.getSessionSettings(this.normalizedBridgeUrl(), sessionId, this.bridgeToken);
-      if (this.selectedSession === null || this.selectedSession.id !== sessionId) {
+      if (this.selectedSession === null || this.selectedSession.id !== sessionId
+        || requestSeq !== this.modelSettingsRequestSeq || this.isSavingReasoningEffort) {
         return;
       }
       this.sessionModel = this.normalizeModel(settings.model ?? '');
       this.desktopDefaultModel = this.normalizeModel(settings.defaultModel ?? settings.effectiveModel ?? this.desktopDefaultModel);
       this.availableModels = this.normalizeModelOptions(settings.modelOptions ?? this.availableModels);
+      this.applyServiceTierSettings(settings, true);
       this.sessionReasoningEffort = this.normalizeReasoningEffort(settings.reasoningEffort ?? '');
       this.desktopDefaultReasoningEffort = this.normalizeReasoningEffort(settings.defaultReasoningEffort ?? settings.effectiveReasoningEffort ?? this.desktopDefaultReasoningEffort);
       this.reasoningEffortLoadedSessionId = sessionId;
       this.reasoningEffortLoadedAt = Date.now();
       this.log('info', 'session.model_catalog.loaded', `sessionId=${sessionId}; force=${force}; source=${settings.modelCatalogSource ?? 'unknown'}; revision=${settings.modelCatalogRevision ?? 'unknown'}; model=${this.sessionModel || 'auto'}; defaultModel=${this.desktopDefaultModel || 'auto'}; modelCount=${this.availableModels.length}; effort=${this.sessionReasoningEffort || 'auto'}; defaultEffort=${this.desktopDefaultReasoningEffort || 'auto'}; display=${this.modelShortLabel(this.sessionModel)} ${this.reasoningEffortDisplayLabel(this.sessionReasoningEffort)}`);
     } catch (error) {
-      if (this.selectedSession === null || this.selectedSession.id !== sessionId) {
+      if (this.selectedSession === null || this.selectedSession.id !== sessionId
+        || requestSeq !== this.modelSettingsRequestSeq || this.isSavingReasoningEffort) {
         return;
       }
       this.sessionModel = '';
+    this.sessionServiceTier = '';
+    this.desktopDefaultServiceTier = '';
+    this.availableServiceTiers = [];
       this.desktopDefaultModel = '';
       this.sessionReasoningEffort = '';
       this.reasoningEffortLoadedSessionId = '';
       this.reasoningEffortLoadedAt = 0;
       this.log('warn', 'session.model_catalog.load_failed', `sessionId=${sessionId}; force=${force}; message=${this.errorText(error)}`);
+    } finally {
+      if (requestSeq === this.modelSettingsRequestSeq && this.modelSettingsLoadingSessionId === sessionId) {
+        this.modelSettingsLoadingSessionId = '';
+      }
     }
   }
 
@@ -8830,14 +10107,19 @@ struct Index {
       && Date.now() - this.desktopModelDefaultsLoadedAt < this.modelSettingsCacheTtlMs) {
       return;
     }
+    const targetSessionId = this.reasoningEffortSessionId();
+    const requestSeq = this.modelSettingsRequestSeq;
     try {
       const settings = await BridgeClient.getCodexSettings(this.normalizedBridgeUrl(), this.bridgeToken);
+      if (this.reasoningEffortSessionId() !== targetSessionId || requestSeq !== this.modelSettingsRequestSeq) return;
       this.desktopDefaultModel = this.normalizeModel(settings.defaultModel ?? settings.effectiveModel ?? '');
       this.availableModels = this.normalizeModelOptions(settings.modelOptions ?? []);
+      this.applyServiceTierSettings(settings, false);
       this.desktopDefaultReasoningEffort = this.normalizeReasoningEffort(settings.defaultReasoningEffort ?? settings.effectiveReasoningEffort ?? '');
       this.desktopModelDefaultsLoadedAt = Date.now();
       this.log('info', 'session.model_catalog.refreshed', `force=${force}; source=${settings.modelCatalogSource ?? 'unknown'}; revision=${settings.modelCatalogRevision ?? 'unknown'}; defaultModel=${this.desktopDefaultModel || 'auto'}; modelCount=${this.availableModels.length}; defaultEffort=${this.desktopDefaultReasoningEffort || 'auto'}; display=${this.modelShortLabel(this.sessionModel)} ${this.reasoningEffortDisplayLabel(this.sessionReasoningEffort)}`);
     } catch (error) {
+      if (this.reasoningEffortSessionId() !== targetSessionId || requestSeq !== this.modelSettingsRequestSeq) return;
       this.desktopModelDefaultsLoadedAt = 0;
       this.desktopDefaultModel = '';
       this.log('warn', 'session.model_catalog.refresh_failed', `force=${force}; message=${this.errorText(error)}`);
@@ -8851,6 +10133,8 @@ struct Index {
     const nextModel = this.normalizeModel(value);
     const previousModel = this.sessionModel;
     const sessionId = this.reasoningEffortSessionId();
+    const requestSeq = ++this.modelSettingsRequestSeq;
+    this.modelSettingsLoadingSessionId = '';
     this.sessionModel = nextModel;
     this.reasoningEffortMenuVisible = false;
     if (this.isNewSessionDraft || sessionId === '__new_session__') {
@@ -8869,15 +10153,19 @@ struct Index {
         { model: nextModel, reasoningEffort: this.sessionReasoningEffort },
         this.bridgeToken
       );
+      if (requestSeq !== this.modelSettingsRequestSeq || this.reasoningEffortSessionId() !== sessionId) return;
       this.sessionModel = this.normalizeModel(settings.model ?? nextModel);
       this.desktopDefaultModel = this.normalizeModel(settings.defaultModel ?? settings.effectiveModel ?? this.desktopDefaultModel);
       this.availableModels = this.normalizeModelOptions(settings.modelOptions ?? this.availableModels);
+      this.applyServiceTierSettings(settings, true);
       this.sessionReasoningEffort = this.normalizeReasoningEffort(settings.reasoningEffort ?? this.sessionReasoningEffort);
       this.desktopDefaultReasoningEffort = this.normalizeReasoningEffort(settings.defaultReasoningEffort ?? settings.effectiveReasoningEffort ?? this.desktopDefaultReasoningEffort);
       this.reasoningEffortLoadedSessionId = sessionId;
+      this.reasoningEffortLoadedAt = Date.now();
       this.message = `模型已设为：${this.modelShortLabel(this.sessionModel)}`;
       this.log('info', 'session.model.saved', `sessionId=${sessionId}; model=${this.sessionModel || 'auto'}; defaultModel=${this.desktopDefaultModel || 'auto'}; display=${this.modelShortLabel(this.sessionModel)}`);
     } catch (error) {
+      if (requestSeq !== this.modelSettingsRequestSeq || this.reasoningEffortSessionId() !== sessionId) return;
       this.sessionModel = previousModel;
       this.message = `保存模型失败：${this.errorText(error)}`;
       this.log('error', 'session.model.save_failed', `sessionId=${sessionId}; message=${this.errorText(error)}`);
@@ -8893,6 +10181,8 @@ struct Index {
     const nextEffort = this.normalizeReasoningEffort(value);
     const previousEffort = this.sessionReasoningEffort;
     const sessionId = this.reasoningEffortSessionId();
+    const requestSeq = ++this.modelSettingsRequestSeq;
+    this.modelSettingsLoadingSessionId = '';
     this.sessionReasoningEffort = nextEffort;
     this.reasoningEffortMenuVisible = false;
     if (this.isNewSessionDraft || sessionId === '__new_session__') {
@@ -8911,15 +10201,19 @@ struct Index {
         { reasoningEffort: nextEffort },
         this.bridgeToken
       );
+      if (requestSeq !== this.modelSettingsRequestSeq || this.reasoningEffortSessionId() !== sessionId) return;
       this.sessionReasoningEffort = this.normalizeReasoningEffort(settings.reasoningEffort ?? nextEffort);
       this.sessionModel = this.normalizeModel(settings.model ?? this.sessionModel);
       this.desktopDefaultModel = this.normalizeModel(settings.defaultModel ?? settings.effectiveModel ?? this.desktopDefaultModel);
       this.availableModels = this.normalizeModelOptions(settings.modelOptions ?? this.availableModels);
+      this.applyServiceTierSettings(settings, true);
       this.desktopDefaultReasoningEffort = this.normalizeReasoningEffort(settings.defaultReasoningEffort ?? settings.effectiveReasoningEffort ?? this.desktopDefaultReasoningEffort);
       this.reasoningEffortLoadedSessionId = sessionId;
+      this.reasoningEffortLoadedAt = Date.now();
       this.message = `思考强度已设为：${this.reasoningEffortDisplayLabel(this.sessionReasoningEffort)}`;
       this.log('info', 'session.reasoning_effort.saved', `sessionId=${sessionId}; effort=${this.sessionReasoningEffort || 'auto'}; default=${this.desktopDefaultReasoningEffort || 'auto'}; display=${this.reasoningEffortDisplayLabel(this.sessionReasoningEffort)}`);
     } catch (error) {
+      if (requestSeq !== this.modelSettingsRequestSeq || this.reasoningEffortSessionId() !== sessionId) return;
       this.sessionReasoningEffort = previousEffort;
       this.message = `保存思考强度失败：${this.errorText(error)}`;
       this.log('error', 'session.reasoning_effort.save_failed', `sessionId=${sessionId}; message=${this.errorText(error)}`);
@@ -8959,39 +10253,77 @@ struct Index {
   }
 
   private async repairDesktopLiveFromPhone(source: string, desktopOnly: boolean = false): Promise<boolean> {
-    if (!this.canRepairDesktopLive()) {
-      return false;
-    }
-    const targetSessionId = (!this.isNewSessionDraft && this.selectedSession !== null) ? this.selectedSession.id : '';
-    this.desktopLiveRestarting = true;
-    this.message = '正在从手机端恢复链路';
-    this.log('warn', 'system.link.recover.requested', `source=${source}; sessionId=${targetSessionId}`);
+    return await this.runMobileControlRepair(source, false);
+  }
+
+  private async refreshMobileControlStatus(): Promise<void> {
+    if (this.desktopLiveRestarting || DEFAULT_CONTROL_TARGET_ID.length === 0) return;
+    const url = this.normalizedBridgeUrl();
+    const token = this.bridgeToken;
     try {
-      let recovered: boolean = false;
-      if (desktopOnly) {
-        const system: SystemRepairStatus = await BridgeClient.repairSystemLink(this.normalizedBridgeUrl(), this.bridgeToken, targetSessionId, 'soft', false);
-        this.applySystemRepairStatus(system, targetSessionId);
-        recovered = system.severity !== 'blocked' && system.desktop?.desktopLive === true;
-        this.message = recovered ? '链路已恢复，可以继续发送' : this.systemRepairMessageText(system);
-        this.log(recovered ? 'info' : 'warn', 'system.link.recover.completed', `source=${source}; action=${system.recommendedAction ?? ''}; mode=${system.repairMode ?? ''}; repaired=${system.repaired === true}; severity=${system.severity ?? ''}; desktopLive=${system.desktop?.desktopLive === true}; state=${this.desktopLiveState}; reason=${this.desktopLiveReason}`);
+      const status = await BridgeClient.getMobileControlStatus(url, token, DEFAULT_CONTROL_TARGET_ID);
+      if (url !== this.normalizedBridgeUrl() || token !== this.bridgeToken || this.desktopLiveRestarting) return;
+      this.mobileControlJob = status.activeJob ?? status.lastJob;
+      this.mobileControlMessage = this.mobileControlJob?.message ?? '';
+      if (status.activeJob !== null) {
+        await this.runMobileControlRepair('resume', status.activeJob.mode === 'hard', status.activeJob);
+      }
+    } catch (_) {
+      // Status discovery must not add a permanent error to an otherwise usable chat.
+    }
+  }
+
+  private async runMobileControlRepair(source: string, hard: boolean, existing: MobileControlJob | null = null): Promise<boolean> {
+    if (this.desktopLiveRestarting) return false;
+    const url = this.normalizedBridgeUrl();
+    const token = this.bridgeToken;
+    const targetSessionId = existing?.sessionId ?? ((!this.isNewSessionDraft && this.selectedSession !== null) ? this.selectedSession.id : '');
+    const navigation = this.readSessionNavigation();
+    this.desktopLiveRestarting = true;
+    this.mobileControlMessage = existing?.message ?? '正在联系电脑管理应用';
+    const progress = (job: MobileControlJob): void => {
+      if (url !== this.normalizedBridgeUrl() || token !== this.bridgeToken) return;
+      this.mobileControlJob = job;
+      this.mobileControlMessage = job.message;
+    };
+    const isCurrent = (): boolean => url === this.normalizedBridgeUrl() && token === this.bridgeToken;
+    try {
+      const job = existing !== null
+        ? await MobileControlService.watch(url, token, DEFAULT_CONTROL_TARGET_ID, existing, progress, isCurrent)
+        : await MobileControlService.repair(url, token, DEFAULT_CONTROL_TARGET_ID, targetSessionId, hard, progress, isCurrent);
+      if (url !== this.normalizedBridgeUrl() || token !== this.bridgeToken) return false;
+      this.mobileControlJob = job;
+      if (!MobileControlService.verified(job, targetSessionId)) {
+        this.mobileControlMessage = job.status === 'needs_confirmation'
+          ? '需要重启 Codex；请使用“重启 Codex”确认后继续。' : job.message;
+        return false;
+      }
+      this.mobileControlMessage = '电脑修复完成，正在验证手机连接';
+      // Also prove the phone's business route recovered; control-plane reachability
+      // and a desktop-only health flag are not enough to say sending is ready.
+      if (targetSessionId.length > 0) {
+        const detail = await BridgeClient.getSession(url, targetSessionId, token);
+        if (detail.id !== targetSessionId) throw new Error('恢复后读取到的目标会话不一致');
       } else {
-        const link: SystemLinkStatus = await BridgeClient.recoverSystemLink(this.normalizedBridgeUrl(), this.bridgeToken, targetSessionId, 'auto');
-        this.applySystemLinkStatus(link, targetSessionId);
-        const status = link.desktop;
-        recovered = link.severity !== 'blocked' && status?.desktopLive === true;
-        this.message = link.severity === 'ok'
-          ? '链路已恢复，可以继续发送'
-          : this.systemLinkMessageText(link);
-        this.log(status?.desktopLive ? 'info' : 'warn', 'system.link.recover.completed', `source=${source}; action=${link.recommendedAction ?? ''}; mode=${link.repairMode ?? ''}; repaired=${link.repaired === true}; severity=${link.severity ?? ''}; desktopLive=${status?.desktopLive === true}; state=${this.desktopLiveState}; verified=${this.desktopLiveSessionVerified}; mobileRecoverable=${this.desktopLiveMobileRecoverable}; failureClass=${this.desktopLiveFailureClass}; processMode=${this.desktopLiveProcessMode}; cdpPort=${this.desktopLiveCdpPort}; reason=${this.desktopLiveReason}; hdc=${this.relayStateText}`);
+        await BridgeClient.listSessions(url, token);
       }
-      await this.refreshDashboard(true);
-      if (this.selectedSession !== null) {
-        await this.loadSessionDetail(this.selectedSession.id);
+      if (url !== this.normalizedBridgeUrl() || token !== this.bridgeToken) return false;
+      this.mobileControlMessage = '链路已恢复，手机与目标会话验证通过';
+      if (this.readSessionNavigation().revision === navigation.revision) {
+        this.message = this.mobileControlMessage;
+        await this.refreshDashboard(true);
+        if (this.selectedSession?.id === targetSessionId) await this.loadSessionDetail(targetSessionId);
       }
-      return recovered;
+      this.log('info', 'control.repair.verified', `source=${source}; hard=${hard}`);
+      return true;
     } catch (error) {
-      this.message = `链路恢复失败：${this.errorText(error)}`;
-      this.log('error', 'system.link.recover.failed', `source=${source}; message=${this.errorText(error)}`);
+      if (url === this.normalizedBridgeUrl() && token === this.bridgeToken) {
+        const detail = this.errorText(error);
+        this.mobileControlMessage = detail.indexOf('control_agent_offline') >= 0
+          ? '电脑管理通道未上线，请在电脑启动托盘管理应用后重试。'
+          : `电脑修复结果尚未确认：${detail}`;
+      }
+      this.log('warn', 'control.repair.unconfirmed', `source=${source}; hard=${hard}`);
       return false;
     } finally {
       this.desktopLiveRestarting = false;
@@ -9083,6 +10415,11 @@ struct Index {
   }
 
   private handleHomeAction(action: string, source: string): void {
+    if (action === 'enable_push') {
+      this.syncPushRegistration();
+      void HuaweiPushRegistrationService.enable(getContext(this) as common.UIAbilityContext);
+      return;
+    }
     if (!this.canRunHomeAction(action) || (source !== 'settings' && this.shouldIgnoreHomeActionMenuAction(action, source))) {
       return;
     }
@@ -9201,7 +10538,7 @@ struct Index {
   }
 
   private async openCompanionConversation(): Promise<void> {
-    this.returnToSessionHome('open_companion');
+    if (!this.returnToSessionHome('open_companion')) return;
     this.companionSelected = true;
     this.activeTab = 'sessions';
     this.sessionSidebarCollapsed = true;
@@ -9227,6 +10564,11 @@ struct Index {
     }
     this.companionTimer = setInterval(() => {
       if (this.appForeground && this.activeTab === 'sessions' && this.companionSelected) {
+        this.syncCompanionEventStream();
+        this.companionPollTick += 1;
+        // Push owns active updates. A sparse history read repairs missed events
+        // and call metadata; unavailable servers retain the old polling fallback.
+        if (this.companionEventStreamHealthy && this.companionPollTick % 20 !== 0) return;
         if (this.voiceCallVisible) {
           void this.loadCompanionProfile();
         } else {
@@ -9237,6 +10579,7 @@ struct Index {
   }
 
   private stopCompanionPolling(): void {
+    this.stopCompanionEventStream();
     this.companionGeneration += 1;
     this.companionOlderPending = false;
     if (this.companionTimer !== 0) {
@@ -9251,6 +10594,52 @@ struct Index {
     this.companionLoading = false;
   }
 
+  private stopCompanionEventStream(): void {
+    this.companionEventStream?.stop();
+    this.companionEventStream = null;
+    this.companionEventStreamKey = '';
+    this.companionEventStreamHealthy = false;
+  }
+
+  private syncCompanionEventStream(): void {
+    const profile = this.companionProfile;
+    if (!this.companionSelected || this.activeTab !== 'sessions' || !this.appForeground || profile === null) {
+      this.stopCompanionEventStream();
+      return;
+    }
+    const key = JSON.stringify([this.normalizedBridgeUrl(), this.bridgeToken, profile.id, profile.roomId]);
+    if (key === this.companionEventStreamKey && this.companionEventStream !== null) return;
+    this.stopCompanionEventStream();
+    this.stopTaskEventStream();
+    this.companionEventStreamKey = key;
+    this.companionEventStream = new BridgeEventStream({
+      url: `${this.normalizedBridgeUrl()}/companion/events?profileId=${encodeURIComponent(profile.id)}&roomId=${encodeURIComponent(profile.roomId)}`,
+      token: this.bridgeToken, cursorEnabled: false, afterSeq: () => 0,
+      onFrame: (frame: SseFrame) => {
+        if (key !== this.companionEventStreamKey || !this.companionSelected) return;
+        if (frame.event === 'stream.control') {
+          const control = JSON.parse(frame.data) as BridgeStreamControl;
+          if (control.reason === 'gap') void this.refreshCompanionConversation(false);
+          return;
+        }
+        if (frame.event !== 'companion.message') return;
+        const entry = (JSON.parse(frame.data) as CompanionStreamMessage).entry;
+        if (!entry || typeof entry.itemId !== 'string' || !entry.itemId.startsWith('room:')
+          || typeof entry.text !== 'string' || (entry.role !== 'user' && entry.role !== 'assistant')) return;
+        this.companionStreamRevision += 1;
+        this.reconcileCompanionText(profile, [entry]);
+        this.companionEntries = mergeCompanionHistory(this.companionEntries, [entry], false);
+      },
+      onState: (state: string) => {
+        if (key !== this.companionEventStreamKey) return;
+        this.companionEventStreamHealthy = state === 'open';
+        if (state === 'auth_error' || state === 'unavailable') this.log('warn', 'companion.stream.fallback', `state=${state}`);
+      },
+      onReconnect: () => { if (key === this.companionEventStreamKey) void this.refreshCompanionConversation(false); }
+    });
+    this.companionEventStream.start();
+  }
+
   private async refreshCompanionConversation(older: boolean): Promise<void> {
     if (!this.companionSelected) {
       return;
@@ -9263,6 +10652,7 @@ struct Index {
       return;
     }
     const generation = this.companionGeneration;
+    const streamRevision = this.companionStreamRevision;
     const companionBridgeUrl = this.normalizedBridgeUrl();
     const companionToken = this.bridgeToken;
     this.companionInFlight = true;
@@ -9297,22 +10687,9 @@ struct Index {
         return;
       }
       const existing = this.companionEntries;
+      if (streamRevision !== this.companionStreamRevision) return;
       this.reconcileCompanionText(profile, page.entries);
-      const pageIds = page.entries.map((entry: VoiceTranscriptEntry) => entry.itemId ?? '');
-      let merged: VoiceTranscriptEntry[] = [];
-      if (older) {
-        merged = page.entries.concat(existing.filter((entry: VoiceTranscriptEntry) =>
-          pageIds.indexOf(entry.itemId ?? '') < 0));
-      } else {
-        const firstId = page.entries.length > 0 ? page.entries[0].itemId : '';
-        const firstIndex = existing.findIndex((entry: VoiceTranscriptEntry) => entry.itemId === firstId);
-        const prefix = firstIndex >= 0 ? existing.slice(0, firstIndex) : existing;
-        const earlier = prefix.filter((entry: VoiceTranscriptEntry) =>
-          (entry.itemId ?? '').indexOf('room:') === 0 && pageIds.indexOf(entry.itemId ?? '') < 0);
-        const live = existing.filter((entry: VoiceTranscriptEntry) => entry.phoneTranscript === true
-          || (entry.itemId ?? '').indexOf('voice:') === 0);
-        merged = earlier.concat(page.entries).concat(live);
-      }
+      const merged = mergeCompanionHistory(existing, page.entries, older);
       const mergedCalls = CompanionHistoryReducer.mergeCalls(this.companionCalls, page.calls ?? []);
       if (older || existing.length === 0) {
         this.companionNextCursor = page.nextCursor;
@@ -9326,6 +10703,7 @@ struct Index {
         this.log('info', 'companion.calls.synced', `calls=${mergedCalls.length}; older=${older}`);
       }
       this.companionError = '';
+      this.syncCompanionEventStream();
     } catch (_) {
       if (generation === this.companionGeneration && this.companionSelected) {
         this.companionError = '会话暂时未能同步，请稍后刷新';
@@ -9418,6 +10796,7 @@ struct Index {
     this.companionTextMessages = CompanionTextService.messages(partition);
     this.changeCompanionTextDraft('');
     this.companionTextError = '';
+    this.log('info', 'companion.text.enqueued', `requestId=${requestId}`);
     try {
       CompanionTextService.save(context, partition);
     } catch (_) {
@@ -9428,6 +10807,7 @@ struct Index {
     try {
       const receipt = await BridgeClient.sendCompanionText(partition.bridgeUrl, partition.profileId,
         partition.roomId, text, requestId, token);
+      this.log('info', 'companion.text.receipt', `requestId=${requestId}; state=${receipt.state}; hasItemId=${receipt.itemId !== null}`);
       CompanionTextService.applyReceipt(partition, receipt);
       // History can arrive before the POST response. Use the full visible official history too.
       if (this.companionTextTargetMatches(partition, generation, token)) {
@@ -9437,6 +10817,7 @@ struct Index {
       const detail = this.errorText(error as Error);
       const rejectedStatus = /HTTP (4\d{2})(?:[：:\s]|$)/.exec(detail);
       const certain = rejectedStatus !== null && rejectedStatus[1] !== '408';
+      this.log('warn', 'companion.text.failure', `requestId=${requestId}; certain=${certain}; status=${rejectedStatus?.[1] ?? 'unknown'}`);
       CompanionTextService.markFailure(partition, requestId, certain
         ? detail : '提交结果不确定，请先核对官方记录，避免重复发送', certain);
     }
@@ -9534,6 +10915,9 @@ struct Index {
         this.pendingVoiceTranscriptIds[pendingKey] = itemId;
       }
     }
+    const existing = this.voiceCallTranscripts.find((current: VoiceTranscriptEntry) =>
+      current.itemId === itemId && current.role === entry.role)
+      ?? this.companionEntries.find((current: VoiceTranscriptEntry) => current.itemId === itemId && current.role === entry.role);
     const localBridgeUrl = this.voiceCallBridgeUrlSnapshot.length > 0
       ? this.voiceCallBridgeUrlSnapshot : this.normalizedBridgeUrl();
     return {
@@ -9541,6 +10925,8 @@ struct Index {
       role: entry.role,
       text: entry.text,
       final: entry.final,
+      createdAt: existing?.createdAt ?? Date.now(),
+      requestId: entry.requestId,
       phoneTranscript: true,
       localStorageStatus: 'pending',
       callId: identity.callId,
@@ -9591,6 +10977,8 @@ struct Index {
       role: entry.role,
       text: entry.text,
       final: true,
+      createdAt: entry.createdAt,
+      requestId: entry.requestId,
       phoneTranscript: true,
       localStorageStatus: 'pending',
       callId: entry.callId,
@@ -9618,6 +11006,7 @@ struct Index {
     status: 'pending' | 'saved' | 'failed'): VoiceTranscriptEntry {
     return {
       itemId: entry.itemId, role: entry.role, text: entry.text, final: entry.final,
+      createdAt: entry.createdAt, requestId: entry.requestId,
       phoneTranscript: entry.phoneTranscript, callId: entry.callId,
       localBridgeOrigin: entry.localBridgeOrigin, localAssistantId: entry.localAssistantId,
       localRoomId: entry.localRoomId, localStorageStatus: status
@@ -9986,9 +11375,17 @@ struct Index {
       return;
     }
     this.isLoadingOutbox = true;
+    const threadId = this.selectedSession?.id ?? '';
+    const baseUrl = this.normalizedBridgeUrl();
+    const token = this.bridgeToken;
     try {
-      const threadId = this.selectedSession?.id ?? '';
-      this.outboxItems = await BridgeClient.listOutbox(this.normalizedBridgeUrl(), threadId, this.bridgeToken);
+      const items = await BridgeClient.listOutbox(baseUrl, threadId, token);
+      if (baseUrl !== this.normalizedBridgeUrl() || token !== this.bridgeToken || threadId !== (this.selectedSession?.id ?? '')) return;
+      this.outboxItems = items;
+      if (threadId) {
+        this.optimisticSessionMessages = restoreOutboxMessages(this.optimisticSessionMessages, items, threadId);
+        this.reconcileVisibleSessionMessages();
+      }
       const drafts: Record<string, string> = {};
       this.outboxItems.forEach((item: BridgeOutboxItem) => {
         drafts[item.id] = item.text;
@@ -10043,6 +11440,19 @@ struct Index {
     }
   }
 
+  private confirmRetryOutboxItem(item: BridgeOutboxItem): void {
+    if (item.status !== 'held' && item.status !== 'uncertain') {
+      void this.retryOutboxItem(item);
+      return;
+    }
+    AlertDialog.show({
+      title: '核对后重试',
+      message: '请先确认这条消息仍需发送。系统会先核对送达记录，未确认送达时重新排队；如果桌面已收到但记录缺失，可能重复发送。',
+      primaryButton: { value: '取消', action: () => {} },
+      secondaryButton: { value: '确认重试', action: () => { void this.retryOutboxItem(item); } }
+    });
+  }
+
   private async retryOutboxItem(item: BridgeOutboxItem): Promise<void> {
     try {
       await BridgeClient.retryOutboxItem(this.normalizedBridgeUrl(), item.id, this.bridgeToken);
@@ -10053,6 +11463,7 @@ struct Index {
   }
 
   private outboxStatusLabel(status: string): string {
+    if (status === 'held') return '历史待处理';
     if (status === 'queued') return '待发送';
     if (status === 'dispatching') return '发送中';
     if (status === 'failed') return '失败';
@@ -10096,32 +11507,7 @@ struct Index {
   }
 
   private async repairDesktopLiveHardFromPhone(source: string): Promise<boolean> {
-    if (this.desktopLiveRestarting) {
-      return false;
-    }
-    const targetSessionId = (!this.isNewSessionDraft && this.selectedSession !== null) ? this.selectedSession.id : '';
-    this.desktopLiveRestarting = true;
-    this.message = '正在重启 Codex 桌面并恢复链路';
-    this.log('warn', 'system.repair.hard_requested', `source=${source}; sessionId=${targetSessionId}`);
-    try {
-      const system: SystemRepairStatus = await BridgeClient.repairSystemLink(this.normalizedBridgeUrl(), this.bridgeToken, targetSessionId, 'hard', true);
-      this.applySystemRepairStatus(system, targetSessionId);
-      const status = system.desktop;
-      const restarted = system.repairMode === 'hard' && system.repaired === true && status?.desktopLive === true;
-      this.message = restarted ? 'Codex 已重启并恢复链路' : this.systemRepairMessageText(system);
-      this.log(status?.desktopLive ? 'info' : 'warn', 'system.repair.hard_completed', `source=${source}; action=${system.recommendedAction ?? ''}; mode=${system.repairMode ?? ''}; repaired=${system.repaired === true}; desktopLive=${status?.desktopLive === true}; state=${this.desktopLiveState}; cdpPort=${this.desktopLiveCdpPort}; reason=${this.desktopLiveReason}`);
-      await this.refreshDashboard(true);
-      if (this.selectedSession !== null) {
-        await this.loadSessionDetail(this.selectedSession.id);
-      }
-      return restarted;
-    } catch (error) {
-      this.message = `重启 Codex 失败：${this.errorText(error)}`;
-      this.log('error', 'system.repair.hard_failed', `source=${source}; message=${this.errorText(error)}`);
-      return false;
-    } finally {
-      this.desktopLiveRestarting = false;
-    }
+    return await this.runMobileControlRepair(source, true);
   }
 
   private applySystemRepairStatus(system: SystemRepairStatus, targetSessionId: string): void {
@@ -10256,57 +11642,7 @@ struct Index {
       || this.desktopLiveProcessMode === 'missing';
   }
 
-  private async requiresDesktopLiveForSend(targetSessionId: string, source: string): Promise<boolean> {
-    try {
-      const runtime: BridgeRuntimeStatus = await BridgeClient.getRuntimeStatus(this.normalizedBridgeUrl(), this.bridgeToken, targetSessionId);
-      const requiresDesktop = runtime.existingThreadExecution !== 'app_server';
-      if (!requiresDesktop) {
-        this.applyAppServerPrimaryStatus(targetSessionId, source, runtime.existingThreadExecution);
-      }
-      this.log('info', 'runtime.send.contract', `source=${source}; sessionId=${targetSessionId}; mode=${runtime.mode}; execution=${runtime.existingThreadExecution}; appServerState=${runtime.appServer?.state ?? ''}; requiresDesktop=${requiresDesktop}`);
-      return requiresDesktop;
-    } catch (error) {
-      const message = this.errorText(error);
-      if (message.indexOf('Bridge 协议不兼容') >= 0) {
-        this.message = message;
-        this.log('error', 'runtime.send.contract.incompatible', `source=${source}; sessionId=${targetSessionId}; message=${message}`);
-        throw new Error(message);
-      }
-      this.log('warn', 'runtime.send.contract.fallback_desktop', `source=${source}; sessionId=${targetSessionId}; message=${message}`);
-      return true;
-    }
-  }
 
-  private async ensureDesktopLiveReadyForSend(targetSessionId: string, source: string): Promise<boolean> {
-    this.message = '正在检查并恢复桌面链路';
-    try {
-      const status: DesktopLiveStatus = await BridgeClient.getDesktopLiveStatus(this.normalizedBridgeUrl(), this.bridgeToken, targetSessionId, true);
-      this.applyDesktopLiveStatus(status, targetSessionId);
-      const targetReady = status.sessionVerified === true || status.targetVerified === true;
-      this.log(status.desktopLive && targetReady ? 'info' : 'warn', 'desktop.live.preflight', `source=${source}; state=${this.desktopLiveState}; visibleSessionVerified=${status.sessionVerified === true}; targetVerified=${status.targetVerified === true}; sendReady=${this.desktopLiveSessionVerified}; recoveryAttempted=${status.recoveryAttempted === true}; recoveryOk=${status.recoveryOk === true}; mobileRecoverable=${this.desktopLiveMobileRecoverable}; failureClass=${this.desktopLiveFailureClass}; processMode=${this.desktopLiveProcessMode}; cdpPort=${this.desktopLiveCdpPort}; reason=${this.desktopLiveReason}`);
-      if (status.desktopLive === true && targetReady) {
-        return true;
-      }
-      this.message = this.desktopLiveBlockedText();
-      return false;
-    } catch (error) {
-      this.desktopLiveState = 'unavailable';
-      this.desktopLiveMessage = '发送前恢复链路失败';
-      this.desktopLiveReason = this.errorText(error);
-      this.desktopLiveCurrentSessionId = '';
-      this.desktopLiveTargetSessionId = targetSessionId;
-      this.desktopLiveSessionVerified = false;
-      this.desktopLiveRequiresDesktopCdp = false;
-      this.desktopLiveMobileRecoverable = true;
-      this.desktopLiveFailureClass = '';
-      this.desktopLiveRecoveryHint = '';
-      this.desktopLiveProcessMode = '';
-      this.desktopLiveCdpPort = 0;
-      this.message = `发送前恢复链路失败：${this.desktopLiveReason}`;
-      this.log('error', 'desktop.live.preflight.failed', `source=${source}; sessionId=${targetSessionId}; message=${this.desktopLiveReason}`);
-      return false;
-    }
-  }
 
   private applyDesktopLiveStatus(status: DesktopLiveStatus, targetSessionId: string): void {
     this.desktopLiveState = status.status ?? (status.desktopLive ? 'ready' : 'unavailable');
@@ -10520,7 +11856,7 @@ struct Index {
   }
 
   private canRepairDesktopLive(): boolean {
-    return !this.desktopLiveRestarting && !this.isSendingSessionMessage;
+    return !this.desktopLiveRestarting;
   }
 
   private canRestartDesktopLive(): boolean {
@@ -10820,6 +12156,7 @@ struct Index {
     }
     const config = this.currentRelayConfig(relayPort, hdcdPort);
     this.relayRunning = true;
+    AppStorage.setOrCreate<boolean>('codexRemoteHdcRelayActive', true);
     void this.startRelayBackgroundRunning();
     this.relayTunnel.start(config);
     this.log('info', 'hdc_relay.auto_start', `relay=${config.relayHost}:${config.relayPort}; deviceId=${config.deviceId}; hdcd=${config.hdcdHost}:${config.hdcdPort}`);
@@ -10894,6 +12231,7 @@ struct Index {
     if (task.status === 'interrupted') {
       return;
     }
+    if (task.activeCodexTurnId && !this.claimNativeTurnCompletion(sessionId, task.activeCodexTurnId)) return;
     await this.publishTaskCompletionNotification(task.id, sessionId, title, failed, previousStatus, 'dashboard');
   }
 
@@ -10905,6 +12243,7 @@ struct Index {
     if (task.status === 'interrupted') {
       return;
     }
+    if (task.activeCodexTurnId && !this.claimNativeTurnCompletion(sessionId, task.activeCodexTurnId)) return;
     await this.publishTaskCompletionNotification(task.id, sessionId, title, task.status === 'failed', previousStatus, source);
   }
 
@@ -10914,7 +12253,8 @@ struct Index {
       return;
     }
     this.notifiedSessionCompletionKeys = [...this.notifiedSessionCompletionKeys, key].slice(-80);
-    await this.publishBasicCompletionNotification(session.id, session.title, false, previousStatus, 'session-activity');
+    await this.publishBasicCompletionNotification(session.id, session.title,
+      sessionCompletionKind(session.activityStatus ?? '', session.terminalReason ?? '') === 'failed', previousStatus, 'session-activity');
   }
 
   private async publishTaskCompletionNotification(taskId: string, sessionId: string, title: string, failed: boolean, previousStatus: string, source: string): Promise<void> {
@@ -10980,25 +12320,71 @@ struct Index {
     }
   }
 
+  private notificationTargetChanged(): void {
+    if (this.appForeground) void this.applyPendingNotificationNavigation();
+  }
+
   private async applyPendingNotificationNavigation(): Promise<void> {
     const revision = this.notificationTargetRevision.trim();
     const sessionId = this.notificationTargetSessionId.trim();
-    if (revision.length === 0 || revision === this.lastHandledNotificationRevision || sessionId.length === 0) {
+    if (this.notificationNavigationBusy || revision.length === 0
+      || revision === this.lastHandledNotificationRevision || sessionId.length === 0) {
       return;
     }
-    const target = this.sessions.find((session: CodexSessionSummary) => session.id === sessionId);
-    if (!target) {
-      return;
+    const bridgeUrl = this.normalizedBridgeUrl();
+    const bridgeToken = this.bridgeToken;
+    const navigationRevision = this.readSessionNavigation().revision;
+    this.notificationNavigationBusy = true;
+    try {
+      let target = this.sessions.find((session: CodexSessionSummary) => session.id === sessionId);
+      if (!target) {
+        const detail = await BridgeClient.getSession(bridgeUrl, sessionId, bridgeToken);
+        target = {
+          id: detail.id, title: detail.title, updatedAt: detail.updatedAt,
+          projectRoot: detail.projectRoot, projectLabel: detail.projectLabel,
+          source: detail.source, activityStatus: detail.activityStatus,
+          activeTurnId: detail.activeTurnId, canInterrupt: detail.canInterrupt,
+          detailAvailable: true
+        };
+      }
+      if (target.id !== sessionId || this.normalizedBridgeUrl() !== bridgeUrl || this.bridgeToken !== bridgeToken
+        || this.readSessionNavigation().revision !== navigationRevision
+        || this.notificationTargetRevision.trim() !== revision || this.notificationTargetSessionId.trim() !== sessionId) {
+        this.lastHandledNotificationRevision = revision;
+        return;
+      }
+      this.activeTab = 'sessions';
+      this.showTaskEventDetails = this.notificationTargetEventId.trim().length > 0;
+      const opening = this.openSession(target);
+      const openingRevision = this.readSessionNavigation().revision;
+      await opening;
+      if (!this.isSessionNavigationCurrent(openingRevision, sessionId)
+        || this.selectedSession?.id !== sessionId || this.normalizedBridgeUrl() !== bridgeUrl || this.bridgeToken !== bridgeToken
+        || this.notificationTargetRevision.trim() !== revision || this.notificationTargetSessionId.trim() !== sessionId) {
+        this.lastHandledNotificationRevision = revision;
+        return;
+      }
+      this.lastHandledNotificationRevision = revision;
+      this.scrollSessionToBottomIfFollowing('notification_deep_link');
+      this.log('info', 'notification.deep_link.opened', `sessionId=${sessionId}; type=${this.notificationTargetEventType}; eventId=${this.notificationTargetEventId}`);
+      this.notificationTargetSessionId = '';
+      this.notificationTargetEventType = '';
+      this.notificationTargetEventId = '';
+    } catch (error) {
+      if (this.normalizedBridgeUrl() !== bridgeUrl || this.bridgeToken !== bridgeToken
+        || this.readSessionNavigation().revision !== navigationRevision) {
+        this.lastHandledNotificationRevision = revision;
+      }
+      this.log('warn', 'notification.deep_link.failed', `sessionId=${sessionId}; message=${this.errorText(error)}`);
+    } finally {
+      this.notificationNavigationBusy = false;
+      // A newer Want may arrive while the canonical lookup is in flight.
+      // Retire that owner, then process the new target without another timer.
+      if (this.appForeground && this.notificationTargetRevision.trim() !== revision
+        && this.notificationTargetRevision.trim() !== this.lastHandledNotificationRevision) {
+        void this.applyPendingNotificationNavigation();
+      }
     }
-    this.lastHandledNotificationRevision = revision;
-    this.activeTab = 'sessions';
-    this.showTaskEventDetails = this.notificationTargetEventId.trim().length > 0;
-    await this.openSession(target);
-    this.scrollSessionToBottomIfFollowing('notification_deep_link');
-    this.log('info', 'notification.deep_link.opened', `sessionId=${sessionId}; type=${this.notificationTargetEventType}; eventId=${this.notificationTargetEventId}`);
-    this.notificationTargetSessionId = '';
-    this.notificationTargetEventType = '';
-    this.notificationTargetEventId = '';
   }
 
   private syncNotificationBadge(source: string): void {
@@ -11013,21 +12399,31 @@ struct Index {
   }
 
   private async startRelayBackgroundRunning(): Promise<void> {
-    if (this.relayBackgroundRunning) {
-      return;
-    }
     try {
       const context = getContext(this) as common.UIAbilityContext;
       const state = await AppBackgroundRuntimeService.ensureRunning(context, 'index_relay');
-      this.relayBackgroundRunning = state.running;
       this.log(
         'info',
         'hdc_relay.background.started',
-        `source=${state.source}; startedAt=${state.startedAt}; detail=${state.detail}`
+        `source=${state.source}; running=${state.running}; taskId=${state.taskId ?? -1}; mode=${state.mode}; suspended=${String(state.suspended)}; startedAt=${state.startedAt}; detail=${state.detail}`
       );
     } catch (error) {
       this.log('error', 'hdc_relay.background.failed', this.errorText(error));
     }
+  }
+
+  private syncPushRegistration(): void {
+    if (this.pushSessionSnapshotKey !== JSON.stringify([this.normalizedBridgeUrl(), this.bridgeToken])) return;
+    HuaweiPushRegistrationService.configure(this.normalizedBridgeUrl(), this.bridgeToken, this.pushThreadIds);
+  }
+
+  private pushStatusText(): string {
+    if (this.pushState === 'ready') return '已启用';
+    if (this.pushState === 'disabled') return '已关闭';
+    if (this.pushState === 'activation_required' || this.pushState === 'profile_required'
+      || this.pushState === 'server_setup_required') return '等待电脑完成配置';
+    if (this.pushState === 'unavailable' || this.pushState === 'reconnecting') return '等待重新连接';
+    return '正在准备';
   }
 
   private relaySummaryText(): string {
@@ -11382,7 +12778,7 @@ struct Index {
     payload.source = 'harmony-app';
     payload.level = level;
     payload.event = event;
-    payload.data = `sessionId=${this.logSessionId}; appMessage=${this.message}; currentTaskId=${this.currentTask?.id ?? ''}; currentTaskStatus=${this.currentTask?.status ?? 'idle'}; ${detail}`;
+    payload.data = `sessionId=${this.logSessionId}; clientAtMs=${Date.now()}; appMessage=${this.message}; currentTaskId=${this.currentTask?.id ?? ''}; currentTaskStatus=${this.currentTask?.status ?? 'idle'}; ${detail}`;
     this.pendingLogs.push(payload);
     if (this.pendingLogs.length > 100) {
       this.pendingLogs.shift();
@@ -12052,23 +13448,24 @@ struct Index {
   private sessionPrimaryActionColor(): string {
     const mode = this.sessionPrimaryActionMode();
     if (mode === 'interrupt') {
-      return this.themeColor('#B42318');
+      return this.themeColor('#253547');
     }
     if (mode === 'guidance_send') {
-      return this.themeColor('#14853D');
+      return this.themeColor('#253547');
     }
     if (mode === 'sending' || mode === 'interrupting' || mode === 'disabled') {
       return this.themeColor('#8A95A3');
     }
-    return this.themeColor('#1F6FEB');
+    return this.themeColor('#253547');
   }
 
   private canUseSessionPrimaryAction(): boolean {
     const mode = this.sessionPrimaryActionMode();
-    return mode === 'interrupt' || mode === 'guidance_send' || mode === 'send';
+    return mode === 'interrupt' || mode === 'guidance_send' || mode === 'send' || mode === 'continue';
   }
 
   private sessionPrimaryActionMode(): string {
+    if (this.selectedSession !== null && this.sessionContinueBusyId === this.selectedSession.id) return 'continuing';
     if (this.isSendingCurrentSessionMessage()) {
       return 'sending';
     }
@@ -12084,6 +13481,7 @@ struct Index {
     if (this.shouldUseSessionInterruptAction()) {
       return 'interrupt';
     }
+    if (this.canContinueSelectedSession()) return 'continue';
     return 'disabled';
   }
 
@@ -12118,6 +13516,7 @@ struct Index {
   }
 
   private sessionPageTitle(): string {
+    if (this.isSessionDetailPending()) return this.sessionTitleById(this.activeSessionId);
     if (this.selectedSession !== null) {
       return this.selectedSession.title;
     }
@@ -12128,9 +13527,11 @@ struct Index {
   }
 
   private sessionPageSubtitle(): string {
+    if (this.isSessionDetailPending()) return `${this.liveDesktopLabel()} · 正在读取会话`;
     if (this.selectedSession !== null) {
-      return this.selectedSession.projectLabel ?? '未归类';
+      return `${this.liveDesktopLabel()} · ${this.liveSessionLabel()} · ${this.selectedSession.projectLabel ?? '未归类'}`;
     }
+    if (this.isNewSessionDraft) return this.newSessionProjectName();
     return this.message;
   }
 
@@ -12138,11 +13539,21 @@ struct Index {
     return this.selectedSession !== null || this.isNewSessionDraft ? '换会话' : '会话';
   }
 
+  private isSessionDetailPending(): boolean {
+    const navigation = this.readSessionNavigation();
+    return !this.isNewSessionDraft && navigation.mode === 'session' && navigation.sessionId.length > 0
+      && this.selectedSession?.id !== navigation.sessionId;
+  }
+
   private visibleSessionEntries(): CodexSessionEntry[] {
     if (this.selectedSession === null) {
       return [];
     }
-    const entries = this.selectedSession.entries.slice();
+    const entries = mergeSessionLiveEntries(this.selectedSession.entries, this.sessionStreamEntries, this.selectedSession.id,
+      this.selectedSession.sync?.completedTurnIds ?? []);
+    if (this.selectedSession.sync?.source === 'desktop-official') {
+      return this.normalizeVisibleSessionEntries(entries);
+    }
     const task = this.selectedVisibleTask();
     if (task !== null) {
       const liveEntries = this.taskLiveEntries(task);
@@ -12158,6 +13569,11 @@ struct Index {
       return { entry: entry, index: index };
     });
     indexedEntries.sort((left: SessionEntryWithOrder, right: SessionEntryWithOrder): number => {
+      // Active text follows the live viewport even when its official timestamp
+      // is the start of a long turn and newer tool history has already arrived.
+      const leftStreaming = left.entry.type === 'live_agent_streaming';
+      const rightStreaming = right.entry.type === 'live_agent_streaming';
+      if (leftStreaming !== rightStreaming) return leftStreaming ? 1 : -1;
       const leftTime = Date.parse(left.entry.timestamp);
       const rightTime = Date.parse(right.entry.timestamp);
       if (Number.isNaN(leftTime) || Number.isNaN(rightTime) || leftTime === rightTime) {
@@ -12172,6 +13588,34 @@ struct Index {
     return this.visibleOptimisticSessionMessages().length > 0
       || this.visibleNewSessionEntries().length > 0
       || this.visibleFailedSessionMessages().length > 0;
+  }
+
+  private sessionTimelineRows(): SessionTimelineRow[] {
+    return sessionRenderWindow(this.allSessionTimelineRows(), this.sessionTimelineStartKey);
+  }
+
+  private allSessionTimelineRows(): SessionTimelineRow[] {
+    const pending = this.visibleOptimisticSessionMessages();
+    const task = this.selectedVisibleTask();
+    const sessionId = this.isNewSessionDraft
+      ? (task !== null ? this.taskSessionId(task) : '') || pending.find((message: OptimisticSessionMessage) => message.sessionId !== '__new_session__')?.sessionId || '__new_session__'
+      : (this.selectedSession?.id ?? '');
+    return buildSessionTimeline(sessionId,
+      this.isNewSessionDraft ? this.visibleNewSessionEntries() : this.visibleSessionEntries(),
+      pending, this.visibleFailedSessionMessages());
+  }
+
+  private sessionTimelineRenderKey(row: SessionTimelineRow): string {
+    // Repeat full-loading mode requires a changed key to update its item.
+    // Unlike ForEach, it reuses removed-key nodes and updates the whole RepeatItem.
+    const failure = row.kind === 'failed'
+      ? this.failedSessionMessages.find((message: FailedSessionMessage) => message.id === row.failedId) : undefined;
+    return JSON.stringify([row, failure]);
+  }
+
+  private shouldShowGuardianNotice(): boolean {
+    return this.guardianError.length > 0 || (this.guardian !== null
+      && ['suspect', 'repairing', 'needs_attention', 'paused'].indexOf(this.guardian.phase) >= 0);
   }
 
   private visibleNewSessionEntries(): CodexSessionEntry[] {
@@ -12191,15 +13635,17 @@ struct Index {
       return [];
     }
     this.pruneResolvedFailedSessionMessages();
-    return this.failedSessionMessages.filter((message: FailedSessionMessage) => message.sessionId === sessionId);
+    return this.failedSessionMessages.filter((message: FailedSessionMessage) => message.sessionId === sessionId
+      && (!this.isNewSessionDraft || message.projectId === this.selectedProjectId));
   }
 
   private visibleOptimisticSessionMessages(): OptimisticSessionMessage[] {
-    const sessionId = this.isNewSessionDraft ? '__new_session__' : (this.selectedSession?.id ?? '');
-    if (sessionId.length === 0) {
-      return [];
+    if (this.isNewSessionDraft) {
+      return this.optimisticSessionMessages.filter((message: OptimisticSessionMessage) =>
+        message.sessionId === '__new_session__' || (this.newSessionTaskId.length > 0 && message.taskId === this.newSessionTaskId));
     }
-    return optimisticSessionMessagesForTarget(this.optimisticSessionMessages, sessionId);
+    const sessionId = this.selectedSession?.id ?? '';
+    return sessionId.length > 0 ? optimisticSessionMessagesForTarget(this.optimisticSessionMessages, sessionId) : [];
   }
 
   private currentTaskLiveEntries(): CodexSessionEntry[] {
@@ -12213,7 +13659,7 @@ struct Index {
     const task = this.selectedVisibleTask();
     if (task === null) return '';
     if (task.status === 'submitted' && this.isSubmittedOutboxReceipt(task)) return '已发送';
-    if (task.runtime?.kind === 'durable_outbox') return '已排队';
+    if (task.runtime?.kind === 'durable_outbox') return outboxTaskMessageLabel(task);
     if (this.taskBlocksDesktopConversation(task)) return '等待连接后发送';
     if (task.events.some((event: BridgeEvent) => event.type === 'codex.app_server.user_message.persisted')) {
       return '已发送';
@@ -12223,7 +13669,13 @@ struct Index {
 
   private taskLiveEntries(task: BridgeTask): CodexSessionEntry[] {
     const entries: CodexSessionEntry[] = [];
-    if (task.status !== 'failed' && task.prompt.trim().length > 0 && !this.taskIsFailedMessageRetry(task)) {
+    if (task.syntheticInterrupt === true) return entries;
+    const retainedEcho = this.optimisticSessionMessages.some((message: OptimisticSessionMessage) =>
+      (message.sessionId === this.taskSessionId(task) || message.sessionId === '__new_session__')
+      && (message.taskId === task.id || (task.submissionId?.length ?? 0) > 0 && message.submissionId === task.submissionId)
+      && (message.submittedText ?? message.text) === task.prompt);
+    if (!retainedEcho && task.status !== 'failed' && task.prompt.trim().length > 0 && !this.taskIsFailedMessageRetry(task)
+      && !this.serverUserHistoryCoversTaskMessage(task)) {
       // Terminal server history may lag behind the status flip; keep the bubble until the
       // canonical user entry lands so it does not blink away and back on the next refresh.
       if (task.status !== 'completed' && task.status !== 'interrupted' || !this.serverUserHistoryCoversTaskMessage(task)) {
@@ -12277,8 +13729,8 @@ struct Index {
   }
 
   private taskIsFailedMessageRetry(task: BridgeTask): boolean {
-    const pending = this.pendingSessionSendsByTaskId[task.id];
-    return !!pending && pending.retryFailedMessageId.length > 0;
+    return (this.pendingSessionSendsByTaskId[task.id] ?? [])
+      .some((pending: PendingSessionSend) => pending.retryFailedMessageId.length > 0);
   }
 
   private pruneResolvedFailedSessionMessages(): void {
@@ -12311,19 +13763,11 @@ struct Index {
   }
 
   private failedSessionMessageHasCanonicalEntry(message: FailedSessionMessage): boolean {
-    const expected = this.normalizedFailedMessageText(message.text);
-    if (expected.length === 0) {
-      return false;
-    }
-    const entries = message.isNewSession
-      ? this.currentTaskLiveEntries()
-      : (this.selectedSession?.entries ?? []);
-    return entries.some((entry: CodexSessionEntry) => {
-      if (entry.role !== 'user') {
-        return false;
-      }
-      return this.normalizedFailedMessageText(entry.text) === expected;
-    });
+    if (message.isNewSession || this.selectedSession === null || this.selectedSession.id !== message.sessionId) return false;
+    const candidates = this.failedSessionMessages.some((failure: FailedSessionMessage) => failure.id === message.id)
+      ? this.failedSessionMessages : this.failedSessionMessages.concat([message]);
+    return !buildSessionTimeline(message.sessionId, this.selectedSession.entries, [], candidates)
+      .some((row: SessionTimelineRow) => row.kind === 'failed' && row.failedId === message.id);
   }
 
   private normalizeComparableSessionText(text: string): string {
@@ -12394,21 +13838,13 @@ struct Index {
 
   private normalizeVisibleSessionEntries(entries: CodexSessionEntry[]): CodexSessionEntry[] {
     const visibleEntries: CodexSessionEntry[] = [];
-    let liveActivity: CodexSessionEntry | null = null;
     entries.forEach((entry: CodexSessionEntry) => {
-      if (entry.type === 'live_activity') {
-        liveActivity = entry;
-        return;
-      }
       if (!this.shouldHideSessionEntry(entry)) {
         visibleEntries.push(entry);
       }
     });
     const compactedEntries = compactAdjacentSessionToolEntries(visibleEntries);
-    if (liveActivity !== null && !this.shouldHideSessionEntry(liveActivity)) {
-      compactedEntries.push(liveActivity);
-    }
-    return compactedEntries;
+    return presentSessionEntryContext(presentSessionActivities(compactedEntries));
   }
 
   private streamingAgentText(): string {
@@ -12419,94 +13855,12 @@ struct Index {
   }
 
   private streamingAgentTextForTask(task: BridgeTask): string {
-    let deltaText = '';
-    let finalText = '';
-    task.events.forEach((event: BridgeEvent) => {
-      const notificationText = this.notificationAgentText(event);
-      if (notificationText.length > 0) {
-        finalText = notificationText;
-      }
-      const delta = this.notificationAgentDelta(event);
-      if (delta.length > 0) {
-        deltaText += delta;
-      }
-      const legacyText = this.legacyAgentText(event);
-      if (legacyText.length > 0) {
-        finalText = legacyText;
-      }
-    });
-    return finalText.length > 0 ? finalText : deltaText.trim();
-  }
-
-  private notificationAgentDelta(event: BridgeEvent): string {
-    const method = event.payload['method'];
-    if (method !== 'item/agentMessage/delta') {
-      return '';
+    if (this.taskStreamTextEvents !== task.events || this.taskStreamTextLength !== task.events.length) {
+      this.taskStreamTextEvents = task.events;
+      this.taskStreamTextLength = task.events.length;
+      this.taskStreamTextValue = latestSessionStreamText(task.events);
     }
-    const params = event.payload['params'] as Record<string, Object>;
-    if (!params) {
-      return '';
-    }
-    const delta = params['delta'];
-    return typeof delta === 'string' ? delta : '';
-  }
-
-  private notificationAgentText(event: BridgeEvent): string {
-    const method = event.payload['method'];
-    if (method !== 'item/completed' && method !== 'turn/completed') {
-      return '';
-    }
-    const params = event.payload['params'] as Record<string, Object>;
-    if (!params) {
-      return '';
-    }
-    const item = params['item'] as Record<string, Object>;
-    if (item) {
-      const itemType = item['type'];
-      const text = item['text'];
-      if (itemType === 'agentMessage' && typeof text === 'string') {
-        return text.trim();
-      }
-    }
-    const turn = params['turn'] as Record<string, Object>;
-    if (turn) {
-      return this.agentTextFromTurn(turn);
-    }
-    return '';
-  }
-
-  private agentTextFromTurn(turn: Record<string, Object>): string {
-    const items = turn['items'] as Object[];
-    if (!items) {
-      return '';
-    }
-    let latest = '';
-    items.forEach((raw: Object) => {
-      const item = raw as Record<string, Object>;
-      const itemType = item['type'];
-      const text = item['text'];
-      if (itemType === 'agentMessage' && typeof text === 'string' && text.trim().length > 0) {
-        latest = text.trim();
-      }
-    });
-    return latest;
-  }
-
-  private legacyAgentText(event: BridgeEvent): string {
-    if (event.type !== 'codex.exec.event') {
-      return '';
-    }
-    const payloadType = event.payload['type'];
-    const item = event.payload['item'] as Record<string, Object>;
-    if (payloadType !== 'item.completed' || !item) {
-      return '';
-    }
-    const itemType = item['type'];
-    const text = item['text'];
-    if ((itemType === 'agent_message' || itemType === 'agentMessage') && typeof text === 'string') {
-      return text.trim();
-    }
-    return '';
+    return this.taskStreamTextValue;
   }
 
   private searchSessionResults(): CodexSessionSummary[] {
@@ -12600,7 +13954,7 @@ struct Index {
   }
 
   private pinnedRunningCount(): number {
-    return this.pinnedSessions().filter((session: CodexSessionSummary) => this.isSessionRunning(session.id)).length;
+    return this.pinnedSessions().filter((session: CodexSessionSummary) => this.isSidebarSessionRunning(session.id)).length;
   }
 
   private pinnedUnreadCount(): number {
@@ -12634,7 +13988,7 @@ struct Index {
   }
 
   private projectRunningCount(projectLabel: string): number {
-    return this.sessionsForProject(projectLabel).filter((session: CodexSessionSummary) => this.isSessionRunning(session.id)).length;
+    return this.sessionsForProject(projectLabel).filter((session: CodexSessionSummary) => this.isSidebarSessionRunning(session.id)).length;
   }
 
   private projectUnreadCount(projectLabel: string): number {
@@ -12713,16 +14067,61 @@ struct Index {
     return summaryLabel === detailLabel;
   }
 
+  private currentSessionDraftScope(): SessionDraftScope | null {
+    if (this.companionSelected) return null;
+    const navigation = this.readSessionNavigation();
+    const sessionId = navigation.mode === 'session' ? navigation.sessionId : '';
+    if (sessionId.length === 0 && !this.isNewSessionDraft) return null;
+    return { bridgeUrl: this.normalizedBridgeUrl(), bridgeToken: this.bridgeToken,
+      sessionId, projectId: sessionId.length === 0 ? this.selectedProjectId : '' };
+  }
+
+  private preserveCurrentSessionDraft(): boolean {
+    const scope = this.currentSessionDraftScope();
+    if (scope === null) return true;
+    if (this.sessionDraftStore.save(scope, { text: this.sessionMessage,
+      images: this.pendingSessionImages, files: this.pendingSessionFiles })) return true;
+    this.message = '未发送草稿已达保存上限，请先处理已有草稿；当前内容已保留';
+    return false;
+  }
+
+  private restoreSessionDraft(scope: SessionDraftScope): void {
+    const draft = this.sessionDraftStore.load(scope);
+    this.sessionMessage = draft?.text ?? '';
+    this.pendingSessionImages = draft?.images ?? [];
+    this.pendingSessionFiles = draft?.files ?? [];
+  }
+
+  private restoreCurrentSessionDraft(): void {
+    const scope = this.currentSessionDraftScope();
+    if (scope !== null) this.restoreSessionDraft(scope);
+    else { this.sessionMessage = ''; this.pendingSessionImages = []; this.pendingSessionFiles = []; }
+  }
+
+  private selectComposerProject(projectId: string): void {
+    if (projectId === this.selectedProjectId) return;
+    if (this.isNewSessionDraft && !this.preserveCurrentSessionDraft()) return;
+    this.selectedProjectId = projectId;
+    if (this.isNewSessionDraft) this.restoreCurrentSessionDraft();
+  }
+
   private async openSession(session: CodexSessionSummary): Promise<void> {
+    if (!this.preserveCurrentSessionDraft()) return;
     this.leaveCompanionConversation();
     this.closeSessionSwipe();
-    if (this.selectedSession?.id === session.id && !this.isNewSessionDraft) {
+    const navigation = this.readSessionNavigation();
+    if (this.selectedSession?.id === session.id && !this.isNewSessionDraft
+      && navigation.mode === 'session' && navigation.sessionId === session.id) {
       this.sessionSidebarCollapsed = true;
       return;
     }
     this.applySessionActivitySnapshot(session, 'open');
     this.isNewSessionDraft = false;
     this.commitSessionNavigation('session', session.id, 'open_session');
+    if (this.selectedSession?.id === session.id) {
+      this.sessionTimelineStartKey = earlierSessionRenderStartKey(this.allSessionTimelineRows());
+    }
+    const navigationRevision = this.readSessionNavigation().revision;
     this.expandedSessionEntries = [];
     this.sessionSidebarCollapsed = true;
     this.sessionSidebarUserCollapsed = false;
@@ -12737,10 +14136,17 @@ struct Index {
     this.homeActionMenuSource = '';
     this.homeActionMenuOpenedAt = 0;
     this.sessionModel = '';
+    this.sessionServiceTier = '';
+    this.desktopDefaultServiceTier = '';
+    this.availableServiceTiers = [];
     this.sessionReasoningEffort = '';
     this.reasoningEffortLoadedSessionId = '';
+    this.restoreSessionDraft({ bridgeUrl: this.normalizedBridgeUrl(), bridgeToken: this.bridgeToken,
+      sessionId: session.id, projectId: '' });
     await this.loadSessionDetail(session.id);
+    if (!this.isSessionNavigationCurrent(navigationRevision, session.id)) return;
     await this.adoptSelectedSessionTaskFromSummaries(this.tasks);
+    this.syncTaskEventStream();
   }
 
   private sessionRefreshHintText(): string {
@@ -12896,6 +14302,9 @@ struct Index {
       this.slashCommandPanelVisible = false;
       this.reasoningEffortMenuVisible = false;
       this.sessionModel = '';
+    this.sessionServiceTier = '';
+    this.desktopDefaultServiceTier = '';
+    this.availableServiceTiers = [];
       this.sessionReasoningEffort = '';
       this.reasoningEffortLoadedSessionId = '';
       this.expandedSessionEntries = [];
@@ -12975,7 +14384,8 @@ struct Index {
     this.log('info', 'ui.session_sidebar.toggle', `collapsed=true; source=${source}; layout=${this.isLandscapeSessionLayout() ? 'landscape' : 'portrait'}`);
   }
 
-  private returnToSessionHome(source: string): void {
+  private returnToSessionHome(source: string): boolean {
+    if (!this.preserveCurrentSessionDraft()) return false;
     this.companionComputerVisible = false;
     this.leaveCompanionConversation();
     this.sessionDetailRequestSeq += 1;
@@ -12996,6 +14406,9 @@ struct Index {
     this.homeActionMenuSource = '';
     this.homeActionMenuOpenedAt = 0;
     this.sessionModel = '';
+    this.sessionServiceTier = '';
+    this.desktopDefaultServiceTier = '';
+    this.availableServiceTiers = [];
     this.sessionReasoningEffort = '';
     this.reasoningEffortLoadedSessionId = '';
     this.message = '请选择一个会话';
@@ -13004,6 +14417,7 @@ struct Index {
     this.desktopLiveTargetSessionId = '';
     this.desktopLiveSessionVerified = false;
     this.log('info', 'ui.session_home.returned', `source=${source}`);
+    return true;
   }
 
   private startNewSessionDraft(): void {
@@ -13012,6 +14426,7 @@ struct Index {
       this.log('warn', 'session.new.blocked', `reason=session_task_running; currentTaskId=${this.currentTask?.id ?? ''}; taskSessionId=${this.currentTask?.codexSessionId ?? ''}`);
       return;
     }
+    if (!this.preserveCurrentSessionDraft()) return;
     this.leaveCompanionConversation();
     const projectRoot = this.selectedSession?.projectRoot ?? '';
     const project = this.projects.find((candidate: BridgeProject) =>
@@ -13036,8 +14451,12 @@ struct Index {
     this.homeActionMenuSource = '';
     this.homeActionMenuOpenedAt = 0;
     this.sessionModel = '';
+    this.sessionServiceTier = '';
+    this.desktopDefaultServiceTier = '';
+    this.availableServiceTiers = [];
     this.sessionReasoningEffort = '';
     this.reasoningEffortLoadedSessionId = '__new_session__';
+    this.restoreCurrentSessionDraft();
     this.desktopLiveState = 'unknown';
     this.desktopLiveCurrentSessionId = '';
     this.desktopLiveTargetSessionId = '';
@@ -13126,6 +14545,8 @@ struct Index {
   }
 
   private sessionEntryKey(entry: CodexSessionEntry): string {
+    if (entry.itemId) return JSON.stringify([entry.threadId ?? this.selectedSession?.id ?? '', entry.turnId ?? '', entry.itemId]);
+    if (entry.syncId) return `sync:${entry.syncId}`;
     if (entry.type === 'live_activity') {
       return `live-${entry.threadId ?? this.selectedSession?.id ?? 'session'}-${entry.turnId ?? entry.timestamp}`;
     }
@@ -13133,12 +14554,16 @@ struct Index {
   }
 
   private shouldHideSessionEntry(entry: CodexSessionEntry): boolean {
+    if (entry.type === 'response_item' && (entry.role === 'developer' || entry.role === 'system')) {
+      return true;
+    }
     const text = entry.text.trim();
     if (text.length === 0) {
       return true;
     }
     if ((entry.role === 'developer' || entry.role === 'system')
-      && text.startsWith('<image_resize_notice>')) {
+      && (text.startsWith('<image_resize_notice>')
+        || /^<codex_apps_client_time_context>[\s\S]*<\/codex_apps_client_time_context>$/.test(text))) {
       return true;
     }
     if (text.indexOf('<turn_aborted>') >= 0 && text.indexOf('</turn_aborted>') >= 0) {
@@ -13317,9 +14742,6 @@ struct Index {
   }
 
   private sessionAssistantEntryLabel(entry: CodexSessionEntry): string {
-    if (entry.type === 'live_agent_streaming') {
-      return '正在返回';
-    }
     return 'Codex';
   }
 
@@ -13339,7 +14761,7 @@ struct Index {
   }
 
   private hasExpandableSessionToolItem(item: SessionToolPresentationItem): boolean {
-    return item.detail.length > 0 || item.target.length > 56;
+    return String(item.args ?? '').trim().length > 0 || item.detail.length > 0 || item.target.length > 56;
   }
 
   private isSessionToolItemExpanded(entry: CodexSessionEntry, item: SessionToolPresentationItem): boolean {
@@ -13347,6 +14769,7 @@ struct Index {
   }
 
   private toggleSessionToolItem(entry: CodexSessionEntry, item: SessionToolPresentationItem): void {
+    this.beginSessionContentRead();
     const key = this.sessionToolItemKey(entry, item);
     const index = this.expandedSessionEntries.indexOf(key);
     if (index >= 0) {
@@ -13399,6 +14822,7 @@ struct Index {
   }
 
   private toggleSessionToolGroup(entry: CodexSessionEntry): void {
+    this.beginSessionContentRead();
     const key = this.sessionToolGroupKey(entry);
     const index = this.expandedSessionEntries.indexOf(key);
     if (index >= 0) {
@@ -13419,6 +14843,7 @@ struct Index {
     if (failed > 0) {
       return `${items.length} 项操作中有 ${failed} 项失败`;
     }
+    if (items.some((item: SessionToolPresentationItem) => item.status !== 'completed')) return `${items.length} 项操作`;
     return `已完成 ${items.length} 项操作`;
   }
 
@@ -13433,6 +14858,7 @@ struct Index {
   }
 
   private sessionToolItemStatusText(item: SessionToolPresentationItem): string {
+    if (item.status === 'unknown') return '';
     if ((item.retryCount ?? 0) > 0 && item.status === 'completed') {
       return `重试 ${item.retryCount} 次后成功`;
     }
@@ -13470,7 +14896,7 @@ struct Index {
 
   private sessionToolVerbLabel(item: SessionToolPresentationItem): string {
     if (item.verb === 'Ran') {
-      return '执行';
+      return item.status === 'completed' ? '已运行' : '运行';
     }
     if (item.verb === 'Edited') {
       return '编辑';
@@ -13491,19 +14917,38 @@ struct Index {
   }
 
   private isSessionAgentToolItem(item: SessionToolPresentationItem): boolean {
-    return item.name === 'spawn_agent'
+    return item.rawType === 'collabAgentToolCall' || item.name === 'subAgentActivity' || item.name === 'spawn_agent'
       || item.name === 'followup_task'
+      || item.name === 'send_input' || item.name === 'send_message' || item.name === 'close_agent' || item.name === 'interrupt_agent'
       || item.name === 'wait_agent'
       || item.name === 'list_agents';
   }
 
+  private sessionAgentDisplayStatus(item: SessionToolPresentationItem): string {
+    if (item.rawType !== 'collabAgentToolCall') return item.status;
+    const agents = item.agents ?? [];
+    if (agents.some((agent: CodexSessionAgentRef) => agent.status === 'running' || agent.status === 'pending' || agent.status === 'unknown')) return 'unknown';
+    if (agents.some((agent: CodexSessionAgentRef) => agent.status === 'failed')) return 'failed';
+    if (agents.length > 0 && agents.every((agent: CodexSessionAgentRef) => agent.status === 'completed')) return 'completed';
+    if (agents.length > 0 && agents.every((agent: CodexSessionAgentRef) => agent.status === 'stopped')) return 'stopped';
+    return 'unknown';
+  }
+
   private sessionAgentVerbLabel(item: SessionToolPresentationItem): string {
+    if (item.name === 'subAgentActivity') {
+      if (item.kind === 'started') return '派出';
+      if (item.kind === 'completed') return '完成';
+      if (item.kind === 'interrupted') return '停止';
+      return '协作';
+    }
     if (item.name === 'spawn_agent') {
       return '派出';
     }
     if (item.name === 'followup_task') {
       return '跟进';
     }
+    if (item.name === 'send_input' || item.name === 'send_message') return '发送';
+    if (item.name === 'close_agent' || item.name === 'interrupt_agent') return '停止';
     if (item.name === 'wait_agent') {
       return '等待';
     }
@@ -13514,6 +14959,7 @@ struct Index {
   }
 
   private sessionAgentStatusColor(status: string): string {
+    if (status === 'unknown') return this.theme().textSecondary;
     if (status === 'failed') {
       return this.themeColor('#B42318');
     }
@@ -13527,21 +14973,29 @@ struct Index {
   }
 
   private sessionAgentStatusText(status: string): string {
+    if (status === 'unknown') return '';
     if (status === 'failed') {
       return '失败';
     }
     if (status === 'stopped') {
       return '已停止';
     }
-    if (status === 'running' || status === 'pending') {
+    if (status === 'pending') return '待启动';
+    if (status === 'running') {
       return '进行中';
     }
     return '完成';
   }
 
   private hasSessionAgentItemDetail(item: SessionToolPresentationItem): boolean {
-    return String(item.args ?? '').trim().length > 0
+    return this.sessionAgentInstructionText(item).length > 0
+      || (item.model ?? '').length > 0
       || (Array.isArray(item.agents) ? item.agents.length : 0) > 0;
+  }
+
+  private sessionAgentInstructionText(item: SessionToolPresentationItem): string {
+    if (item.prompt) return item.prompt;
+    return item.name === 'subAgentActivity' ? '' : String(item.args ?? '').trim();
   }
 
   private sessionAgentItemTaskName(item: SessionToolPresentationItem): string {
@@ -13549,6 +15003,7 @@ struct Index {
     if (taskName.length > 0) {
       return taskName;
     }
+    if (item.agentPath) return item.agentPath;
     const args = String(item.args ?? '').trim();
     if (args.length > 0) {
       const parsedName = this.sessionAgentArgsTaskName(args);
@@ -13561,6 +15016,20 @@ struct Index {
       return agents[0].name.trim();
     }
     return item.target;
+  }
+
+  private sessionAgentItemName(item: SessionToolPresentationItem): string {
+    if (item.agentPath?.trim()) return item.agentPath.trim();
+    const agents = item.agents ?? [];
+    if (agents.length > 0) return agents.map((agent: CodexSessionAgentRef) => agent.displayName || agent.name).join('、');
+    const named = this.sessionAgentArgsTaskName(item.args ?? '');
+    if (named.length > 0) return named;
+    return item.agentThreadId || this.sessionAgentItemTaskName(item) || '协作者';
+  }
+
+  private sessionAgentAvatarText(name: string): string {
+    const leaf = name.split('、')[0].split('/').filter((part: string) => part.length > 0).pop() ?? '';
+    return leaf.length > 0 ? leaf.substring(0, 2).toUpperCase() : '协';
   }
 
   private sessionAgentArgsTaskName(args: string): string {
@@ -13582,31 +15051,72 @@ struct Index {
     return '';
   }
 
+  private sessionContentActionsVisible(entry: CodexSessionEntry): boolean {
+    return this.activeSessionContentActionsKey === this.sessionEntryKey(entry);
+  }
+
+  private sessionHeartbeatRequest(entry: CodexSessionEntry): SessionHeartbeat | null {
+    if (entry.role !== 'user') return null;
+    const heartbeat = parseSessionHeartbeat(entry.text);
+    if (heartbeat === null) return null;
+    // Do not bypass image extraction or the existing hidden-context sanitization.
+    if (this.sessionEntryVisibleMarkdown(entry) !== entry.text.trim()) return null;
+    return heartbeat;
+  }
+
+  private sessionHeartbeatKey(entry: CodexSessionEntry, scope: string, rowKey: string): string {
+    const identity = rowKey || entry.itemId || entry.syncId || JSON.stringify([entry.timestamp, entry.type, entry.text]);
+    return JSON.stringify([entry.threadId ?? '', entry.turnId ?? '', entry.role, scope, identity]);
+  }
+
+  private isSessionHeartbeatExpanded(entry: CodexSessionEntry, scope: string, rowKey: string): boolean {
+    return this.expandedSessionEntries.indexOf(this.sessionHeartbeatKey(entry, scope, rowKey)) >= 0;
+  }
+
+  private toggleSessionHeartbeat(entry: CodexSessionEntry, scope: string, rowKey: string): void {
+    const key = this.sessionHeartbeatKey(entry, scope, rowKey);
+    this.expandedSessionEntries = this.expandedSessionEntries.indexOf(key) >= 0
+      ? this.expandedSessionEntries.filter((value: string) => value !== key) : this.expandedSessionEntries.concat([key]);
+  }
+
+  private toggleSessionContentActions(entry: CodexSessionEntry): void {
+    this.activeSessionContentActionsKey = this.sessionContentActionsVisible(entry) ? '' : this.sessionEntryKey(entry);
+  }
+
+  private sessionReplyQuestionExpanded(entry: CodexSessionEntry, index: number): boolean {
+    return this.expandedSessionEntries.indexOf(`${this.sessionEntryKey(entry)}::reply:${index}`) >= 0;
+  }
+
+  private toggleSessionReplyQuestion(entry: CodexSessionEntry, index: number): void {
+    const key = `${this.sessionEntryKey(entry)}::reply:${index}`;
+    this.expandedSessionEntries = this.expandedSessionEntries.indexOf(key) >= 0
+      ? this.expandedSessionEntries.filter((value: string) => value !== key) : this.expandedSessionEntries.concat([key]);
+  }
+
+  private sessionAssistantHeaderStatus(entry: CodexSessionEntry): string {
+    return (entry as SessionDisplayEntry).footerProgress ?? '';
+  }
+
+  private sessionActivityIsInHeader(entry: CodexSessionEntry): boolean {
+    return (entry as SessionDisplayEntry).activityInFooter === true;
+  }
+
+  private shouldShowAssistantContentActions(entry: CodexSessionEntry): boolean {
+    return this.isSessionLastAssistantEntry(entry) && this.sessionAssistantHeaderStatus(entry).length === 0;
+  }
+
   private sessionEntryRoleBefore(entry: CodexSessionEntry): string {
-    const entries = this.isNewSessionDraft ? this.visibleNewSessionEntries() : this.visibleSessionEntries();
-    const key = this.sessionEntryKey(entry);
-    for (let index = 0; index < entries.length; index += 1) {
-      if (this.sessionEntryKey(entries[index]) === key) {
-        return index > 0 ? entries[index - 1].role : '';
-      }
-    }
-    return '';
+    return (entry as SessionDisplayEntry).previousVisibleRole ?? '';
   }
 
   private sessionEntryShowAssistantHeader(entry: CodexSessionEntry): boolean {
+    if (this.selectedSession?.sync?.source === 'desktop-official') return false;
     const previousRole = this.sessionEntryRoleBefore(entry);
     return previousRole !== 'assistant';
   }
 
   private isSessionLastAssistantEntry(entry: CodexSessionEntry): boolean {
-    const entries = this.isNewSessionDraft ? this.visibleNewSessionEntries() : this.visibleSessionEntries();
-    for (let index = entries.length - 1; index >= 0; index -= 1) {
-      const candidate = entries[index];
-      if (candidate.role === 'assistant') {
-        return this.sessionEntryKey(candidate) === this.sessionEntryKey(entry);
-      }
-    }
-    return false;
+    return (entry as SessionDisplayEntry).lastVisibleAssistant === true;
   }
 
   private isSessionEntryFoldCandidate(entry: CodexSessionEntry): boolean {
@@ -13620,10 +15130,10 @@ struct Index {
       return false;
     }
     const text = this.sessionEntryVisibleMarkdown(entry);
-    if (text.length > 600) {
-      return true;
+    if (entry.role === 'user' || entry.role === 'assistant') {
+      return text.length > 1600 && (text.indexOf('```') >= 0 || text.indexOf('<INSTRUCTIONS>') >= 0);
     }
-    return text.replace(/\r\n/g, '\n').split('\n').length > 18;
+    return text.length > 600 || text.replace(/\r\n/g, '\n').split('\n').length > 18;
   }
 
   private sessionEntryFoldKey(entry: CodexSessionEntry): string {
@@ -13658,6 +15168,7 @@ struct Index {
   }
 
   private toggleSessionEntryFold(entry: CodexSessionEntry): void {
+    this.beginSessionContentRead();
     const key = this.sessionEntryFoldKey(entry);
     const index = this.expandedSessionEntries.indexOf(key);
     if (index >= 0) {
@@ -13677,6 +15188,7 @@ struct Index {
   }
 
   private toggleSessionMarkdownBlock(entry: CodexSessionEntry, block: SessionMarkdownBlock): void {
+    this.beginSessionContentRead();
     const key = this.sessionMarkdownBlockKey(entry, block);
     const index = this.expandedSessionEntries.indexOf(key);
     if (index >= 0) {
@@ -14218,6 +15730,8 @@ struct Index {
   }
 
   private sessionEntryVisibleText(entry: CodexSessionEntry): string {
+    const replies = entry.role === 'user' ? parseSessionUserReplies(entry.text) : [];
+    if (replies.length > 0) return replies.map((reply: SessionUserReply) => reply.answer).join('\n\n');
     if (entry.type === 'live_activity' || entry.type === 'live_agent_status') {
       return this.liveSessionEntryStageText(entry.text.length > 0 ? entry.text : entry.type);
     }
@@ -14255,6 +15769,16 @@ struct Index {
       ? this.sessionEntryFoldPreviewText(entry)
       : this.sessionEntryVisibleMarkdown(entry);
     return this.parseSessionMarkdown(markdown);
+  }
+
+  private isSessionMermaidBlock(block: SessionMarkdownBlock): boolean {
+    return block.kind === 'code' && block.language.trim().toLowerCase() === 'mermaid';
+  }
+
+  private shouldDeferSessionMermaid(entry: CodexSessionEntry): boolean {
+    // The current timeline rebuilds its live row as text grows. Keep ArkWeb out
+    // of that hot path; the final/history entry renders the complete diagram.
+    return entry.type === 'live_agent_streaming' || entry.liveKind === 'streaming';
   }
 
   private parseSessionMarkdown(text: string): SessionMarkdownBlock[] {
@@ -14865,6 +16389,7 @@ struct Index {
   }
 
   private sessionEntryImages(entry: CodexSessionEntry): string[] {
+    if (entry.role === 'user' && parseSessionUserReplies(entry.text).length > 0) return [];
     const urls: string[] = [];
     this.sessionEntryImagePaths(entry.text).forEach((imagePath: string) => {
       const url = this.mobileImagePreviewUrl(imagePath);
@@ -14880,10 +16405,11 @@ struct Index {
   }
 
   private userSessionEntryWidth(entry: CodexSessionEntry): string | number {
-    if (this.sessionEntryImages(entry).length > 0 && !this.shouldRenderUserTextBubble(entry)) {
-      return this.isLandscapeSessionLayout() ? '72%' : '58%';
+    if (this.sessionEntryImages(entry).length > 0) {
+      return this.shouldRenderUserTextBubble(entry) ? '78%' : (this.isLandscapeSessionLayout() ? '72%' : '58%');
     }
-    return this.userTextBubbleWidth(this.sessionEntryVisibleText(entry));
+    const textWidth = this.userTextBubbleWidth(this.sessionEntryVisibleText(entry));
+    return parseSessionUserReplies(entry.text).length > 0 ? Math.max(240, textWidth) : textWidth;
   }
 
   private userTextBubbleWidth(text: string): number {
@@ -14896,10 +16422,7 @@ struct Index {
   }
 
   private userImageEntryWidth(entry: CodexSessionEntry): string {
-    if (!this.shouldRenderUserTextBubble(entry)) {
-      return '100%';
-    }
-    return this.isLandscapeSessionLayout() ? '72%' : '58%';
+    return '100%';
   }
 
   private async refreshInteractionTask(task: BridgeTask | null, navigationRevision: number): Promise<void> {
@@ -14933,12 +16456,86 @@ struct Index {
     });
   }
 
+  @Builder
+  SessionDesktopInteractionView(request: BridgeDesktopInteraction) {
+    SessionInteractionPanel({
+      request, darkMode: this.usesDarkTheme(), fontScaleMode: this.fontScaleMode,
+      answers: this.userInputAnswers,
+      busy: this.isInteractionBusy('desktop', request.threadId, this.desktopAnswerScope(request)),
+      onAnswer: (interaction: BridgeDesktopInteraction, questionId: string, value: string) => {
+        this.setDesktopInteractionAnswer(interaction, questionId, value);
+      },
+      onRespond: (interaction: BridgeDesktopInteraction, decision: string) => {
+        void this.respondDesktopInteraction(interaction, decision);
+      },
+      onSkip: (interaction: BridgeDesktopInteraction, questionId: string) => {
+        void this.respondDesktopInteraction(interaction, '', questionId);
+      }
+    })
+  }
+
+  private inlineDesktopInteractions(entry: CodexSessionEntry): BridgeDesktopInteraction[] {
+    if (entry.role !== 'assistant' || !entry.itemId || !entry.turnId) return [];
+    return this.visibleDesktopInteractions().filter((request: BridgeDesktopInteraction) => {
+      return request.itemId === entry.itemId && request.turnId === entry.turnId && request.threadId === entry.threadId;
+    });
+  }
+
+  private footerDesktopInteractions(): BridgeDesktopInteraction[] {
+    const entries = this.visibleSessionEntries();
+    return this.visibleDesktopInteractions().filter((request: BridgeDesktopInteraction) => {
+      return !request.itemId || !entries.some((entry: CodexSessionEntry) => entry.role === 'assistant'
+        && entry.itemId === request.itemId && entry.turnId === request.turnId && entry.threadId === request.threadId);
+    });
+  }
+
+  private shouldShowPendingInteractionFooter(): boolean {
+    return this.footerDesktopInteractions().length > 0 || this.pendingUserInput() !== null
+      || this.pendingApprovalId().length > 0 || this.pendingInteractionNotice().length > 0;
+  }
+
+  private hasKnownPendingInteractions(): boolean {
+    return this.visibleDesktopInteractions().length > 0 || this.pendingUserInput() !== null
+      || this.pendingApprovalId().length > 0;
+  }
+
+  private isWaitingForPendingInteraction(): boolean {
+    const taskStatus = this.selectedVisibleTask()?.status ?? '';
+    if (taskStatus === 'waiting_approval' || taskStatus === 'waiting_input') {
+      return true;
+    }
+    if (this.desktopInteractionSessionId().length === 0) {
+      return false;
+    }
+    const sessionStatus = this.selectedSession?.activityStatus ?? '';
+    return sessionStatus === 'waiting_approval' || sessionStatus === 'waiting_input';
+  }
+
+  private shouldShowPendingInteractions(): boolean {
+    return this.hasKnownPendingInteractions() || this.isWaitingForPendingInteraction()
+      || this.interactionSubmitError.length > 0;
+  }
+
+  private pendingInteractionNotice(): string {
+    if (this.interactionSubmitError.length > 0) {
+      return this.interactionSubmitError;
+    }
+    if (!this.shouldShowPendingInteractions()) {
+      return '';
+    }
+    if (this.desktopInteractionError.length > 0) {
+      return '暂时无法读取待处理请求，请重试或在电脑查看';
+    }
+    return this.hasKnownPendingInteractions() ? '' : '会话正在等待确认或回答，请刷新请求或在电脑查看';
+  }
+
   private async refreshDesktopInteractions(): Promise<void> {
     const threadId = this.desktopInteractionSessionId();
     if (threadId.length === 0) {
       return;
     }
     const navigation = this.readSessionNavigation();
+    const submitErrorBeforeRefresh = this.interactionSubmitError;
     const requestSeq = ++this.desktopInteractionRefreshSeq;
     try {
       const requests = await BridgeClient.listDesktopInteractions(this.normalizedBridgeUrl(), threadId, this.bridgeToken);
@@ -14951,10 +16548,17 @@ struct Index {
         return request.threadId === threadId && request.status === 'pending';
       });
       this.desktopInteractionError = '';
+      if (this.desktopInteractions.length === 0 && this.interactionSubmitError === submitErrorBeforeRefresh) {
+        this.interactionSubmitError = '';
+      }
     } catch (error) {
       if (requestSeq === this.desktopInteractionRefreshSeq
         && this.isSessionNavigationCurrent(navigation.revision, threadId)
         && this.desktopInteractionSessionId() === threadId) {
+        if (this.desktopInteractionError.length === 0) {
+          this.log('warn', 'desktop.interactions.refresh.failed',
+            `hasRequests=${this.hasKnownPendingInteractions()}; waiting=${this.isWaitingForPendingInteraction()}`);
+        }
         this.desktopInteractionError = `待处理请求刷新失败：${this.errorText(error)}`;
       }
     }
@@ -14986,26 +16590,34 @@ struct Index {
 
   private setDesktopInteractionAnswer(request: BridgeDesktopInteraction, questionId: string, value: string): void {
     if (request.threadId === this.desktopInteractionSessionId()
-      && !this.isInteractionBusy('desktop', request.threadId, request.id)
+      && !this.isInteractionBusy('desktop', request.threadId, this.desktopAnswerScope(request))
       && this.visibleDesktopInteractions().some((item: BridgeDesktopInteraction) => item.id === request.id)) {
-      this.setInteractionAnswer('desktop', request.threadId, request.id, questionId, value);
+      this.setInteractionAnswer('desktop', request.threadId, this.desktopAnswerScope(request), questionId, value);
     }
   }
 
-  private async respondDesktopInteraction(request: BridgeDesktopInteraction, decision: string): Promise<void> {
+  private desktopAnswerScope(request: BridgeDesktopInteraction): string {
+    return request.turnId && request.itemId ? JSON.stringify(['async', request.turnId, request.itemId]) : request.id;
+  }
+
+  private async respondDesktopInteraction(request: BridgeDesktopInteraction, decision: string, skipQuestionId: string = ''): Promise<void> {
     const threadId = this.desktopInteractionSessionId();
     if (request.threadId !== threadId || request.status !== 'pending' || request.supportsResponse !== true
-      || this.isInteractionBusy('desktop', threadId, request.id)
+      || this.isInteractionBusy('desktop', threadId, this.desktopAnswerScope(request))
       || !this.visibleDesktopInteractions().some((item: BridgeDesktopInteraction) => item.id === request.id)) {
       return;
     }
     const response: BridgeDesktopInteractionResponse = { threadId };
-    if (request.kind === 'approval' && (decision === 'approved' || decision === 'denied')) {
+    if (skipQuestionId.length > 0) {
+      if (request.kind !== 'user-input' || request.supportsSkip !== true
+        || !request.questions.some((question: BridgeUserInputQuestion) => question.id === skipQuestionId)) return;
+      response.skipQuestionId = skipQuestionId;
+    } else if (request.kind === 'approval' && (decision === 'approved' || decision === 'denied')) {
       response.decision = decision;
     } else if (request.kind === 'user-input' && request.questions.length > 0) {
       const answers: Record<string, string[]> = {};
       for (const question of request.questions) {
-        const answer = this.interactionAnswer('desktop', threadId, request.id, question.id).trim();
+        const answer = this.interactionAnswer('desktop', threadId, this.desktopAnswerScope(request), question.id).trim();
         if (answer.length === 0) {
           return;
         }
@@ -15016,15 +16628,20 @@ struct Index {
       return;
     }
     const navigation = this.readSessionNavigation();
-    this.setInteractionBusy('desktop', threadId, request.id, true);
+    this.setInteractionBusy('desktop', threadId, this.desktopAnswerScope(request), true);
     this.interactionSubmitError = '';
     try {
       await BridgeClient.respondDesktopInteraction(this.normalizedBridgeUrl(), request.id, response, this.bridgeToken);
       if (!this.isSessionNavigationCurrent(navigation.revision, threadId)) {
         return;
       }
-      this.clearInteractionAnswers('desktop', threadId, request.id);
-      this.message = request.kind === 'approval' ? '桌面已确认处理结果' : '桌面已确认收到回答';
+      if (skipQuestionId.length > 0) {
+        this.setInteractionAnswer('desktop', threadId, this.desktopAnswerScope(request), skipQuestionId, '');
+        this.message = '已跳过此问题';
+      } else {
+        this.clearInteractionAnswers('desktop', threadId, this.desktopAnswerScope(request));
+        this.message = request.kind === 'approval' ? '桌面已确认处理结果' : '桌面已确认收到回答';
+      }
     } catch (error) {
       if (this.isSessionNavigationCurrent(navigation.revision, threadId)) {
         this.interactionSubmitError = `${request.title || '桌面请求'}提交失败：${this.errorText(error)}`;
@@ -15033,7 +16650,7 @@ struct Index {
       if (this.isSessionNavigationCurrent(navigation.revision, threadId)) {
         await this.refreshDesktopInteractions();
       }
-      this.setInteractionBusy('desktop', threadId, request.id, false);
+      this.setInteractionBusy('desktop', threadId, this.desktopAnswerScope(request), false);
     }
   }
 

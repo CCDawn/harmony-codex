@@ -30,6 +30,16 @@
 
       var MAX_SOURCE_CHARS = 24 * 1024;
       var root = document.getElementById('diagram-root');
+      var latestRevision = -1;
+
+      function completed(revision, result) {
+        try {
+          if (window.MermaidNative && typeof window.MermaidNative.completed === 'function') {
+            window.MermaidNative.completed(revision, result);
+          }
+        } catch (_) { /* The native view may already have been destroyed. */ }
+        return result;
+      }
 
       function sourceError(source) {
         if (!source || !source.trim()) return '图表内容为空';
@@ -64,14 +74,18 @@
       }
 
       window.renderMermaid = async function (payloadJson) {
+        var revision = -1;
         try {
           var payload = JSON.parse(payloadJson);
+          revision = Number(payload.revision);
+          if (!Number.isSafeInteger(revision) || revision < 0) return 'MERMAID_ERROR:无效的渲染版本';
+          if (revision > latestRevision) latestRevision = revision;
           var source = String(payload.source || '');
           var error = sourceError(source);
-          if (error) return 'MERMAID_ERROR:' + error;
-          if (!window.mermaid) return 'MERMAID_ERROR:离线 Mermaid 引擎未加载';
+          if (error) return completed(revision, 'MERMAID_ERROR:' + error);
+          if (!window.mermaid) return completed(revision, 'MERMAID_ERROR:离线 Mermaid 引擎未加载');
 
-          document.body.className = payload.darkMode ? '' : 'light';
+          if (revision === latestRevision) document.body.className = payload.darkMode ? '' : 'light';
           window.mermaid.initialize({
             startOnLoad: false,
             securityLevel: 'strict',
@@ -81,11 +95,11 @@
           var renderId = 'codex-mermaid-' + String(payload.revision || Date.now());
           var rendered = await window.mermaid.render(renderId, source);
           var svg = sanitizeSvg(rendered.svg);
-          root.innerHTML = svg;
-          return 'MERMAID_RENDERED';
+          if (revision === latestRevision) root.innerHTML = svg;
+          return completed(revision, 'MERMAID_RENDERED');
         } catch (error) {
-          root.innerHTML = '<div class="empty">图表无法渲染</div>';
-          return 'MERMAID_ERROR:' + briefError(error);
+          if (revision === latestRevision) root.innerHTML = '<div class="empty">图表无法渲染</div>';
+          return completed(revision, 'MERMAID_ERROR:' + briefError(error));
         }
       };
     }());

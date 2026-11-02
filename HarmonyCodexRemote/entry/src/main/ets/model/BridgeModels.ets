@@ -213,6 +213,12 @@ export interface SlashIndexItem {
   root?: string;
 }
 
+export interface CodexServiceTier {
+  id: string;
+  name: string;
+  description: string;
+}
+
 export interface CodexModelOption {
   id: string;
   model?: string;
@@ -221,6 +227,13 @@ export interface CodexModelOption {
   isDefault?: boolean;
   defaultReasoningEffort?: string;
   supportedReasoningEfforts?: string[];
+  serviceTiers?: CodexServiceTier[];
+}
+
+export interface SessionSettingsPatch {
+  model?: string;
+  reasoningEffort?: string;
+  serviceTier?: string;
 }
 
 export interface SessionSettings {
@@ -231,6 +244,11 @@ export interface SessionSettings {
   modelOptions?: CodexModelOption[];
   modelCatalogSource?: string;
   modelCatalogRevision?: string;
+  serviceTier?: string;
+  defaultServiceTier?: string;
+  effectiveServiceTier?: string;
+  serviceTierSource?: 'session' | 'desktop';
+  serviceTierOptions?: CodexServiceTier[];
   reasoningEffort: string;
   defaultReasoningEffort?: string;
   effectiveReasoningEffort?: string;
@@ -239,6 +257,7 @@ export interface SessionSettings {
 }
 
 export interface BridgeTask {
+  deliveryAttempted?: boolean;
   id: string;
   projectId: string;
   prompt: string;
@@ -356,10 +375,15 @@ export interface BridgeDesktopInteraction {
   detail: string;
   questions: BridgeUserInputQuestion[];
   supportsResponse: boolean;
+  supportsSkip?: boolean;
+  itemId?: string;
+  turnId?: string;
+  rejectLabel?: string;
 }
 
 export interface BridgeDesktopInteractionResponse {
   threadId: string;
+  skipQuestionId?: string;
   decision?: string;
   answers?: Record<string, string[]>;
 }
@@ -375,6 +399,8 @@ export interface BridgeOutboxItem {
   order: number;
   attemptCount: number;
   retryable: boolean;
+  blockedBy?: string;
+  blockedReason?: string;
   error: string;
   nextAttemptAt: string;
   lastAttemptAt: string;
@@ -408,6 +434,7 @@ export interface CodexSessionSummary {
 }
 
 export interface CodexRuntimeSession {
+  nativeState?: string;
   threadId: string;
   title: string;
   projectRoot: string;
@@ -435,13 +462,50 @@ export interface CodexRuntimeSnapshot {
   sessions: CodexRuntimeSession[];
 }
 
+export interface CodexContinueStatus {
+  threadId: string;
+  turnId: string;
+  canContinue: boolean;
+  reason: string;
+  state: string;
+}
+
+export interface CodexContinueResult {
+  operationId: string;
+  threadId: string;
+  expectedTurnId: string;
+  turnId: string;
+  canContinue: boolean;
+  reason: string;
+  state: string;
+  active: boolean;
+}
+
+export interface CodexLiveDesktopStatus {
+  connected: boolean;
+  state: string;
+}
+
+export interface CodexLiveRuntimeFrame {
+  snapshot: CodexRuntimeSnapshot | null;
+  desktop: CodexLiveDesktopStatus;
+  observedAt: string;
+}
+
 export interface CodexSessionAgentRef {
   name: string;
+  displayName?: string;
   status: string;
   report?: string;
 }
 
+export interface CodexSessionAgentState {
+  status: string;
+  message?: string | null;
+}
+
 export interface CodexSessionToolItem {
+  displayCommand?: string;
   id: string;
   name: string;
   verb: string;
@@ -452,6 +516,20 @@ export interface CodexSessionToolItem {
   args?: string;
   taskName?: string;
   agents?: CodexSessionAgentRef[];
+  agentThreadId?: string;
+  agentPath?: string;
+  kind?: string;
+  model?: string;
+  reasoningEffort?: string;
+  source?: string;
+  pluginId?: string | null;
+  scriptPath?: string | null;
+  rawType?: string;
+  rawTool?: string;
+  senderThreadId?: string;
+  receiverThreadIds?: string[];
+  agentsStates?: Record<string, CodexSessionAgentState>;
+  prompt?: string;
 }
 
 export interface CodexSessionEntry {
@@ -480,6 +558,8 @@ export interface CodexSessionSync {
   hasMoreBefore: boolean;
   hasMoreAfter: boolean;
   entryCount: number;
+  // Official full-page turns whose terminal item sets now own the display.
+  completedTurnIds?: string[];
 }
 
 export interface CodexSessionFingerprint {
@@ -522,6 +602,10 @@ export type VoiceCallStatus = 'idle' | 'connecting' | 'ready' | 'active' | 'clos
 
 export interface VoiceTranscriptEntry {
   itemId?: string;
+  /** Epoch milliseconds when known; legacy cached entries may have no time. */
+  createdAt?: number;
+  /** Official request identity, when provided by room history. */
+  requestId?: string;
   role: string;
   text: string;
   final: boolean;

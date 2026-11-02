@@ -1,0 +1,2 @@
+from pathlib import Path
+p=Path('voice/companion_session.py');s=p.read_text(encoding='utf-8').replace('operation = "reconcile" if response.get("operation") == "reconcile" else (\n                    method if method in {"discover", "history", "start", "attach", "stop"} else "unknown")','operation = method if method in {"discover", "history", "start", "attach", "stop"} else "unknown"');p.write_text(s,encoding='utf-8')

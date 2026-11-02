@@ -3,6 +3,7 @@ import { scaleFontSize } from '../theme/AppTypography';
 import { VoiceTranscriptEntry } from '../model/BridgeModels';
 import { CompanionCallRecord, CompanionProfile, CompanionTextMessage } from '../model/CompanionModels';
 import { CompanionHistoryReducer } from '../services/CompanionHistoryReducer';
+import { composeCompanionTimeline, companionTimelineRenderKey, CompanionTimelineItem } from '../services/CompanionTimeline';
 import { VoiceTranscriptPresentation } from '../services/VoiceTranscriptPresentation';
 import {
   parseSessionMarkdownInline,
@@ -205,13 +206,19 @@ export struct CompanionConversationPanel {
     }
   }
 
-  @Monitor('entries')
-  private onEntriesChanged(): void {
-    if (this.entries.length === 0) {
+  private timeline(): CompanionTimelineItem[] {
+    return composeCompanionTimeline(VoiceTranscriptPresentation.visible(this.entries), this.textMessages);
+  }
+
+  @Monitor('entries', 'textMessages')
+  private onTimelineChanged(): void {
+    const timeline = this.timeline();
+    if (timeline.length === 0) {
+      this.latestSignature = '';
       return;
     }
-    const latest = this.entries[this.entries.length - 1];
-    const signature = `${latest.itemId ?? ''}:${latest.text}`;
+    const latest = timeline[timeline.length - 1];
+    const signature = `${latest.key}:${latest.entry?.text ?? latest.message?.text ?? ''}`;
     if (signature === this.latestSignature) {
       return;
     }
@@ -222,22 +229,14 @@ export struct CompanionConversationPanel {
     }
     this.latestSignature = signature;
     if (followLatest) {
-      setTimeout(() => {
-        try {
-          this.messagesScroller.scrollEdge(Edge.Bottom);
-        } catch (_) {
-        }
-      }, 60);
+      this.scrollToLatest();
     }
   }
 
-  @Monitor('textMessages')
-  private onTextMessagesChanged(): void {
-    if (this.textMessages.length > 0) {
-      setTimeout(() => {
-        try { this.messagesScroller.scrollEdge(Edge.Bottom); } catch (_) {}
-      }, 60);
-    }
+  private scrollToLatest(): void {
+    setTimeout(() => {
+      try { this.messagesScroller.scrollEdge(Edge.Bottom); } catch (_) {}
+    }, 60);
   }
 
   build() {
@@ -310,16 +309,15 @@ export struct CompanionConversationPanel {
               }
             }, (call: CompanionCallRecord) => `${call.callId}:${call.messageId}`)
           }
-          ForEach(VoiceTranscriptPresentation.visible(this.entries), (entry: VoiceTranscriptEntry) => {
+          ForEach(this.timeline(), (item: CompanionTimelineItem) => {
             ListItem() {
-              this.MessageBubble(entry)
+              if (item.entry !== null) {
+                this.MessageBubble(item.entry)
+              } else if (item.message !== null) {
+                this.TextMessageBubble(item.message)
+              }
             }
-          }, (entry: VoiceTranscriptEntry) => `${entry.itemId ?? ''}:${entry.role}:${entry.text}`)
-          ForEach(this.textMessages, (message: CompanionTextMessage) => {
-            ListItem() {
-              this.TextMessageBubble(message)
-            }
-          }, (message: CompanionTextMessage) => message.requestId)
+          }, (item: CompanionTimelineItem) => companionTimelineRenderKey(item))
         }.layoutWeight(1).width('100%').scrollBar(BarState.Auto)
       }
 
@@ -411,7 +409,7 @@ export struct CompanionConversationPanel {
           .width(56).height(44).padding({ left: 0, right: 0 }).fontSize(this.fs(13)).fontColor(this.theme().textOnAccent)
           .backgroundColor(this.theme().accent).borderRadius(12)
           .enabled(this.textReady && this.profile !== null && this.draft.trim().length > 0)
-          .onClick(() => this.onSendText())
+          .onClick(() => { this.onSendText(); this.scrollToLatest(); })
         Button(this.voiceOngoing ? '通话' : '语音')
           .width(48).height(44).padding({ left: 0, right: 0 }).fontSize(this.fs(12)).fontColor(this.theme().accent)
           .backgroundColor(this.theme().accentSurface).borderRadius(12)

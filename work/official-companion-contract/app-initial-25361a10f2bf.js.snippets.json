@@ -1,0 +1,9 @@
+{
+  "length": 11135648,
+  "hits": [
+    {
+      "at": 7401690,
+      "text": "o(hRo)}function SRo(e){CRo(e?dRo:pRo)}function CRo(e){let t;try{t=new Audio(e)}catch{return}let n=()=>{wRo.delete(t)};wRo.add(t),t.addEventListener(`ended`,n,{once:!0}),t.addEventListener(`error`,n,{once:!0});try{t.play().catch(n)}catch{n()}}var wRo;function TRo(){return(TRo=e((()=>{iRo(),oRo(),cRo(),uRo(),fRo(),mRo(),gRo(),wRo=new Set})))()}var ERo,DRo;function ORo(){return(ORo=e((()=>{bi(),Jp(),ERo=class{#e=null;#t=null;#n=null;hasAttempt(){return this.#e!=null}isDictationActive(){return this.#e?.dictationActive??!1}async claim(e,t,n,r,i,a){let o={dictationActive:!1,handleControl:null,microphoneMuted:t,outputMuted:n,stopRequested:!1};this.#e=o,this.#n=null;let s=wu?.realtimeVoice;if(s==null)return{status:`claimed`,microphoneMuted:t,outputMuted:n};let c;try{c=await s.claim(e,new DRo(e=>this.#r(o,e),async e=>{if(this.#e!==o||o.stopRequested)return null;let t=await i(e);return this.#e===o&&!o.stopRequested?t:null}),r,a)}catch(e){throw this.#e===o&&(this.#e=null),e}return c==null?(this.#e===o&&(this.#e=null),{status:`busy`}):(this.#t=c,o.stopRequested?(this.release(c),{status:`cancelled`}):{status:`claimed`,microphoneMuted:o.microphoneMuted,outputMuted:o.outputMuted})}setControlHandl"
+    }
+  ]
+}

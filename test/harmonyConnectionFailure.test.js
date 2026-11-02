@@ -77,6 +77,7 @@ export function createHarness(BridgeClient) {
     isNewSessionDraft = false; selectedSession = null; calls = [];
     sessionRuntimeStore = { mergeSessions: (sessions) => sessions };
     loadCompanionProfile() { return Promise.resolve(); }
+    syncPushRegistration() {}
     normalizedBridgeUrl() { return 'https://bridge.example'; }
     bridgeToken = 'test';
     errorText(error) { return error.message; }
@@ -157,17 +158,18 @@ export function createRecoveryHarness(BridgeClient) {
     log() {}
     refreshDashboard() { return Promise.resolve(); }
     errorText(error) { return error.message; }
+    calls = [];
+    async runMobileControlRepair(source, hard) { this.calls.push([source, hard]); return true; }
     ${method('repairDesktopLiveFromPhone')}
   };
 }`);
 
-test('session-list soft action invokes explicit soft endpoint with restart confirmation false', async () => {
-  const calls = [];
+test('session-list recovery delegates to control repair without hard restart confirmation', async () => {
   const harness = createRecoveryHarness({
-    repairSystemLink: async (...args) => { calls.push(args); return { severity: 'ok', desktop: { desktopLive: true } }; },
-    recoverSystemLink: async () => { throw new Error('auto recovery must not be requested'); }
+    repairSystemLink: async () => { throw new Error('repair must use the independent control route'); },
+    recoverSystemLink: async () => { throw new Error('repair must use the independent control route'); }
   });
   assert.equal(await harness.repairDesktopLiveFromPhone('sessions_connection_failure', true), true);
-  assert.deepEqual(calls, [['https://bridge.example', 'test', '', 'soft', false]]);
+  assert.deepEqual(harness.calls, [['sessions_connection_failure', false]]);
   assert.equal(harness.desktopLiveRestarting, false);
 });

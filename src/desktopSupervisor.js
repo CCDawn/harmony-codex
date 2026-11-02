@@ -8,7 +8,12 @@ export function supervisorArmPath(repoRoot) {
   return path.join(repoRoot, 'logs', 'state', 'desktop-supervisor.json');
 }
 
+// Auto relaunch of a missing desktop is opt-in only: unless the env switch is
+// explicitly set, never bring Codex.exe to the foreground on its own.
 export function canAutoRelaunchMissingCodex(desktop, supervisor) {
+  if (process.env.CODEX_BRIDGE_AUTO_RELAUNCH_MISSING_DESKTOP !== '1') {
+    return false;
+  }
   if (supervisor?.armed !== true || desktop?.desktopLive === true) {
     return false;
   }

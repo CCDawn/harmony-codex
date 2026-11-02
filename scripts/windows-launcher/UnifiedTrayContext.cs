@@ -33,6 +33,7 @@ internal sealed class UnifiedTrayContext : ApplicationContext
     private string currentOperationId = "";
     private string lastProgressStamp = "";
     private bool guardianBusy;
+    private bool controlAgentBusy;
     private string guardianError = "";
     private bool busy;
     private bool exiting;
@@ -44,6 +45,13 @@ internal sealed class UnifiedTrayContext : ApplicationContext
     // 为空表示待命不可用，探测结论按旧路径直接 spawn。
     private volatile string standbySignalPath = "";
     private volatile bool standbyStartActive;
+    // 待命控制进程句柄：仅用于 HasExited 活体监测（不等待、不杀死、流不重定向），
+    // standby 生命周期结束（收据/回退/超时/abort）后释放。
+    private volatile Process standbyController;
+    // standby 异常收尾（控制进程死亡 / 25s 兜底 / 190s 超时）的时刻：该次操作已无
+    // 终态收据来源，startedAt 更早的操作不再进入进度展示，防止已宣告放弃或超时的
+    // 操作继续显示假进度。
+    private DateTimeOffset standbyProgressFloorAt = DateTimeOffset.MinValue;
 
     public UnifiedTrayContext()
     {
@@ -89,6 +97,7 @@ internal sealed class UnifiedTrayContext : ApplicationContext
             if (showSignal.WaitOne(0)) { Execute("Status", true); }
             WriteHeartbeat();
             if (++ticks % 6 == 0) {
+                EnsureControlAgent();
                 ExecuteGuardian("Ensure", false);
                 if (!busy) Execute("Maintain", false);
             }
@@ -105,6 +114,7 @@ internal sealed class UnifiedTrayContext : ApplicationContext
         SpawnStandbyController();
         RunInitialProbe();
         ExecuteGuardian("Ensure", false);
+        EnsureControlAgent();
     }
 
     // ---- 冷启动快速判定 ----------------------------------------------------
@@ -170,12 +180,13 @@ internal sealed class UnifiedTrayContext : ApplicationContext
                         + "\" -Action Start -StandbyFile \"" + signalPath + "\"",
                     WorkingDirectory = repoRoot, UseShellExecute = false,
                     CreateNoWindow = true, WindowStyle = ProcessWindowStyle.Hidden };
-                using (var process = Process.Start(info)) {
-                    if (process == null) return;
-                    // 句柄用完即弃：不等待也不杀死，待命进程按自身轮询上限收尾；
-                    // 托盘退出时若信号文件仍在，再补写 abort 兜底。
-                    standbySignalPath = signalPath;
-                }
+                var process = Process.Start(info);
+                if (process == null) return;
+                // 保留句柄供 WatchStandbyStart 活体监测（只查 HasExited：不等待也不
+                // 杀死，进程按自身契约收尾）。先记进程再发布信号路径（volatile 写
+                // 次序），保证 ReleaseStandbyForStart 放行时句柄必然可见。
+                standbyController = process;
+                standbySignalPath = signalPath;
             } catch { /* 待命不可用：CompleteInitialProbe 按旧路径直接 spawn。 */ }
         });
     }
@@ -211,18 +222,23 @@ internal sealed class UnifiedTrayContext : ApplicationContext
     // 删除只是清理；即便删除时它还没读到，它也会按自身超时无副作用退出。
     private void CancelStandby()
     {
+        // 句柄先释放：abort+删除语义不变（不杀不等，进程按自身超时无副作用退出）。
+        DisposeStandbyController();
         var path = standbySignalPath;
         if (path.Length == 0 || !File.Exists(path)) return;
         try { File.WriteAllText(path, "abort", new UTF8Encoding(false)); } catch { }
         try { File.Delete(path); } catch { }
     }
 
-    // 观察待命 Start 的收尾（不持有进程句柄，全部经由落盘契约）：
+    // 观察待命 Start 的收尾（句柄仅用于 HasExited 活体监测，判定全部经由落盘契约）：
     //   终态收据（ready/partial/failed 且 active=false， freshness 由 AcceptOperation
     //   按 actionStartedAt 把关）→ 与旧路径收据分支一致，转一次只读 Status 刷新；
+    //   控制进程已退出且无终态收据 → 活体监测立即介入：/health 廉价探测，健康按
+    //   收据到达处理，否则走 25s 兜底相同的回退补 Start，不干等 190s；
     //   go 写入 25 秒后信号文件仍在 → 待命进程没能接手（提前退出或错过轮询窗），
     //   清掉残留文件并回退旧路径补一次 Start（幂等，重复触发安全）；
-    //   190 秒仍无收据 → 与旧 Start 超时（180 秒 + 裕量）同样的提示。
+    //   190 秒仍无收据 → 仅剩“进程活着但收据迟迟不来”这一种情形，与旧 Start
+    //   超时（180 秒 + 裕量）同样的提示。
     private void WatchStandbyStart(DateTimeOffset startedAt, string signalPath)
     {
         Task.Run(delegate {
@@ -230,30 +246,27 @@ internal sealed class UnifiedTrayContext : ApplicationContext
                 System.Threading.Thread.Sleep(500);
                 if (exiting || !standbyStartActive) return;
                 if (DateTimeOffset.UtcNow - startedAt > TimeSpan.FromSeconds(25) && File.Exists(signalPath)) {
-                    try { dispatcher.BeginInvoke((Action)delegate {
-                        if (exiting || !standbyStartActive) return;
-                        standbyStartActive = false;
-                        if (pendingExit) { pendingExit = false; busy = false; foreach (var item in operations) item.Enabled = true; try { File.Delete(signalPath); } catch { } ExitApp(); return; }
-                        busy = false;
-                        foreach (var item in operations) item.Enabled = true;
-                        try { File.Delete(signalPath); } catch { }
-                        Execute("Start", false);
-                    }); } catch (InvalidOperationException) { }
+                    try { dispatcher.BeginInvoke((Action)delegate { FinishStandbyByFallback(signalPath); }); } catch (InvalidOperationException) { }
                     return;
                 }
-                if (ReadOperationReceipt(startedAt) == null) continue;
-                try { dispatcher.BeginInvoke((Action)delegate {
-                    if (exiting || !standbyStartActive) return;
-                    standbyStartActive = false;
-                    if (pendingExit) { pendingExit = false; busy = false; foreach (var item in operations) item.Enabled = true; ExitApp(); return; }
-                    busy = false;
-                    Execute("Status", false);
-                }); } catch (InvalidOperationException) { }
+                if (ReadOperationReceipt(startedAt) != null) {
+                    try { dispatcher.BeginInvoke((Action)delegate { FinishStandbyByReceipt(); }); } catch (InvalidOperationException) { }
+                    return;
+                }
+                if (!StandbyControllerExited()) continue;
+                // 活体监测命中：控制进程已死且无收据。廉价探测在监视线程完成
+                // （/health 1.2s 超时 + 两次文件读），结论交 UI 线程收尾。
+                var probe = ProbeLinkHealth();
+                try { dispatcher.BeginInvoke((Action)delegate { CompleteStandbyControllerDeath(probe, signalPath); }); } catch (InvalidOperationException) { }
                 return;
             }
             try { dispatcher.BeginInvoke((Action)delegate {
                 if (exiting || !standbyStartActive) return;
                 standbyStartActive = false;
+                // 超时宣告后截断该次操作的进度显示；句柄一并释放（进程若仍存活，
+                // 按自身契约继续，其后续收据不再进入进度展示）。
+                standbyProgressFloorAt = DateTimeOffset.UtcNow;
+                DisposeStandbyController();
                 if (pendingExit) { pendingExit = false; busy = false; foreach (var item in operations) item.Enabled = true; ExitApp(); return; }
                 busy = false;
                 lastStatus = "操作超时，请查看启动日志。";
@@ -262,6 +275,65 @@ internal sealed class UnifiedTrayContext : ApplicationContext
                 if (statusWindow != null) statusWindow.ShowFailure(lastStatus);
             }); } catch (InvalidOperationException) { }
         });
+    }
+
+    // 真实终态收据与活体监测“健康/已暂停”结论共用的收尾：与旧路径收据分支一致，
+    // 转一次只读 Status 刷新。此处不设进度截断——正常收据的进度展示是合法的。
+    private void FinishStandbyByReceipt()
+    {
+        if (exiting || !standbyStartActive) return;
+        standbyStartActive = false;
+        DisposeStandbyController();
+        if (pendingExit) { pendingExit = false; busy = false; foreach (var item in operations) item.Enabled = true; ExitApp(); return; }
+        busy = false;
+        Execute("Status", false);
+    }
+
+    // 25s 兜底与活体监测“不健康”结论共用的回退收尾：按“go 未被接住/链路未起”
+    // 处理——清掉残留信号文件并回退旧路径补一次 Start（幂等，重复触发安全），
+    // 同时截断 standby 遗留的陈旧 active 进度显示。
+    private void FinishStandbyByFallback(string signalPath)
+    {
+        if (exiting || !standbyStartActive) return;
+        standbyStartActive = false;
+        standbyProgressFloorAt = DateTimeOffset.UtcNow;
+        DisposeStandbyController();
+        if (pendingExit) { pendingExit = false; busy = false; foreach (var item in operations) item.Enabled = true; try { File.Delete(signalPath); } catch { } ExitApp(); return; }
+        busy = false;
+        foreach (var item in operations) item.Enabled = true;
+        try { File.Delete(signalPath); } catch { }
+        Execute("Start", false);
+    }
+
+    // 活体监测结论（UI 线程）：控制进程已退出但始终没有终态收据。进入即截断
+    // 该次操作的进度显示，再按探测结论收尾：链路已健康（或已暂停）→ 按收据
+    // 到达处理（已暂停时不自动拉起，与 CompleteInitialProbe 的停止不变量一致）；
+    // 其余 → 与 25s 兜底相同的回退补 Start。
+    private void CompleteStandbyControllerDeath(LinkProbeResult probe, string signalPath)
+    {
+        if (exiting || !standbyStartActive) return;
+        standbyProgressFloorAt = DateTimeOffset.UtcNow;
+        if (probe.Paused || (probe.BridgeHealthy && probe.DesktopLive)) { FinishStandbyByReceipt(); return; }
+        FinishStandbyByFallback(signalPath);
+    }
+
+    // 活体监测：待命控制进程是否已退出。句柄缺失或已释放按“未知→视为存活”
+    // 处理，交由 25s 兜底与 190s 超时兜底。
+    private bool StandbyControllerExited()
+    {
+        var process = standbyController;
+        if (process == null) return false;
+        try { return process.HasExited; } catch { return false; }
+    }
+
+    // standby 生命周期结束（收据/回退/超时/abort）后释放句柄：只归还句柄，
+    // 不等待也不杀死，进程按自身契约收尾。
+    private void DisposeStandbyController()
+    {
+        var process = standbyController;
+        standbyController = null;
+        if (process == null) return;
+        try { process.Dispose(); } catch { }
     }
 
     // 与 PollOperationProgress 相同的容错读取与验收：只认本次 Start（相对
@@ -367,6 +439,24 @@ internal sealed class UnifiedTrayContext : ApplicationContext
                 catch { return null; }
             }
         }
+    }
+
+    // The phone repair channel outlives this tray and owns its own task/tunnel.
+    private void EnsureControlAgent()
+    {
+        if (controlAgentBusy || exiting) return;
+        controlAgentBusy = true;
+        Task.Run(delegate {
+            try {
+                var script = Path.Combine(repoRoot, "tools", "windows", "mobile-control-agent.ps1");
+                Run(HiddenProcess(pwsh, "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"" + script + "\" -Action Ensure"), 30000);
+            } finally {
+                if (!exiting) {
+                    try { dispatcher.BeginInvoke((Action)delegate { controlAgentBusy = false; }); }
+                    catch (InvalidOperationException) { }
+                }
+            }
+        });
     }
 
     // Ensure only keeps the independent worker alive. It never changes the persisted mode.
@@ -612,6 +702,12 @@ internal sealed class UnifiedTrayContext : ApplicationContext
                 using (var reader = new StreamReader(stream, Encoding.UTF8)) json = reader.ReadToEnd();
             }
             var operation = new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(json);
+            // standby 异常收尾（控制进程死亡 / 25s 兜底 / 190s 超时）后，遗留的
+            // active 操作已无终态收据来源：startedAt 早于截断时刻的一律不再展示；
+            // 正常收据与截断之后新开的操作不受影响。
+            DateTimeOffset staleStart;
+            if (LinkStatusPresentation.TryTime(operation, "startedAt", out staleStart)
+                && staleStart < standbyProgressFloorAt) return;
             var action = LinkStatusPresentation.Flag(operation, "active") ? LinkStatusPresentation.Text(operation, "action")
                 : activeAction == "Start" || activeAction == "Repair" ? activeAction : "";
             if (action != "Start" && action != "Repair") return;

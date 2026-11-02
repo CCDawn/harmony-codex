@@ -213,3 +213,48 @@ test('unmatched paths fall through; profile remains read-only', async () => {
   assert.equal(handled, true);
   assert.equal(response.statusCode, 405);
 });
+
+test('a desktop adapter 401 keeps its real status and the auth class instead of a 502 mask', async () => {
+  const service = new CompanionConversationService({
+    clientFactory() {
+      return {
+        async discover() { return { id: 'p', roomId: 'r' }; },
+        async messages() { const error = new Error('Companion HTTP 401'); error.status = 401; throw error; },
+        close() {}
+      };
+    }
+  });
+  const response = responseCapture();
+  const handled = await handleCompanionRoute({
+    request: makeRequest('GET'), response,
+    url: 'http://127.0.0.1/companion/messages?profileId=p&roomId=r', service
+  });
+  assert.equal(handled, true);
+  assert.equal(response.statusCode, 401);
+  assert.equal(response.payload.failureClass, 'auth');
+});
+
+test('a desktop timeout stays a 502 without any auth class so the guardian reads upstream', async () => {
+  const service = new CompanionConversationService({
+    clientFactory() {
+      return {
+        async discover() { return { id: 'p', roomId: 'r' }; },
+        async messages() {
+          const error = new Error('Companion TimeoutError');
+          error.name = 'TimeoutError';
+          error.status = 0;
+          throw error;
+        },
+        close() {}
+      };
+    }
+  });
+  const response = responseCapture();
+  const handled = await handleCompanionRoute({
+    request: makeRequest('GET'), response,
+    url: 'http://127.0.0.1/companion/messages?profileId=p&roomId=r', service
+  });
+  assert.equal(handled, true);
+  assert.equal(response.statusCode, 502);
+  assert.equal(response.payload.failureClass, undefined);
+});

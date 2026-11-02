@@ -101,3 +101,34 @@ test('interruption after moving old file to backup recovers acknowledged history
   assert.deepEqual(Array.from(await freshStore().load(context, partition), e => e.text), ['final turn 0']);
   await Store.appendFinal(context, partition, turn(1)); assert.equal((await freshStore().load(context, partition)).length, 2);
 });
+
+test('timestamps and request identities survive reload and final updates keep their first timestamp', async t => {
+  const { Store, freshStore, context } = setup(t);
+  await Store.appendFinal(context, partition, { ...turn(0), createdAt: 100, requestId: 'request-one' });
+  await Store.appendFinal(context, partition, { ...turn(0, 'updated'), createdAt: 900 });
+  const entries = plain(await freshStore().load(context, partition));
+  assert.equal(entries[0].createdAt, 100);
+  assert.equal(entries[0].requestId, 'request-one');
+  assert.equal(entries[0].text, 'updated');
+});
+
+test('schema 1 legacy entries remain undated through load and a subsequent write', async t => {
+  const { Store, freshStore, context } = setup(t);
+  await Store.appendFinal(context, partition, turn(0));
+  const file = Store.documentPath(context, partition);
+  const original = JSON.parse(fs.readFileSync(file, 'utf8'));
+  assert.equal(original.schemaVersion, 1);
+  assert.equal(original.entries[0].createdAt, undefined);
+  await Store.appendFinal(context, partition, { ...turn(1), createdAt: 200 });
+  const reloaded = plain(await freshStore().load(context, partition));
+  assert.equal(reloaded.length, 2);
+  assert.equal(reloaded[0].createdAt, undefined);
+  assert.equal(reloaded[1].createdAt, 200);
+});
+
+test('same itemId with distinct roles persists as two separate turns', async t => {
+  const { Store, freshStore, context } = setup(t);
+  await Store.appendFinal(context, partition, turn(0));
+  await Store.appendFinal(context, partition, { ...turn(0), role: 'assistant' });
+  assert.deepEqual(Array.from(await freshStore().load(context, partition), value => value.role), ['user', 'assistant']);
+});

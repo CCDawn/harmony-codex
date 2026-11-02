@@ -1,4 +1,4 @@
-﻿[CmdletBinding()]
+[CmdletBinding()]
 param(
   [ValidateSet('Status','Maintain','Start','Repair','Stop','Pair','GuardianRepair','GuardianReloadWatchers')][string]$Action='Status',
   [ValidateRange(1,65535)][int]$BridgePort=8787,
@@ -69,7 +69,9 @@ function Get-LinkDiagnostics([bool]$Paused,[object]$VoiceTunnel) {
     $info.Arguments='"'+$diagnosticScript+'" --port '+$BridgePort+' --paused '+$Paused.ToString().ToLowerInvariant()+' --voice-state "'+[string]$VoiceTunnel.state+'"'
     $process=[Diagnostics.Process]::Start($info)
     $stdout=$process.StandardOutput.ReadToEndAsync();$stderr=$process.StandardError.ReadToEndAsync()
-    if(-not $process.WaitForExit(20000)){$process.Kill();throw 'Diagnostics probe timed out'}
+    # 30s covers the worst chain without the voice tunnel; a fully saturated
+    # voice chain can still exceed it and degrade to unknown, same as before.
+    if(-not $process.WaitForExit(30000)){$process.Kill();throw 'Diagnostics probe timed out'}
     $parsed=$stdout.Result | ConvertFrom-Json
     if (-not (Get-LinkValue $parsed 'severity')) { throw 'Incomplete diagnostics' }
     return $parsed
@@ -77,6 +79,38 @@ function Get-LinkDiagnostics([bool]$Paused,[object]$VoiceTunnel) {
     Write-LinkEvent ('diagnostics-failed type='+$_.Exception.GetType().Name+' line='+$_.InvocationInfo.ScriptLineNumber)
     return [pscustomobject]@{ severity=$(if($Paused){'stopped'}else{'unknown'}); summary=$(if($Paused){'链路已停止'}else{'业务检测未完成，不能确认通道状态'}); nextAction=$(if($Paused){'start'}else{'check_logs'}); checks=@(); restartRequired=$false }
   } finally { if($process){$process.Dispose()} }
+}
+function Get-LinkGuardianSnapshot([bool]$Paused) {
+  # Maintain-path diagnostics source: the guardian persists every diagnostic
+  # round to mobile-link-guardian-diagnostics.json, so this controller's
+  # periodic pass can consume that snapshot instead of spawning a second node
+  # probe against the same endpoints. Read-only consumer: the guardian owns
+  # the file. Returns @{snapshot=...} when usable, or @{reason=...} so the
+  # caller can record exactly why the self-probe fallback was taken.
+  if ($Paused) { return @{reason='paused'} }
+  $path=Join-Path $repo 'logs\state\mobile-link-guardian-diagnostics.json'
+  if (-not (Test-Path -LiteralPath $path)) { return @{reason='missing'} }
+  $enabled=$false
+  try { $enabled=((Get-Content -Raw -LiteralPath (Join-Path $repo 'logs\state\mobile-link-guardian-config.json') | ConvertFrom-Json).enabled -eq $true) } catch { $enabled=$false }
+  if (-not $enabled) { return @{reason='guardian-disabled'} }
+  $snapshot=$null
+  try { $snapshot=Get-Content -Raw -LiteralPath $path | ConvertFrom-Json } catch { return @{reason='unparsable'} }
+  if (-not (Get-LinkValue $snapshot 'severity') -or $null -eq (Get-LinkValue $snapshot 'checks')) { return @{reason='unparsable'} }
+  # checkedAt is UTC ISO-8601. ConvertFrom-Json eagerly turns that string into
+  # a [datetime] (Kind=Utc): casting it back to [string] drops the Z and
+  # DateTimeOffset.Parse would then re-read the wall clock as local time — the
+  # same 8-hour offset trap in reverse, which made every fresh snapshot read as
+  # stale on UTC+8 hosts. Keep the DateTime's own Kind and only fall back to
+  # the string parse when the file still carries plain text.
+  $fresh=$false
+  try {
+    $checkedAtRaw=$snapshot.checkedAt
+    $checkedAt=if ($checkedAtRaw -is [datetime]) { [datetimeoffset]::new($checkedAtRaw) } else { [datetimeoffset]::Parse([string]$checkedAtRaw) }
+    $age=([datetimeoffset]::UtcNow.UtcDateTime-$checkedAt.UtcDateTime).TotalSeconds
+    $fresh=($age -ge -5 -and $age -le 45)
+  } catch { $fresh=$false }
+  if (-not $fresh) { return @{reason='stale'} }
+  return @{snapshot=$snapshot}
 }
 function Get-LinkHdcStatus {
   $hdc=''
@@ -160,8 +194,14 @@ function Get-LinkBootstrapArguments {
   $Arguments
 }
 function Invoke-DesktopRepair {
-  $safe=Invoke-DesktopSafeRecovery
-  if ($safe.state -in @('not-needed','recovered','pending')) { return $safe }
+  param([switch]$ForceRestart)
+  # Explicit manual hard repair is a restart request even when soft recovery
+  # reports healthy. Guardian retains its last-minute soft/no-op protection;
+  # operation and lifecycle ownership still serialize both paths upstream.
+  if (-not $ForceRestart -or $GuardianRepair) {
+    $safe=Invoke-DesktopSafeRecovery
+    if ($safe.state -in @('not-needed','recovered','pending')) { return $safe }
+  }
   if ((Get-Variable GuardianRepair -ValueOnly -ErrorAction SilentlyContinue) -and -not (Test-GuardianRepairAllowed)) { return [pscustomobject]@{state='cancelled';message='自动恢复已取消'} }
   Write-LinkEvent 'desktop-restart-requested'
   if (Get-Command Set-LinkOperationPhase -ErrorAction SilentlyContinue) { Set-LinkOperationPhase 'restarting_desktop' }
@@ -338,7 +378,11 @@ function Get-LinkFastProbe {
   [pscustomobject]@{
     healthOk=$(if($SkipHealth){$true}else{[bool](Get-LinkValue $health 'ok' $false) -and [string](Get-LinkValue (Get-LinkValue $health 'runtime') 'mode' '') -eq 'desktop'})
     desktopLive=[bool](Get-LinkValue (Get-LinkValue $desktop 'desktop') 'desktopLive' $false)
-    sessionsReady=($null -ne (Get-LinkValue $sessions 'sessions' $null))
+    # Session readiness is the authenticated /codex/sessions answer itself: an
+    # empty list is a valid cold start. Do not read the 'sessions' property via
+    # Get-LinkValue here — an empty array unwinds to zero pipeline objects and
+    # reads as $null, so cold starts would never reach the ready verdict.
+    sessionsReady=($null -ne $sessions)
     remainingSeconds=$remainingSeconds
   }
 }
@@ -435,6 +479,35 @@ function Complete-LinkFastStart {
     Start-Sleep -Milliseconds 400
   } while ($true)
 }
+function Write-LinkStatusJson {
+  param([object]$State,[string]$Path)
+  # Every mobile-link-status.json producer (Get-LinkStatus for Status/Maintain,
+  # the Start/Repair tail) goes through here. Set-Content truncates before
+  # writing, so overlapping writers could interleave into an IOException and
+  # record a successful startup as failed. Same temp+Replace pattern as
+  # Write-MobileLinkAtomicJson, serialized by a dedicated Global mutex keyed on
+  # the target path so controller, tray and scheduler sessions share one key.
+  $full=[IO.Path]::GetFullPath($Path)
+  $dir=Split-Path -Parent $full
+  New-Item -ItemType Directory -Force -Path $dir | Out-Null
+  $sha=[Security.Cryptography.SHA256]::Create()
+  try { $hash=[BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($full.TrimEnd('\','/').ToLowerInvariant()))).Replace('-','').Substring(0,16) }
+  finally { $sha.Dispose() }
+  $gate=[Threading.Mutex]::new($false,('Global\CodexMobileLinkStatus-'+$hash))
+  $owns=$false
+  $temporary=Join-Path $dir ('.link-status-'+[guid]::NewGuid().ToString('N')+'.tmp')
+  try {
+    try { $owns=$gate.WaitOne(10000) } catch [Threading.AbandonedMutexException] { $owns=$true }
+    if (-not $owns) { throw 'Status snapshot is busy' }
+    [IO.File]::WriteAllText($temporary,($State | ConvertTo-Json -Depth 6),[Text.UTF8Encoding]::new($false))
+    if ([IO.File]::Exists($full)) { [IO.File]::Replace($temporary,$full,[System.Management.Automation.Language.NullString]::Value) }
+    else { [IO.File]::Move($temporary,$full) }
+  } finally {
+    if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }
+    if ($owns) { $gate.ReleaseMutex() }
+    $gate.Dispose()
+  }
+}
 function Get-LinkStatus {
   if (Get-Command Get-MobileLinkOperation -ErrorAction SilentlyContinue) {
     $progress=Get-MobileLinkOperation $repo
@@ -462,7 +535,35 @@ function Get-LinkStatus {
   $live = $false
   $paused=Test-MobileLinkPaused $repo
   $voiceTunnel=Get-MobileVoiceTunnelStatus $repo
-  $diagnostics=Get-LinkDiagnostics $paused $voiceTunnel
+  # Call-site switch ($script:preferGuardianSnapshot, set only by the Maintain
+  # paths): prefer the guardian's persisted diagnostics snapshot over spawning
+  # a second node probe of the same endpoints. A script flag instead of a
+  # parameter keeps the AST-extracted parameter-less Get-LinkStatus stubs in
+  # the acceptance harnesses binding-compatible. Start/Repair/Stop keep the
+  # unconditional self-probe: their verdicts gate repair actions.
+  $preferSnapshot=[bool](Get-Variable preferGuardianSnapshot -ValueOnly -ErrorAction SilentlyContinue)
+  $snapshotDecision=$null
+  if ($preferSnapshot) {
+    $snapshotDecision=Get-LinkGuardianSnapshot -Paused $paused
+    # The decision is a plain hashtable carrying either snapshot or reason.
+    # Direct property access throws under StrictMode on the missing half, and
+    # Get-LinkValue only sees PSCustomObject properties, so probe the key and
+    # read through the indexer instead.
+    if ($snapshotDecision -and -not $snapshotDecision.ContainsKey('snapshot')) { Write-LinkEvent ('diagnostics-snapshot-fallback reason='+$snapshotDecision['reason']) }
+  }
+  if ($snapshotDecision -and $snapshotDecision.ContainsKey('snapshot')) {
+    $diagnostics=$snapshotDecision['snapshot']
+    $diagnostics.checks=@($diagnostics.checks)
+    $diagnostics | Add-Member -NotePropertyName source -NotePropertyValue 'guardian' -Force
+  } else {
+    $diagnostics=Get-LinkDiagnostics $paused $voiceTunnel
+    if ($snapshotDecision) {
+      # Maintain fallback observability: mark this diagnostics round as
+      # self-probed so the status JSON shows who produced it.
+      $diagnostics | Add-Member -NotePropertyName source -NotePropertyValue 'self' -Force
+      $diagnostics | Add-Member -NotePropertyName checkedAt -NotePropertyValue ([datetime]::UtcNow.ToString('o')) -Force
+    }
+  }
   # Use the same probe as the detailed checks, not an earlier desktop snapshot.
   $live=@($diagnostics.checks | Where-Object { $_.id -eq 'desktop' -and $_.state -eq 'ready' }).Count -gt 0
   # HDC is an optional installation channel, never a prerequisite for normal mobile conversation.
@@ -475,8 +576,46 @@ function Get-LinkStatus {
   }
   $dir=Join-Path $repo 'logs\state'
   New-Item -ItemType Directory -Force -Path $dir | Out-Null
-  $state | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $dir 'mobile-link-status.json') -Encoding utf8
+  # Guard matches the operation.ps1 integration idiom below: harnesses that
+  # extract Get-LinkStatus standalone stub writes instead of carrying the
+  # helper, while the full script always defines it, so the atomic writer runs
+  # in every real invocation.
+  if (Get-Command Write-LinkStatusJson -ErrorAction SilentlyContinue) {
+    Write-LinkStatusJson -State $state -Path (Join-Path $dir 'mobile-link-status.json')
+  }
   $state
+}
+function Clear-LinkStdHandleInheritance {
+  # pwsh Start-Process creates children with handle inheritance enabled (the
+  # redirected log files must reach them), which also duplicates this
+  # controller's own std handles into the child. When a parent captured our
+  # stdout via a pipe, the long-lived bridge would keep that pipe open past
+  # our exit and the parent's ReadToEndAsync would block forever. Same
+  # protection intent as Start-MobileLinkDetached's bInheritHandles=false;
+  # invoked only from the guardian repair context, where the controller runs
+  # under redirected pipes, so user Start paths never pay the Add-Type
+  # compile in their cold start.
+  if (-not ('MobileLinkStdGuard' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class MobileLinkStdGuard {
+  [DllImport("kernel32.dll", SetLastError=true)] static extern IntPtr GetStdHandle(int nStdHandle);
+  [DllImport("kernel32.dll", SetLastError=true)] static extern bool SetHandleInformation(IntPtr hObject, uint dwMask, uint dwFlags);
+  public static int ClearStdInheritance() {
+    int cleared=0;
+    int[] std=new int[] {-10,-11,-12};
+    foreach(int s in std){
+      IntPtr h=GetStdHandle(s);
+      if(h==IntPtr.Zero||h==new IntPtr(-1)){continue;}
+      if(SetHandleInformation(h,1u,0u)){cleared++;}
+    }
+    return cleared;
+  }
+}
+'@
+  }
+  return [MobileLinkStdGuard]::ClearStdInheritance()
 }
 function Start-LinkBridgeProcess {
   # Fast Start path: launch the node bridge directly instead of paying a second
@@ -613,7 +752,7 @@ function Start-Link {
   if (Get-Command Set-LinkOperationPhase -ErrorAction SilentlyContinue) { Set-LinkOperationPhase 'connecting_desktop' }
   # Exit 2 means dependencies are not ready yet, not a fatal bootstrap error.
   # Resolve the desktop dependency synchronously before collecting final status.
-  $script:desktopRecovery=if ($Action -eq 'Repair' -and $RestartDesktop) { Invoke-DesktopRepair } else { Invoke-DesktopSafeRecovery }
+  $script:desktopRecovery=if ($Action -eq 'Repair' -and $RestartDesktop) { Invoke-DesktopRepair -ForceRestart:(-not $GuardianRepair) } else { Invoke-DesktopSafeRecovery }
   Ensure-LinkMonitors
 }
 function Ensure-LinkMonitors {
@@ -691,9 +830,30 @@ function Invoke-GuardianScopedRepair {
       Stop-MobileLinkOwnedProcesses -Repo $repo -Roles @('bridge','bridge-host') | Out-Null
       if (-not (Test-GuardianRepairAllowed)) { return }
       Set-LinkEnvironment
-      $startupArguments=Get-LinkBootstrapArguments @('-BridgePort',"$BridgePort",'-SkipCodexDesktop','-KeepExistingCodex','-SkipHdcRelay')
-      $startup=Start-MobileLinkDetached -HostPath (Get-Process -Id $PID).Path -ScriptPath (Join-Path $repo 'scripts\start-codex-mobile-stack.ps1') -Arguments $startupArguments -LogPath (Join-Path $repo 'logs\startup\guardian-bridge-repair.log') -WorkingDirectory $repo
-      try { if (-not $startup.WaitForExit(90000) -or $startup.ExitCode -notin @(0,2)) { throw 'Bridge bootstrap failed or timed out' } } finally { $startup.Dispose() }
+      # The guardian runs this controller behind redirected pipes; strip their
+      # inheritable flag before the direct bridge spawn so the long-lived node
+      # cannot hold the worker's ReadToEndAsync open past our exit. Plain user
+      # Start paths spawn without redirected pipes and skip this compile cost.
+      Clear-LinkStdHandleInheritance | Out-Null
+      # Same fast path as Start: direct node bridge plus the detached Background
+      # track (watchdogs, voice, HDC), verified by the shared probe loop while
+      # this stage still holds the lifecycle gate. The launch-generation binding
+      # still rides on the track via Get-LinkBootstrapArguments, so a concurrent
+      # Stop/Disable invalidates it exactly as the old stack spawn did.
+      Write-LinkEvent 'guardian-bridge-repair fast-launch'
+      $bridge=Start-LinkBridgeProcess
+      try { Start-LinkBackgroundTrack -RuntimeMode ([string]$env:CODEX_BRIDGE_RUNTIME_MODE) }
+      catch { Write-LinkEvent ('guardian-background-track-fork-failed type='+$_.Exception.GetType().Name) }
+      try {
+        Complete-LinkFastStart -Startup $bridge
+      } catch {
+        # Stop/Disable mid-repair keeps this branch's clean-exit path (the
+        # guardian re-checks persisted intent itself); every other failure keeps
+        # the throw-to-unconfirmed semantics of the previous bootstrap wait.
+        if (-not (Test-GuardianRepairAllowed)) { return }
+        throw
+      } finally { $bridge.Dispose() }
+      Ensure-LinkMonitors
     }
     if ('public' -in $components -and (Test-GuardianRepairAllowed)) {
       Stop-MobileLinkOwnedProcesses -Repo $repo -Roles @('public-proxy') | Out-Null
@@ -805,7 +965,7 @@ try {
     # observe it, then clean up any service started immediately before Stop.
     if ($Action -eq 'Stop') { $waitMs=180000 }
     try { $owns=$gate.WaitOne($waitMs) } catch [Threading.AbandonedMutexException] { $owns=$true }
-    if (-not $owns -and $Action -eq 'Maintain') { Get-LinkStatus | ConvertTo-Json -Depth 6 -Compress; return }
+    if (-not $owns -and $Action -eq 'Maintain') { $script:preferGuardianSnapshot=$true; try { Get-LinkStatus | ConvertTo-Json -Depth 6 -Compress } finally { $script:preferGuardianSnapshot=$false }; return }
     if (-not $owns) { throw '另一项链路管理操作正在进行，请稍后重试。' }
   }
   # The user may have disabled guardian or stopped the link while this operation
@@ -859,7 +1019,13 @@ try {
   if ($Action -in @('Start','Repair')) { Set-LinkOperationPhase 'verifying' }
   # Fast Start already verified readiness through the probe loop; its snapshot
   # carries synthesized checks so the shared tail below stays untouched.
-  $status=if ($script:fastStartStatus) { $script:fastStartStatus } else { Get-LinkStatus }
+  # Maintain is the only guardian-snapshot consumer: it runs every 30s against
+  # the same endpoints the guardian re-probes every 15s. The flag resets in
+  # finally so later Start/Repair readback loops keep their own self-probes.
+  $script:preferGuardianSnapshot=($Action -eq 'Maintain')
+  try {
+    $status=if ($script:fastStartStatus) { $script:fastStartStatus } else { Get-LinkStatus }
+  } finally { $script:preferGuardianSnapshot=$false }
   # A detached desktop launcher may outlive its initial wait. Keep only read-only
   # verification alive; never issue another restart while it is pending.
   if (-not $script:fastStartStatus -and $Action -in @('Start','Repair') -and (Get-LinkValue $script:desktopRecovery 'state' '') -eq 'pending') {
@@ -906,7 +1072,7 @@ try {
     $phase=if($outcome.state -in @('ready','partial','pending')){$outcome.state}else{'failed'}
     Set-LinkOperationPhase $phase
     Write-LinkEvent ('startup-outcome='+$outcome.state)
-    $status | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $repo 'logs\state\mobile-link-status.json') -Encoding utf8
+    Write-LinkStatusJson -State $status -Path (Join-Path $repo 'logs\state\mobile-link-status.json')
   }
   $status | ConvertTo-Json -Depth 6 -Compress
   Write-LinkEvent 'completed'

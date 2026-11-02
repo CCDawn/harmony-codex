@@ -18,7 +18,8 @@ function fingerprint() {
   };
 }
 
-async function createFixture({ outboxPath, runs = [], onSend = null, threadServiceOverrides = {}, outboxReconciler }) {
+async function createFixture({ outboxPath, runs = [], onSend = null, threadServiceOverrides = {}, outboxReconciler,
+  adapter = { async run() { return {}; } } }) {
   const threadService = {
     async listProjects() {
       return [{ id: 'probe', name: 'Probe', root: 'C:\\work' }];
@@ -98,7 +99,7 @@ async function createFixture({ outboxPath, runs = [], onSend = null, threadServi
     }),
     projects: [{ id: 'probe', name: 'Probe', root: 'C:\\work', allowedCommands: [] }]
   };
-  const app = createApp({ config, adapter: { async run() { return {}; } } });
+  const app = createApp({ config, adapter });
   app.server.listen(0, '127.0.0.1');
   await once(app.server, 'listening');
   return {
@@ -121,15 +122,146 @@ async function send(baseUrl, submissionId, text = '持久消息') {
   });
 }
 
-test('thread message outbox deduplicates the same submission after bridge restart', async () => {
+async function waitUntil(predicate, timeoutMs = 3000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await predicate()) return;
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  throw new Error('timed out waiting for outbox state');
+}
+
+test('steer-capable dispatch skips a history read that cannot change its decision', async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'outbox-dispatch-metadata-'));
+  let historyReads = 0, sends = 0;
+  const fixture = await createFixture({ outboxPath: path.join(root, 'outbox.json'),
+    adapter: { async run() { return {}; }, async steer() { return {}; } },
+    threadServiceOverrides: { async getThread() { historyReads++; throw new Error('unnecessary read'); } },
+    onSend: async input => { sends++; return { id: 'run-direct', threadId: input.threadId,
+      submissionId: input.submissionId, status: 'running' }; } });
+  t.after(async () => { fixture.server.closeAllConnections(); await new Promise(resolve => fixture.server.close(resolve));
+    await fixture.outbox.dispatchPromise; await fixture.outbox.persistPromise;
+    await fs.rm(root, { recursive: true, force: true }); });
+  const sent = await (await send(fixture.baseUrl, 'metadata-fast')).json();
+  await waitUntil(() => fixture.outbox.get(sent.outbox.id).status === 'submitted');
+  assert.equal(sends, 1);
+  assert.equal(historyReads, 0);
+});
+
+test('receipt acknowledgements wake outbox reconciliation without phone subscribers', async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'outbox-receipt-event-'));
+  const fixture = await createFixture({ outboxPath: path.join(root, 'outbox.json') });
+  t.after(async () => { fixture.server.closeAllConnections(); await new Promise(resolve => fixture.server.close(resolve));
+    await fixture.outbox.persistPromise; await fs.rm(root, { recursive: true, force: true }); });
+  let wakes = 0;
+  fixture.outbox.requestReceiptReconciliation = () => { wakes++; };
+  fixture.eventBus.publish('unsubscribed-task', { type: 'codex.delivery.attempted' });
+  assert.equal(wakes, 0);
+  fixture.eventBus.publish('unsubscribed-task', { type: 'codex.app_server.turn.started' });
+  fixture.eventBus.publish('unsubscribed-task', { type: 'task.guidance.accepted' });
+  assert.equal(wakes, 2);
+});
+
+for (const activity of ['running', 'idle', 'unavailable']) {
+  test(`an adapter without steer preserves the ${activity} dispatch decision`, async t => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'outbox-dispatch-compat-'));
+    let historyReads = 0, sends = 0;
+    const fixture = await createFixture({ outboxPath: path.join(root, 'outbox.json'),
+      threadServiceOverrides: { async getThread() { historyReads++;
+        if (activity === 'unavailable') throw new Error('offline');
+        return { activityStatus: activity }; } },
+      onSend: async input => { sends++; return { id: 'run-compat', threadId: input.threadId,
+        submissionId: input.submissionId, status: 'running' }; } });
+    t.after(async () => { fixture.server.closeAllConnections(); await new Promise(resolve => fixture.server.close(resolve));
+      await fixture.outbox.dispatchPromise; await fixture.outbox.persistPromise;
+      await fs.rm(root, { recursive: true, force: true }); });
+    const body = await (await send(fixture.baseUrl, 'compat-'+activity)).json();
+    await fixture.outbox.dispatchReady();
+    assert.ok(historyReads > 0);
+    assert.equal(sends, activity === 'running' ? 0 : 1);
+    assert.equal(fixture.outbox.get(body.outbox.id).status, activity === 'running' ? 'queued' : 'submitted');
+  });
+}
+
+for (const kind of ['existing_thread', 'new_thread']) {
+  test(`${kind} accepts two durable messages while the first native dispatch is blocked`, async t => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-outbox-nonblocking-'));
+    const outboxPath = path.join(root, 'outbox.json');
+    const gate = Promise.withResolvers();
+    const started = Promise.withResolvers();
+    const dispatched = [];
+    const dispatch = async input => {
+      dispatched.push(input.submissionId);
+      if (dispatched.length === 1) { started.resolve(); await gate.promise; }
+      return { id: `run-${input.submissionId}`, status: 'running', submissionId: input.submissionId };
+    };
+    const fixture = await createFixture({ outboxPath, onSend: dispatch,
+      threadServiceOverrides: { startThread: async input => ({ run: await dispatch(input) }) } });
+    t.after(async () => { gate.resolve(); fixture.server.close(); await fs.rm(root, { recursive: true, force: true }); });
+    const post = async submissionId => fetch(`${fixture.baseUrl}${kind === 'existing_thread'
+      ? '/api/codex/threads/thread-a/messages' : '/api/codex/threads'}`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, signal: AbortSignal.timeout(1500),
+      body: JSON.stringify({ projectId: 'probe', submissionId, text: submissionId,
+        ...(kind === 'existing_thread' ? { sessionFingerprint: fingerprint() } : {}) })
+    });
+    const response1 = await post('first');
+    assert.equal(response1.status, 202);
+    const first = await response1.json();
+    assert.equal(first.run.status, 'queued');
+    await started.promise;
+    const response2 = await post('second');
+    assert.equal(response2.status, 202);
+    const second = await response2.json();
+    assert.equal(second.run.status, 'queued');
+    const persisted = JSON.parse(await fs.readFile(outboxPath, 'utf8'));
+    assert.deepEqual(persisted.items.map(item => item.submissionId), ['first', 'second']);
+    assert.deepEqual(dispatched, ['first']);
+    gate.resolve();
+    await waitUntil(() => fixture.outbox.get(second.outbox.id)?.status === 'submitted');
+    assert.deepEqual(dispatched, ['first', 'second']);
+    assert.equal(fixture.outbox.get(first.outbox.id).status, 'submitted');
+  });
+}
+
+test('retry returns after persisting even when native dispatch is blocked', async t => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-outbox-retry-'));
+  const gate = Promise.withResolvers();
+  const started = Promise.withResolvers();
+  let calls = 0;
+  const fixture = await createFixture({ outboxPath: path.join(root, 'outbox.json'),
+    outboxReconciler: async () => ({ status: 'unknown' }),
+    onSend: async input => {
+      calls++;
+      if (calls === 1) throw Object.assign(new Error('bad request'), { statusCode: 400 });
+      started.resolve();
+      await gate.promise;
+      return { id: `run-${input.submissionId}`, status: 'running' };
+    } });
+  t.after(async () => { gate.resolve(); fixture.server.close(); await fs.rm(root, { recursive: true, force: true }); });
+  const response = await send(fixture.baseUrl, 'retry-nonblocking');
+  const accepted = await response.json();
+  await waitUntil(() => fixture.outbox.get(accepted.outbox.id)?.status === 'failed');
+  const retry = await fetch(`${fixture.baseUrl}/api/outbox/${accepted.outbox.id}/retry`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}', signal: AbortSignal.timeout(4000)
+  });
+  assert.equal(retry.status, 200);
+  assert.ok(['queued', 'dispatching'].includes((await retry.json()).item.status));
+  await started.promise;
+  gate.resolve();
+  await waitUntil(() => fixture.outbox.get(accepted.outbox.id)?.status === 'submitted');
+});
+
+test('thread message outbox deduplicates after restart without reviving an unloaded run', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-outbox-api-'));
   const outboxPath = path.join(root, 'outbox.json');
   let firstDispatches = 0;
+  const liveRuns = [];
   const first = await createFixture({
     outboxPath,
+    runs: liveRuns,
     onSend: async (input) => {
       firstDispatches += 1;
-      return {
+      const run = {
         id: `run-${input.submissionId}`,
         projectId: input.projectId,
         threadId: input.threadId,
@@ -140,15 +272,23 @@ test('thread message outbox deduplicates the same submission after bridge restar
         updatedAt: new Date().toISOString(),
         events: []
       };
+      liveRuns.push(run);
+      return run;
     }
   });
   try {
     const response = await send(first.baseUrl, 'restart-safe-1');
     assert.equal(response.status, 202);
-    const body = await response.json();
+    const accepted = await response.json();
+    let body;
+    await waitUntil(async () => {
+      body = await (await fetch(`${first.baseUrl}/api/codex/runs/${accepted.outbox.id}`)).json();
+      return body.outbox.status === 'submitted';
+    });
     assert.equal(body.run.id, 'run-restart-safe-1');
-    assert.equal(body.outbox.status, 'submitted');
     assert.equal(firstDispatches, 1);
+    await waitUntil(async () => JSON.parse(await fs.readFile(outboxPath, 'utf8'))
+      .items.find(item => item.id === accepted.outbox.id)?.status === 'submitted');
   } finally {
     first.server.close();
   }
@@ -165,11 +305,29 @@ test('thread message outbox deduplicates the same submission after bridge restar
     const response = await send(second.baseUrl, 'restart-safe-1');
     assert.equal(response.status, 202);
     const body = await response.json();
-    assert.equal(body.run.id, 'run-restart-safe-1');
+    assert.equal(body.run.id, body.outbox.id);
+    assert.equal(body.run.status, 'submitted');
+    assert.equal(body.outbox.resultId, 'run-restart-safe-1');
     assert.equal(body.outbox.status, 'submitted');
     assert.equal(secondDispatches, 0);
   } finally {
     second.server.close();
+  }
+});
+
+test('thread message API rejects a conflicting submission without dispatching it', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-outbox-api-'));
+  let dispatches = 0;
+  const fixture = await createFixture({ outboxPath: path.join(root, 'outbox.json'),
+    onSend: async () => { dispatches++; return { id: 'first-run', status: 'running' }; } });
+  try {
+    assert.equal((await send(fixture.baseUrl, 'same-id', '第一条')).status, 202);
+    await waitUntil(() => dispatches === 1);
+    const response = await send(fixture.baseUrl, 'same-id', '不同正文');
+    assert.equal(response.status, 409);
+    assert.equal(dispatches, 1);
+  } finally {
+    fixture.server.close();
   }
 });
 
@@ -258,10 +416,13 @@ test(`confirmed ${scenario} delivery returns a stable receipt run without claimi
   t.after(() => fs.rm(root, { recursive: true, force: true }));
   const outboxPath = path.join(root, 'outbox.json');
   const text = '重启后已确认送达的消息仍然可见';
+  const payload = kind === 'existing_thread'
+    ? { projectId: 'probe', text, submissionId: 'restored-receipt', sessionFingerprint: fingerprint() }
+    : { projectId: 'probe', submissionId: 'restored-receipt', prompt: text };
   const first = new DurableOutbox({ filePath: outboxPath, schedule: false,
     dispatch: async () => ({ run: { id: 'old-memory-task', status: 'running' }, deliveryPending: true }) });
   const queued = await first.enqueue({ kind, threadId: kind === 'existing_thread' ? 'thread-a' : '',
-    projectId: 'probe', submissionId: 'restored-receipt', text });
+    projectId: 'probe', submissionId: 'restored-receipt', text, payload });
   await first.dispatchReady();
   first.close();
   let redispatches = 0;
@@ -416,11 +577,15 @@ test('outbox reconciles a restored run before deciding whether the lane is busy'
     const response = await send(fixture.baseUrl, 'recovering-release-1', '继续');
     const body = await response.json();
     assert.equal(response.status, 202);
-    assert.equal(body.outbox.status, 'submitted');
+    await waitUntil(() => fixture.outbox.get(body.outbox.id)?.status === 'submitted');
     assert.equal(reconciliations, 1);
     assert.deepEqual(dispatched, ['recovering-release-1']);
   } finally {
-    fixture.server.close();
+    fixture.server.closeAllConnections();
+    await new Promise(resolve => fixture.server.close(resolve));
+    await fixture.outbox.dispatchPromise;
+    fixture.outbox.close();
+    await fixture.outbox.persistPromise;
     await fs.rm(root, { recursive: true, force: true });
   }
 });

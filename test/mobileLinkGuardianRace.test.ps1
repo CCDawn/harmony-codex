@@ -10,7 +10,9 @@ foreach($name in @('Test-GuardianRepairAllowed','Start-Link')) {
   . ([scriptblock]::Create($fn.Extent.Text))
 }
 $checks=0;$script:launches=0;$script:environmentWrites=0;$script:stopAt='probe'
-$GuardianRepair=$true;$RestartDesktop=$true;$Action='Repair';$BridgePort=12345
+# Third-round desktop recovery now bypasses the bootstrap; these races cover
+# the bridge/bootstrap path that still performs the ownership probes below.
+$GuardianRepair=$true;$RestartDesktop=$false;$Action='Start';$BridgePort=12345
 function Assert([bool]$Condition,[string]$Message){if(-not $Condition){throw $Message};$script:checks++}
 function Write-LinkEvent {param($Event)}
 function Get-NetTCPConnection {param($State,$LocalPort,$ErrorAction) [pscustomobject]@{OwningProcess=424242}}

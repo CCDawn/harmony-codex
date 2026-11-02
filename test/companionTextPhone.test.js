@@ -63,7 +63,7 @@ function pageHarness(t, request) {
     companionTextPartitionKey: Service.partitionKey(partition), companionTextDrafts: new Map(),
     companionTextDraft: 'first message', companionTextMessages: [], companionTextError: '', companionEntries: [],
     normalizedBridgeUrl: () => partition.bridgeUrl, errorText: error => error.message,
-    async refreshCompanionConversation() {}
+    log() {}, async refreshCompanionConversation() {}
   });
   return { ...setupResult, page };
 }
@@ -236,7 +236,7 @@ test('disk failure prevents the POST, exposes failure and recovers text only int
 
 test('transport timeout is uncertain and never retried; explicit rejection is recoverable failure', async t => {
   for (const [error, state] of [['network timeout', 'uncertain'], ['HTTP 408: timeout', 'uncertain'],
-    ['桥接返回异常 HTTP 409：identity changed', 'failed'], ['HTTP 429: rate limited', 'failed']]) {
+    ['桥接返回异常 HTTP 409：identity changed', 'failed'], ['HTTP 429: rate limited', 'failed'], ['HTTP 422: API unavailable', 'failed']]) {
     let calls = 0;
     const { page } = pageHarness(t, async () => { calls += 1; throw Error(error); });
     await page.sendCompanionText();
@@ -266,4 +266,23 @@ test('dedicated client posts the official room identity once and preserves the p
   assert.equal(result.itemId, 'room:message');
   receipt.requestId = randomUUID();
   await assert.rejects(context.Client.sendCompanionText('https://bridge.example', 'profile-a', 'room-a', 'hello', requestId), /回执无效/);
+});
+
+
+test('uncertain text reconciles by exact official request identity after restart without retry', t => {
+  const { Service, fresh, diskContext } = setup(t);
+  const requestId = randomUUID();
+  Service.enqueue(partition, '同一条测试消息', requestId);
+  Service.save(diskContext, partition);
+  const restarted = fresh().Service;
+  restarted.load(diskContext, partition);
+  const official = { itemId: 'room:confirmed', role: 'user', text: '同一条测试消息', requestId };
+  for (const invalid of [
+    { ...official, requestId: randomUUID() }, { ...official, role: 'assistant' },
+    { ...official, phoneTranscript: true }, { ...official, itemId: 'voice:confirmed' },
+    { ...official, text: '不同内容' }
+  ]) assert.equal(restarted.reconcile(partition, [invalid]), false);
+  assert.equal(restarted.reconcile(partition, [official]), true);
+  restarted.save(diskContext, partition);
+  assert.equal(fresh().Service.load(diskContext, partition).length, 0);
 });

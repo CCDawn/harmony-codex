@@ -79,14 +79,20 @@ function submittedReceiptHarness(client) {
   const receipt = { id: 'outbox-one', status: 'submitted', prompt: 'visible message', codexSessionId: 'thread', createdAt: '2026-10-15T00:48:09Z', events: [], runtime: { kind: 'durable_outbox', state: 'submitted' } };
   const state = {
     currentTask: receipt, selectedSession: { id: 'thread', entries: [] }, isNewSessionDraft: false,
-    pendingSessionSendsByTaskId: { [receipt.id]: { retryFailedMessageId: '' } },
+    pendingSessionSendsByTaskId: { [receipt.id]: [{ retryFailedMessageId: '' }] },
     activeSessionTaskId: receipt.id, activeSessionTaskTitle: 'T', newSessionTaskId: '',
     sessionNavigationState: { revision: 1, mode: 'session', sessionId: 'thread' },
+    sessionTaskAdoptionSeq: 0,
+    isSessionNavigationCurrent(revision, sessionId) {
+      const current = this.readSessionNavigation();
+      return current.revision === revision && current.mode === 'session' && current.sessionId === sessionId;
+    },
     runningSessionIds: ['thread', 'other'], pollStops: 0,
     pollTimer: -1,
     readSessionNavigation() { return this.sessionNavigationState; },
     taskSessionId: task => task.codexSessionId || task.createdCodexSessionId || '',
     normalizedBridgeUrl: () => '', bridgeToken: '', log() {},
+    reconcileVisibleSessionMessages() { this.reconciles = (this.reconciles || 0) + 1; },
     clearPendingSessionSend(id) { delete this.pendingSessionSendsByTaskId[id]; },
     stopPolling() { this.pollStops++; this.pollTimer = -1; }, removeFailedSessionMessage() {},
     mergeSessionDetailPreservingHistory: (old, detail) => ({ ...detail, entries: [...old.entries, ...detail.entries] }),
@@ -106,6 +112,15 @@ function submittedReceiptHarness(client) {
   state.settleSubmittedOutboxReceipt = run('settleSubmittedOutboxReceipt', 'task', true);
   state.scheduleSubmittedReceiptHistoryRetry = run('scheduleSubmittedReceiptHistoryRetry', 'task, navigationRevision');
   return { state, receipt, run, timers };
+}
+
+// These layout checks predate reference-parameter builders. Normalize only the
+// access syntax; sessionRepeatReactive20261031.test.js checks the raw reference chain.
+function uiBuilderBody(name) {
+  return methodBody(name).replaceAll('$$.blockItem', 'block').replaceAll('$$.toolItem', 'item').replaceAll('$$.entry', 'entry')
+    .replaceAll('$$.rowKey', 'rowKey').replaceAll('$$.isUser', 'isUser').replaceAll('$$.text', 'text')
+    .replaceAll('$$.block', 'block').replaceAll('$$.message', 'message').replaceAll('$$.item', 'item')
+    .replaceAll('toolItem.', 'item.').replaceAll('(toolItem)', '(item)').replaceAll(', toolItem)', ', item)');
 }
 
 test('submitted delivery stops only its task poll and preserves the bubble until official history is visible', async () => {
@@ -206,16 +221,16 @@ test('both send paths and polling use the dedicated delivery-receipt branch', ()
   for (const name of ['sendMessageToSelectedSession', 'sendNewSessionMessage']) {
     const body = methodBody(name);
     assert.match(body, /isSubmittedOutboxReceipt\(this\.currentTask\)[\s\S]*settleSubmittedOutboxReceipt\(this\.currentTask\)/);
-    assert.match(body, /isSubmittedOutboxReceipt\(receivedTask\)[\s\S]*readSessionNavigation\(\)\.revision/);
+    assert.match(body, /acknowledgeOptimisticSessionSend\(submissionId, receivedTask, messageText\)[\s\S]*if \(this\.readSessionNavigation\(\)\.revision/);
   }
   assert.match(methodBody('loadSessionDetail'), /clearSubmittedOutboxReceiptIfVisible/);
   const body = methodBody('settleSubmittedOutboxReceipt');
   assert.doesNotMatch(body, /handleTaskTerminalForSession|unmarkSessionRunning|markSessionRunningLocallyCleared|publishTaskCompletion|startPolling/);
 });
 
-test('late submitted receipts retire their optimistic attempt without overwriting the current page', () => {
+test('late acknowledgments retain their local echo without overwriting the current page', () => {
   for (const name of ['sendMessageToSelectedSession', 'sendNewSessionMessage']) {
-    const branch = methodBody(name).match(/if \(this\.isSubmittedOutboxReceipt\(receivedTask\)[\s\S]*?return;\s*\}/)?.[0];
+    const branch = methodBody(name).match(/if \(this\.readSessionNavigation\(\)\.revision[\s\S]*?return;\s*\}/)?.[0];
     assert.ok(branch);
     const state = { selectedSession: { id: 'other' }, currentTask: { id: 'newer-task' }, isNewSessionDraft: false,
       pending: ['submitted-attempt', 'other-attempt'], readSessionNavigation: () => ({ revision: 2 }),
@@ -223,7 +238,7 @@ test('late submitted receipts retire their optimistic attempt without overwritin
       completeOptimisticSessionSend(id) { this.pending = this.pending.filter(value => value !== id); } };
     new Function('receivedTask', 'navigation', 'navigationRevision', 'targetSessionId', 'submissionId', branch)
       .call(state, { id: 'receipt' }, { revision: 1 }, 1, 'thread', 'submitted-attempt');
-    assert.deepEqual(state.pending, ['other-attempt']);
+    assert.deepEqual(state.pending, ['submitted-attempt', 'other-attempt']);
     assert.equal(state.currentTask.id, 'newer-task');
     assert.equal(state.selectedSession.id, 'other');
   }
@@ -355,7 +370,7 @@ test('new live snapshot commits the same navigation target used by subsequent se
     activeSessionId: '',
     sessionNavigationState: JSON.stringify({ revision: 8, mode: 'new', sessionId: '' }),
     readSessionNavigation() { return JSON.parse(this.sessionNavigationState); },
-    log() {}, markSessionRead() {}, scrollSessionToBottomIfFollowing() {}
+    log() {}, markSessionRead() {}, scrollSessionToBottomIfFollowing() {}, stopSessionEventStream() {}, stopTaskEventStream() {}
   };
   state.commitSessionNavigation = run('commitSessionNavigation', 'mode, sessionId, source');
   const session = { id: 'test-new', title: 'New', entries: [{ text: 'hello' }], entryCount: 1 };
@@ -372,6 +387,8 @@ test('new draft inherits the current project by normalized root, not duplicate d
     projects: [{ id: 'first', name: 'Same', root: 'C:/work/one' }, { id: 'second', name: 'Same', root: 'C:/work/two' }],
     selectedProjectId: 'first', selectedSession: { projectRoot: 'c:\\WORK\\two\\' },
     hasRunningSessionTask: () => false,
+    preserveCurrentSessionDraft: () => true,
+    restoreCurrentSessionDraft() {},
     leftCompanion: false,
     leaveCompanionConversation() { this.leftCompanion = true; },
     commitSessionNavigation() {}, log() {}, loadDesktopReasoningDefaults() {},
@@ -408,7 +425,7 @@ test('session primary action sends drafts even when the session is interruptible
   assert.match(modeBody, /this\.shouldUseSessionInterruptAction\(\)[\s\S]*return 'interrupt'/);
   assert.match(modeBody, /this\.canSendSessionMessage\(\)[\s\S]*this\.hasRunningTaskForSession\(this\.selectedSession\.id\)[\s\S]*return 'guidance_send'/);
   assert.match(modeBody, /return 'disabled'/);
-  assert.match(colorBody, /mode === 'guidance_send'[\s\S]*return this\.themeColor\('#14853D'\)/);
+  assert.match(colorBody, /mode === 'guidance_send'[\s\S]*return this\.themeColor\('#253547'\)/);
   assert.match(colorBody, /mode === 'disabled'[\s\S]*return this\.themeColor\('#8A95A3'\)/);
 });
 
@@ -433,7 +450,8 @@ test('selected running desktop session can interrupt through thread activity wit
   assert.match(selectedActivityBody, /this\.sessionActivityStatusById\[sessionId\]/);
   assert.match(selectedActivityBody, /this\.isLocallyClearedSessionActivity/);
   assert.match(selectedActivityBody, /cachedStatus !== 'idle'[\s\S]*return cachedStatus === 'running'/);
-  assert.match(selectedInterruptBody, /BridgeClient\.interruptCodexThread\(this\.normalizedBridgeUrl\(\), targetSessionId, this\.bridgeToken\)/);
+  assert.match(selectedInterruptBody, /BridgeClient\.interruptCodexThread\(bridgeUrl, targetSessionId, bridgeToken\)/);
+  assert.doesNotMatch(selectedInterruptBody, /BridgeClient\.interruptTask\(/);
 });
 
 test('official idle snapshot clears stale mobile running state without hiding a newer send', () => {
@@ -442,7 +460,7 @@ test('official idle snapshot clears stale mobile running state without hiding a 
     sessionActivityStatusById: { s1: 'running' }, sessionUpdatedAtById: {},
     runningSessionIds: ['s1'], locallyClearedRunningSessionIds: [],
     selectedSession: { id: 's1', activityStatus: 'running' }, currentTask: null, tasks: [],
-    log() {}, clearLocalRunningOverride() {}, markSessionRead() {},
+    log() {}, clearLocalRunningOverride() {}, markSessionRead() {}, refreshSessionSidebarSnapshot() {},
     isLocallyClearedSessionActivity: () => false, isSessionCurrentlyRead: () => false,
     clearStaleCurrentTaskForCompletedSession() {},
     unmarkSessionRunning(id) { this.runningSessionIds = this.runningSessionIds.filter(value => value !== id); },
@@ -515,7 +533,7 @@ test('session sending is optimistic in the conversation and does not open a sepa
   const sourceText = source();
   const optimisticSource = optimisticMessageServiceSource();
   const panelBody = methodBody('SessionConversationPanel()');
-  const cardBody = methodBody('OptimisticSessionMessageCard(message: OptimisticSessionMessage)');
+  const cardBody = uiBuilderBody('OptimisticSessionMessageCard(message: OptimisticSessionMessage)');
   const sendBody = methodBody('sendMessageToSelectedSession(retryFailedMessageId: string = \'\'): Promise<boolean>');
   const newSendBody = methodBody('sendNewSessionMessage(retryFailedMessageId: string = \'\'): Promise<boolean>');
   const floatingBody = methodBody('shouldShowSessionFloatingStatus(): boolean');
@@ -525,15 +543,20 @@ test('session sending is optimistic in the conversation and does not open a sepa
   assert.match(optimisticSource, /export function appendOptimisticSessionMessage/);
   assert.match(optimisticSource, /export function removeOptimisticSessionMessage/);
   assert.match(sourceText, /@State optimisticSessionMessages: OptimisticSessionMessage\[\] = \[\]/);
-  assert.match(panelBody, /visibleOptimisticSessionMessages\(\)/);
+  assert.match(panelBody, /this\.sessionTimelineRows\(\)/);
+  assert.match(methodBody('sessionTimelineRows()'), /this\.allSessionTimelineRows\(\)/);
+  assert.match(methodBody('allSessionTimelineRows()'), /this\.visibleOptimisticSessionMessages\(\)/);
   assert.match(cardBody, /message\.text/);
-  assert.match(cardBody, /LoadingProgress\(\)/);
+  const footerBody = uiBuilderBody('PendingMessageDeliveryFooter(message: OptimisticSessionMessage)');
+  assert.match(cardBody, /this\.PendingMessageDeliveryFooter\(\{ message: message \}\)/);
+  assert.match(footerBody, /LoadingProgress\(\)/);
+  assert.match(footerBody, /outboxMessageLabel\(/);
   assert.ok(sendBody.indexOf('this.beginOptimisticSessionSend(') < sendBody.indexOf("await this.guard('sendSessionMessage'"));
   assert.ok(newSendBody.indexOf('this.beginOptimisticSessionSend(') < newSendBody.indexOf("await this.guard('sendNewSessionMessage'"));
   assert.doesNotMatch(floatingBody, /isSendingSessionMessage/);
   assert.doesNotMatch(floatingTitleBody, /正在发送到 Codex/);
   assert.match(panelBody, /if \(this\.hasNewSessionConversation\(\)\)/);
-  assert.ok(cardBody.indexOf("Text('发送中…')") > cardBody.indexOf('Text(message.text)'));
+  assert.ok(cardBody.lastIndexOf('this.PendingMessageDeliveryFooter({ message: message })') > cardBody.indexOf('Text(message.text)'));
   assert.match(cardBody, /ForEach\(message\.files/);
 });
 
@@ -553,9 +576,9 @@ test('first message opens the conversation before any server task or history exi
 
 test('submitted user text stays visible while the desktop connection is unavailable', () => {
   const run = new Function(`${stripTypeScriptTypes(`function run(task) {${methodBody('taskLiveEntries')}}`)}; return run;`)();
-  const state = { taskIsFailedMessageRetry: () => false, taskSessionId: () => 'session',
+  const state = { optimisticSessionMessages: [], taskIsFailedMessageRetry: () => false, taskSessionId: () => 'session',
     streamingAgentTextForTask: () => '', workingStatusTextForTask: () => 'connecting',
-    taskBlocksDesktopConversation: () => true };
+    taskBlocksDesktopConversation: () => true, serverUserHistoryCoversTaskMessage: () => false };
   const task = { status: 'queued', prompt: 'my message', createdAt: '2026-10-14T01:00:00Z',
     activeCodexTurnId: 'turn-new', events: [] };
   const entries = run.call(state, task);
@@ -575,15 +598,38 @@ test('old repeated text cannot replace the new live user message', () => {
   assert.equal(match.call(state, [{ ...candidate, type: 'response_item', turnId: undefined }], candidate), true);
 });
 
-test('message footer distinguishes submission from a confirmed delivery', () => {
-  const label = new Function(`${stripTypeScriptTypes(`function run() {${methodBody('liveUserMessageStatus')}}`)}; return run;`)();
+test('message footer distinguishes submission from a confirmed delivery', async () => {
+  const outboxSource = fs.readFileSync(path.resolve('HarmonyCodexRemote/entry/src/main/ets/services/OutboxMessagePresentation.ets'), 'utf8').replace(/^import .*;\s*$/gm, '');
+  const outbox = await import(`data:text/javascript,${encodeURIComponent(stripTypeScriptTypes(outboxSource))}`);
+  const label = new Function('outboxTaskMessageLabel', `${stripTypeScriptTypes(`function run() {${methodBody('liveUserMessageStatus')}}`)}; return run;`)(outbox.outboxTaskMessageLabel);
   const task = { events: [], runtime: {} };
   const state = { selectedVisibleTask: () => task, taskBlocksDesktopConversation: () => false };
   assert.equal(label.call(state), '已提交 · 等待确认');
-  task.events.push({ type: 'codex.app_server.user_message.persisted' });
+  task.events.push({ type: 'codex.app_server.user_message.persisted', payload: {} });
   assert.equal(label.call(state), '已发送');
   task.runtime.kind = 'durable_outbox';
-  assert.equal(label.call(state), '已排队');
+  task.runtime.state = 'queued';
+  assert.equal(label.call(state), '排队中');
+  task.runtime.state = 'dispatching';
+  assert.equal(label.call(state), '正在确认送达');
+  task.runtime.state = 'uncertain';
+  assert.equal(label.call(state), '发送结果待核对 · 查看队列');
+});
+
+test('new conversation subtitle remains project context while delivery state changes', () => {
+  const subtitle = new Function(methodBody('sessionPageSubtitle'));
+  const state = { selectedSession: null, isNewSessionDraft: true, isSessionDetailPending: () => false, newSessionProjectName: () => '项目：QA', message: '正在确认送达' };
+  assert.equal(subtitle.call(state), '项目：QA');
+  state.message = '任务运行中：正在返回内容';
+  assert.equal(subtitle.call(state), '项目：QA');
+});
+
+test('raw instruction records stay out of the phone timeline while visible notices remain', () => {
+  const hide = new Function('entry', methodBody('shouldHideSessionEntry'));
+  assert.equal(hide({type:'response_item',role:'developer',text:'internal instruction'}),true);
+  assert.equal(hide({type:'response_item',role:'system',text:'internal instruction'}),true);
+  assert.equal(hide({type:'context_compacted',role:'system',text:'已压缩上下文'}),false);
+  assert.equal(hide({type:'response_item',role:'user',text:'literal developer system message'}),false);
 });
 
 test('optimistic send synchronously transfers text and attachments into the target conversation', async () => {
@@ -592,7 +638,7 @@ test('optimistic send synchronously transfers text and attachments into the targ
     `function run(sessionId, isNewSession, projectId, submissionId, text, images, files, retryFailedMessageId) {${methodBody('beginOptimisticSessionSend')}}`
   )}; return run;`)(service.appendOptimisticSessionMessage);
   const state = { optimisticSessionMessages: [], sessionMessage: 'hello', pendingSessionImages: [],
-    pendingSessionFiles: [], log() {}, scrollSessionToBottom() {} };
+    pendingSessionFiles: [], currentSessionDraftScope: () => null, log() {}, scrollSessionToBottom() {} };
   const images = [{ id: 'image', uri: 'image://local', fileName: 'photo.png', mimeType: 'image/png' }];
   const files = [{ id: 'file', fileName: 'report.pdf', uri: 'file://local', bytes: 8 }];
   begin.call(state, '__new_session__', true, 'project', 'first', 'hello', images, files, '');
@@ -640,9 +686,11 @@ test('durable outbox tasks keep polling through the Codex run API and hand pendi
   assert.match(refreshBody, /this\.taskUsesCodexRunApi\(activeTask\)/);
   assert.match(refreshBody, /BridgeClient\.getCodexRun/);
   assert.match(refreshBody, /this\.handoffPendingSessionSend\(activeTaskId, task\)/);
-  assert.match(handoffBody, /this\.pendingSessionSendsByTaskId\[previousTaskId\]/);
-  assert.match(handoffBody, /next\[task\.id\] = pending/);
-  assert.match(handoffBody, /this\.activeSessionTaskId === previousTaskId/);
+  assert.match(handoffBody, /let sourceTaskId = previousTaskId/);
+  assert.match(handoffBody, /message\.submissionId === submissionId/);
+  assert.match(handoffBody, /this\.pendingSessionSendsByTaskId\[sourceTaskId\]/);
+  assert.match(handoffBody, /this\.rememberPendingSessionSend\(task\.id, item\)/);
+  assert.match(handoffBody, /this\.activeSessionTaskId === sourceTaskId/);
   assert.match(sendBody, /this\.currentTask\.runtime\?\.kind === 'durable_outbox'/);
   assert.match(sendBody, /消息已排队，将在当前回合结束后按顺序自动发送/);
 });
@@ -654,7 +702,6 @@ test('mobile negotiates Bridge compatibility and advances a monotonic task event
   const refreshBody = methodBody('refreshTask()');
   const mergeBody = methodBody('mergeTaskEventPage(previous: BridgeTask, incoming: BridgeTask): BridgeTask');
   const dashboardBody = methodBody('refreshDashboard(force: boolean = false): Promise<void>');
-  const contractBody = methodBody('requiresDesktopLiveForSend(targetSessionId: string, source: string): Promise<boolean>');
 
   assert.match(modelText, /export interface BridgeProtocolHandshake/);
   assert.match(modelText, /eventCursor\?: number/);
@@ -669,8 +716,6 @@ test('mobile negotiates Bridge compatibility and advances a monotonic task event
   assert.match(mergeBody, /event\.id/);
   assert.match(dashboardBody, /BridgeClient\.getRuntimeStatus/);
   assert.match(dashboardBody, /lastRuntimeContractRefreshAt/);
-  assert.match(contractBody, /Bridge 协议不兼容/);
-  assert.match(contractBody, /throw new Error\(message\)/);
   assert.match(sourceText, /task\.event_cursor\.gap/);
 });
 
@@ -696,14 +741,16 @@ test('running session refresh uses task list and session activity, not only curr
 });
 
 test('ended-task interrupt conflict is treated as recovered terminal state', () => {
-  const body = methodBody('recoverAfterGuardError(name: string, error: Object): Promise<boolean>');
+  const body = methodBody('interruptSelectedSessionTask(): Promise<void>');
 
-  assert.match(body, /name === 'interruptSelectedSessionTask'/);
+  assert.match(body, /catch \(error\)/);
+  assert.match(body, /this\.selectedSession\?\.id !== targetSessionId/);
+  assert.match(body, /this\.readSessionNavigation\(\)\.revision !== navigationRevision/);
   assert.match(body, /this\.isEndedTaskInterruptConflict\(message\)/);
   assert.match(body, /this\.clearSelectedSessionRunningAfterEndedInterruptConflict\(\)/);
 });
 
-test('composer action menu pops upward without changing the composer width', () => {
+test('composer action menu is outside layout flow and cannot expand the composer', () => {
   const body = methodBody('SessionComposer()');
   const guardBody = methodBody('shouldIgnoreComposerActionToggle(): boolean');
   const popupIndex = body.indexOf('this.ComposerActionPopup()');
@@ -714,7 +761,10 @@ test('composer action menu pops upward without changing the composer width', () 
   assert.ok(popupIndex < plusIndex, 'popup should be rendered before the stable plus rail so the plus button remains on top');
   assert.match(body, /Stack\(\{ alignContent: Alignment\.BottomStart \}\)/);
   assert.match(body, /\.width\('100%'\)/);
-  assert.match(body, /\.translate\(\{ x: 0, y: -234 \}\)/);
+  assert.match(body, /\.position\(\{ x: 0, y: -234 \}\)/);
+  assert.doesNotMatch(body, /\.translate\(\{ x: 0, y: -234 \}\)/);
+  assert.ok(body.match(/\.height\(this\.sessionComposerTextAreaHeight\(\)\)/g)?.length >= 2,
+    'both the text area and its stack must use the bounded composer height');
   assert.match(body, /\.zIndex\(1\)/);
   assert.match(body, /\.zIndex\(2\)/);
   assert.match(body, /this\.shouldIgnoreComposerActionToggle\(\)/);
@@ -733,14 +783,14 @@ test('session composer keeps an empty draft compact', () => {
   assert.match(sourceText, /\.expandSafeArea\(\[SafeAreaType\.SYSTEM\], \[SafeAreaEdge\.BOTTOM\]\)/);
   assert.match(sourceText, /\.ignoreLayoutSafeArea\(\[LayoutSafeAreaType\.SYSTEM\], \[LayoutSafeAreaEdge\.BOTTOM\]\)/);
   assert.match(panelBody, /\.padding\(\{ left: 12, right: 12, top: 12, bottom: 0 \}\)/);
-  assert.match(composerBody, /\.width\(40\)/);
-  assert.match(composerBody, /\.padding\(\{ left: 10, right: 10, top: 8, bottom: 8 \}\)/);
+  assert.match(composerBody, /\.width\(44\)/);
+  assert.match(composerBody, /\.padding\(\{ left: 6, right: 6, top: 5, bottom: 5 \}\)/);
   assert.match(composerBody, /\.translate\(\{ y: this\.sessionComposerBottomShift\(\) \}\)/);
   assert.match(heightBody, /Math\.min\(4/);
   assert.match(heightBody, /scaledLineHeight\(24\)/);
   assert.doesNotMatch(heightBody, /return 9[0-9]|return 100/);
   assert.match(marginBody, /return 0/);
-  assert.match(shiftBody, /this\.sessionComposerFocused \? 0 : 16/);
+  assert.match(shiftBody, /return 0/);
 });
 
 test('desktop screenshot button uses a drawn icon instead of the blurry display symbol', () => {
@@ -870,7 +920,7 @@ test('model settings cache refreshes after failures and emits catalog diagnostic
 test('git codex directives render as compact component blocks', () => {
   const sourceText = source();
   const parseBody = methodBody('parseSessionMarkdown(text: string): SessionMarkdownBlock[]');
-  const blockBody = methodBody('SessionMarkdownBlockView(entry: CodexSessionEntry, block: SessionMarkdownBlock, isUser: boolean)');
+  const blockBody = uiBuilderBody('SessionMarkdownBlockView(entry: CodexSessionEntry, block: SessionMarkdownBlock, isUser: boolean, rowKey: string)');
   const directiveBody = methodBody('CodexDirectiveBlockView(entry: CodexSessionEntry, block: SessionMarkdownBlock)');
   const directiveIconBody = methodBody('CodexDirectiveIconView(name: string)');
   const directiveDetailViewBody = methodBody('CodexDirectiveDetailView(block: SessionMarkdownBlock)');
@@ -910,12 +960,12 @@ test('git codex directives render as compact component blocks', () => {
 
 test('memory citation directive blocks are clickable and recent activity header is hidden', () => {
   const sourceText = source();
-  const blockBody = methodBody('SessionMarkdownBlockView(entry: CodexSessionEntry, block: SessionMarkdownBlock, isUser: boolean)');
-  const contentBody = methodBody('SessionMarkdownContent(entry: CodexSessionEntry, isUser: boolean)');
+  const blockBody = uiBuilderBody('SessionMarkdownBlockView(entry: CodexSessionEntry, block: SessionMarkdownBlock, isUser: boolean, rowKey: string)');
+  const contentBody = uiBuilderBody('SessionMarkdownContent(entry: CodexSessionEntry, isUser: boolean, rowKey: string)');
   const detailViewBody = methodBody('MarkdownDirectiveDetailView(block: SessionMarkdownBlock)');
   const detailFieldsBody = methodBody('markdownDirectiveDetailFields(block: SessionMarkdownBlock): SessionStructuredField[]');
 
-  assert.match(contentBody, /this\.SessionMarkdownBlockView\(entry, block, isUser\)/);
+  assert.match(contentBody, /this\.SessionMarkdownBlockView\(\{ entry: entry, blockItem: blockItem, isUser: isUser, rowKey: rowKey \}\)/);
   assert.match(blockBody, /block\.kind === 'directive'/);
   assert.match(blockBody, /this\.isSessionMarkdownBlockExpanded\(entry, block\)/);
   assert.match(blockBody, /this\.toggleSessionMarkdownBlock\(entry, block\)/);
@@ -931,10 +981,10 @@ test('session message stream renders rich markdown and concrete expandable tool 
   const sourceText = source();
   const presentationSource = sessionPresentationServiceSource();
   const modelsSource = bridgeModelsSource();
-  const blockBody = methodBody('SessionMarkdownBlockView(entry: CodexSessionEntry, block: SessionMarkdownBlock, isUser: boolean)');
-  const inlineBody = methodBody('SessionMarkdownInlineText(text: string, isUser: boolean, fontSize: number, lineHeight: number)');
-  const toolBody = methodBody('SessionToolEntryView(entry: CodexSessionEntry)');
-  const tableBody = methodBody('SessionMarkdownTableView(block: SessionMarkdownBlock, isUser: boolean)');
+  const blockBody = uiBuilderBody('SessionMarkdownBlockView(entry: CodexSessionEntry, block: SessionMarkdownBlock, isUser: boolean, rowKey: string)');
+  const inlineBody = uiBuilderBody('SessionMarkdownInlineText(text: string, isUser: boolean, fontSize: number, lineHeight: number)');
+  const toolBody = uiBuilderBody('SessionToolEntryView(entry: CodexSessionEntry)');
+  const tableBody = uiBuilderBody('SessionMarkdownTableView(block: SessionMarkdownBlock, isUser: boolean)');
   const tableColumnWidthBody = methodBody('sessionMarkdownTableColumnWidth(block: SessionMarkdownBlock): number');
   const parseBody = methodBody('parseSessionMarkdown(text: string): SessionMarkdownBlock[]');
 
@@ -962,7 +1012,7 @@ test('session message stream renders rich markdown and concrete expandable tool 
   assert.match(parseBody, /parseSessionMarkdownTable/);
   assert.match(parseBody, /pushBlock\('table'/);
   assert.match(blockBody, /block\.kind === 'table'/);
-  assert.match(blockBody, /this\.SessionMarkdownTableView\(block, isUser\)/);
+  assert.match(blockBody, /this\.SessionMarkdownTableView\(\{ block: block, isUser: isUser \}\)/);
   assert.match(tableBody, /parseSessionMarkdownTable\(block\.text\)\.headers/);
   assert.match(tableBody, /parseSessionMarkdownTable\(block\.text\)\.rows/);
   assert.match(tableBody, /\.width\(this\.sessionMarkdownTableColumnWidth\(block\)\)/);
@@ -1005,14 +1055,15 @@ test('session stream slims chrome, folds long entries, and renders agent collabo
   const sourceText = source();
   const modelsSource = bridgeModelsSource();
   const presentationSource = sessionPresentationServiceSource();
-  const cardBody = methodBody('SessionEntryCard(entry: CodexSessionEntry)');
-  const toolBody = methodBody('SessionToolEntryView(entry: CodexSessionEntry)');
-  const agentCardBody = methodBody('SessionAgentEventItemView(entry: CodexSessionEntry, item: SessionToolPresentationItem)');
-  const agentDetailBody = methodBody('SessionAgentEventDetailView(item: SessionToolPresentationItem)');
-  const noticeBody = methodBody('SessionSystemNoticeView(entry: CodexSessionEntry)');
+  const cardBody = uiBuilderBody('SessionEntryCard(entry: CodexSessionEntry, rowKey: string)');
+  const toolBody = uiBuilderBody('SessionToolEntryView(entry: CodexSessionEntry)');
+  const agentCardBody = uiBuilderBody('SessionAgentEventItemView(entry: CodexSessionEntry, item: SessionToolPresentationItem)');
+  const agentDetailBody = uiBuilderBody('SessionAgentEventDetailView(item: SessionToolPresentationItem)');
+  const noticeBody = uiBuilderBody('SessionSystemNoticeView(entry: CodexSessionEntry)');
   const foldToggleBody = methodBody('SessionEntryFoldToggleView(entry: CodexSessionEntry)');
   const verbBody = methodBody('sessionToolVerbLabel(item: SessionToolPresentationItem): string');
   const agentVerbBody = methodBody('sessionAgentVerbLabel(item: SessionToolPresentationItem): string');
+  const agentDisplayStatusBody = methodBody('sessionAgentDisplayStatus(item: SessionToolPresentationItem): string');
   const agentItemBody = methodBody('isSessionAgentToolItem(item: SessionToolPresentationItem): boolean');
   const taskNameBody = methodBody('sessionAgentItemTaskName(item: SessionToolPresentationItem): string');
   const foldCandidateBody = methodBody('isSessionEntryFoldCandidate(entry: CodexSessionEntry): boolean');
@@ -1025,24 +1076,26 @@ test('session stream slims chrome, folds long entries, and renders agent collabo
 
   // 契约字段：args / taskName / agents（含子结构 report）
   assert.match(modelsSource, /export interface CodexSessionAgentRef/);
-  assert.match(modelsSource, /name: string;\s*\n\s*status: string;\s*\n\s*report\?: string/);
+  assert.match(modelsSource, /name: string;\s*\n\s*displayName\?: string;\s*\n\s*status: string;\s*\n\s*report\?: string/);
   assert.match(modelsSource, /args\?: string/);
   assert.match(modelsSource, /taskName\?: string/);
   assert.match(modelsSource, /agents\?: CodexSessionAgentRef\[\]/);
   assert.match(presentationSource, /args: item\.args/);
   assert.match(presentationSource, /taskName: item\.taskName/);
   assert.match(presentationSource, /agents: item\.agents/);
-  assert.match(presentationSource, /args: source\.args \?\? failed\.args/);
+  assert.match(presentationSource, /const retried = copySessionToolItem\(source, failed\)/);
+  assert.match(presentationSource, /args: item\.args \?\? fallback\?\.args/);
 
   // chrome 瘦身：assistant 头部仅角色切换时渲染，复制/分享只挂最后一条 assistant，
   // user 头部行移除，assistant 卡 padding t2/b4，工具单项行高 24
   assert.match(headerBody, /previousRole !== 'assistant'/);
-  assert.match(lastAssistantBody, /entries\.length - 1/);
+  assert.match(lastAssistantBody, /lastVisibleAssistant === true/);
+  assert.doesNotMatch(lastAssistantBody, /visibleSessionEntries|visibleNewSessionEntries/);
   assert.match(cardBody, /this\.sessionEntryShowAssistantHeader\(entry\)/);
-  assert.match(cardBody, /this\.isSessionLastAssistantEntry\(entry\) && this\.sessionEntryVisibleText\(entry\)\.length > 0/);
+  assert.match(cardBody, /this\.shouldShowAssistantContentActions\(entry\) && this\.sessionEntryVisibleText\(entry\)\.length > 0/);
   assert.doesNotMatch(cardBody, /Text\('你'\)/);
-  assert.match(cardBody, /\.padding\(\{ left: 0, right: 0, top: 8, bottom: 12 \}\)/);
-  assert.match(toolBody, /\.height\(24\)/);
+  assert.match(cardBody, /\.padding\(\{ left: 0, right: 0, top: 4, bottom: 12 \}\)/);
+  assert.match(toolBody, /\.height\(32\)/);
   assert.doesNotMatch(toolBody, /\.height\(34\)/);
 
   // 长消息折叠：>600 字符或 >18 行默认折叠，fold:: 前缀 key，展开/收起切换，预览补齐代码围栏
@@ -1055,7 +1108,7 @@ test('session stream slims chrome, folds long entries, and renders agent collabo
   assert.match(foldToggleBody, /'收起'/);
   assert.match(sourceText, /ui\.session_entry_fold\.toggle/);
 
-  // agent 协作事件卡片：胶囊 28vp、中文动词、状态点色、展开面板 #F2F7FF + 委派指令/逐 agent 汇报
+  // agent 协作事件卡片：真实头像、中文动词、状态点色、主题详情面板 + 委派指令/逐 agent 汇报
   assert.match(agentItemBody, /spawn_agent/);
   assert.match(agentItemBody, /followup_task/);
   assert.match(agentItemBody, /wait_agent/);
@@ -1064,21 +1117,24 @@ test('session stream slims chrome, folds long entries, and renders agent collabo
   assert.match(agentVerbBody, /followup_task[\s\S]*'跟进'/);
   assert.match(agentVerbBody, /wait_agent[\s\S]*'等待'/);
   assert.match(agentVerbBody, /list_agents[\s\S]*'查询'/);
-  assert.match(toolBody, /this\.SessionAgentEventItemView\(entry, item\)/);
-  assert.match(agentCardBody, /\.height\(28\)/);
-  assert.match(agentCardBody, /this\.sessionAgentStatusColor\(item\.status\)/);
+  assert.match(toolBody, /this\.SessionAgentEventItemView\(\{ entry: entry, toolItem: toolItem \}\)/);
+  assert.match(agentCardBody, /\.constraintSize\(\{ minHeight: 36 \}\)/);
+  assert.match(agentCardBody, /this\.SessionAgentAvatar\(this\.sessionAgentItemName\(item\)\)/);
+  assert.match(agentCardBody, /this\.sessionAgentStatusColor\(this\.sessionAgentDisplayStatus\(item\)\)/);
+  assert.match(agentDisplayStatusBody, /item\.rawType !== 'collabAgentToolCall'\) return item\.status/);
+  assert.match(agentDisplayStatusBody, /agent\.status === 'running' \|\| agent\.status === 'pending' \|\| agent\.status === 'unknown'\)\) return 'unknown'/);
   assert.match(agentCardBody, /this\.toggleSessionToolItem\(entry, item\)/);
   assert.match(taskNameBody, /item\.taskName/);
   assert.match(taskNameBody, /agents\[0\]\.name/);
   assert.match(taskNameBody, /item\.target/);
   assert.match(agentDetailBody, /委派指令/);
-  assert.match(agentDetailBody, /#F2F7FF/);
+  assert.match(agentDetailBody, /\.backgroundColor\(this\.theme\(\)\.surfaceSubtle\)/);
   assert.match(agentDetailBody, /agent\.report/);
   assert.match(sourceText, /#14853D/);
   assert.match(sourceText, /#B42318/);
 
   // 工具动词中文化（展示层映射，未知动词回落“调用”）
-  assert.match(verbBody, /'Ran'[\s\S]*'执行'/);
+  assert.match(verbBody, /'Ran'[\s\S]*'已运行'/);
   assert.match(verbBody, /'Edited'[\s\S]*'编辑'/);
   assert.match(verbBody, /'Viewed'[\s\S]*'查看'/);
   assert.match(verbBody, /'Searched'[\s\S]*'搜索'/);
@@ -1119,7 +1175,7 @@ test('compaction retry events are visible in running task status', () => {
 
 test('running Codex status is rendered inside the conversation stream', () => {
   const hideBody = methodBody('shouldHideSessionEntry(entry: CodexSessionEntry): boolean');
-  const cardBody = methodBody('SessionEntryCard(entry: CodexSessionEntry)');
+  const cardBody = uiBuilderBody('SessionEntryCard(entry: CodexSessionEntry, rowKey: string)');
   const floatingBody = methodBody('shouldShowSessionFloatingStatus()');
   const panelBody = methodBody('SessionConversationPanel()');
 
@@ -1129,12 +1185,12 @@ test('running Codex status is rendered inside the conversation stream', () => {
   assert.match(cardBody, /LoadingProgress\(\)/);
   assert.doesNotMatch(floatingBody, /shouldShowSelectedSessionTaskPanel\(\)/);
   assert.doesNotMatch(floatingBody, /shouldShowNewSessionTaskPanel\(\)/);
-  assert.match(panelBody, /this\.sessionEntryKey\(entry\)/);
+  assert.match(uiBuilderBody('SessionTimelineCard(row: RepeatItem<SessionTimelineRow>)'), /this\.sessionEntryKey\(row\.item\.entry/);
 });
 
 test('live activity is rendered as one stable bottom conversation entry', () => {
   const hideBody = methodBody('shouldHideSessionEntry(entry: CodexSessionEntry): boolean');
-  const cardBody = methodBody('SessionEntryCard(entry: CodexSessionEntry)');
+  const cardBody = uiBuilderBody('SessionEntryCard(entry: CodexSessionEntry, rowKey: string)');
   const keyBody = methodBody('sessionEntryKey(entry: CodexSessionEntry): string');
   const visibleBody = methodBody('visibleSessionEntries(): CodexSessionEntry[]');
   const textBody = methodBody('sessionEntryVisibleText(entry: CodexSessionEntry): string');
@@ -1166,7 +1222,7 @@ test('live activity is rendered as one stable bottom conversation entry', () => 
   assert.doesNotMatch(liveBranch, /sessionEntryTimeText/);
 });
 
-test('failed session messages render in the conversation with a left retry button', () => {
+test('failed session messages retain their bubble and put retry below its content', () => {
   const sourceText = source();
   const panelBody = methodBody('SessionConversationPanel()');
   const cardBody = methodBody('FailedSessionMessageCard(message: FailedSessionMessage)');
@@ -1174,20 +1230,22 @@ test('failed session messages render in the conversation with a left retry butto
   const retryBody = methodBody('retryFailedSessionMessage(message: FailedSessionMessage, source: string = \'manual\'): Promise<void>');
   const visibleFailedBody = methodBody('visibleFailedSessionMessages(): FailedSessionMessage[]');
 
-  assert.match(panelBody, /ForEach\(this\.visibleFailedSessionMessages\(\)/);
+  assert.match(panelBody, /this\.sessionTimelineRows\(\)/);
+  assert.match(methodBody('allSessionTimelineRows()'), /this\.visibleFailedSessionMessages\(\)/);
   assert.match(rememberBody, /this\.failedSessionMessages = \[/);
   assert.match(rememberBody, /retryLimit: this\.failedSessionAutoRetryLimit/);
   assert.match(rememberBody, /this\.scheduleFailedSessionAutoRetry\(id, 'new_failure'\)/);
   assert.match(rememberBody, /this\.scheduleFailedSessionAutoRetry\(input\.failedId, 'updated_failure'\)/);
-  assert.match(rememberBody, /this\.sessionMessage = ''/);
-  assert.match(rememberBody, /this\.pendingSessionImages = \[\]/);
+  assert.doesNotMatch(rememberBody, /this\.sessionMessage = ''/);
+  assert.doesNotMatch(rememberBody, /this\.pendingSession(?:Images|Files) = \[\]/);
 
   const blankIndex = cardBody.indexOf('Blank()');
   const retryIndex = cardBody.indexOf("retryFailedSessionMessage(message, 'manual')");
   const bubbleIndex = cardBody.indexOf('failedSessionMessageStatusText(message)');
   assert.ok(blankIndex >= 0 && retryIndex > blankIndex, 'retry button should appear after the right-aligning blank');
-  assert.ok(bubbleIndex > retryIndex, 'retry button should appear to the left of the failed message bubble');
-  assert.match(cardBody, /backgroundColor\(message\.retrying \? this\.themeColor\('#8A95A3'\) : this\.themeColor\('#14853D'\)\)/);
+  assert.ok(bubbleIndex < retryIndex, 'retry action follows the preserved bubble and its status');
+  assert.match(cardBody, /Button\('重试'\)/);
+  assert.match(cardBody, /backgroundColor\(this\.theme\(\)\.surfaceMuted\)/);
   assert.match(cardBody, /cancelFailedSessionAutoRetry\(message\.id\)/);
   assert.doesNotMatch(cardBody, /failed_message_repair/);
   assert.doesNotMatch(cardBody, /repairDesktopLiveFromPhone\('failed_message'\)/);
@@ -1198,7 +1256,11 @@ test('failed session messages render in the conversation with a left retry butto
   assert.match(sourceText, /private cancelFailedSessionAutoRetry\(failedId: string\): void/);
   assert.match(retryBody, /beginFailedSessionRetryAttempt\(message\.id, source\)/);
   assert.match(retryBody, /this\.sessionMessage = attempt\.text/);
-  assert.match(retryBody, /this\.pendingSessionImages = attempt\.images\.slice\(\)/);
+  assert.match(retryBody, /const retryImages = attempt\.images\.slice\(\)/);
+  assert.match(retryBody, /this\.pendingSessionImages = retryImages/);
+  assert.ok(retryBody.indexOf('this.sessionMessage = previousText') < retryBody.indexOf('const ok = await sending'),
+    'the original composer must be restored before yielding to the retry result');
+  assert.doesNotMatch(retryBody.slice(retryBody.indexOf('const ok = await sending')), /this\.(?:sessionMessage|pendingSessionImages|pendingSessionFiles) =/);
   assert.match(retryBody, /sendMessageToSelectedSession\(attempt\.id\)/);
   assert.match(retryBody, /sendNewSessionMessage\(attempt\.id\)/);
   assert.match(retryBody, /this\.scheduleFailedSessionAutoRetry\(attempt\.id, 'retry_failed'\)/);
@@ -1216,14 +1278,14 @@ test('pending session sends become retryable chat messages when the bridge task 
   const failureTextBody = methodBody('taskFailureMessage(task: BridgeTask): string');
 
   assert.match(sourceText, /interface PendingSessionSend/);
-  assert.match(sourceText, /private pendingSessionSendsByTaskId: Record<string, PendingSessionSend> = \{\}/);
-  assert.match(sendBody, /this\.rememberPendingSessionSend\(this\.currentTask\.id/);
+  assert.match(sourceText, /private pendingSessionSendsByTaskId: Record<string, PendingSessionSend\[\]> = \{\}/);
+  assert.match(sendBody, /this\.rememberPendingSessionSend\(receivedTask\.id/);
   assert.match(sendBody, /引导已提交，正在确认 Codex 接收/);
-  assert.match(newBody, /this\.rememberPendingSessionSend\(this\.currentTask\.id/);
+  assert.match(newBody, /this\.rememberPendingSessionSend\(receivedTask\.id/);
   assert.match(terminalBody, /this\.rememberFailedSessionMessageForTerminalTask\(task\)/);
-  assert.match(pendingBody, /this\.pendingSessionSendsByTaskId\[taskId\] = pending/);
+  assert.match(pendingBody, /this\.pendingSessionSendsByTaskId\[taskId\] = index < 0/);
   assert.match(failedTerminalBody, /this\.rememberFailedSessionMessageAfterSendFailure/);
-  assert.match(failedTerminalBody, /this\.clearPendingSessionSend\(task\.id\)/);
+  assert.match(failedTerminalBody, /this\.clearPendingSessionSend\(task\.id, pending\.submissionId\)/);
   assert.match(failureTextBody, /event\.type === 'task\.failed'/);
 });
 
@@ -1240,12 +1302,10 @@ test('selected session adoption does not replace a newer active guidance task wi
 });
 
 test('app-server send contract clears stale desktop CDP unavailable state', () => {
-  const contractBody = methodBody('requiresDesktopLiveForSend(targetSessionId: string, source: string): Promise<boolean>');
   const applyBody = methodBody('applyAppServerPrimaryStatus(targetSessionId: string, source: string, execution: string): void');
   const taskBody = methodBody('applyTaskExecutionContract(task: BridgeTask, targetSessionId: string, source: string): void');
   const openBody = methodBody('openSession(session: CodexSessionSummary): Promise<void>');
 
-  assert.match(contractBody, /!requiresDesktop[\s\S]*applyAppServerPrimaryStatus/);
   assert.match(applyBody, /this\.desktopLiveState = 'not_required'/);
   assert.match(applyBody, /this\.desktopLiveReason = ''/);
   assert.match(applyBody, /this\.desktopLiveRequiresDesktopCdp = false/);
@@ -1254,7 +1314,7 @@ test('app-server send contract clears stale desktop CDP unavailable state', () =
 });
 
 test('session entries expose official text and image copy and share actions', () => {
-  const entryBody = methodBody('SessionEntryCard(entry: CodexSessionEntry)');
+  const entryBody = uiBuilderBody('SessionEntryCard(entry: CodexSessionEntry, rowKey: string)');
   const actionBody = methodBody('SessionContentActionRow(entry: CodexSessionEntry, imageUrl: string)');
   const service = contentActionServiceSource();
 
@@ -1300,7 +1360,7 @@ test('session workspace uses responsive landscape columns with a fully hidden co
   const closeBody = methodBody('closeSessionSidebar(source: string): void');
   const openBody = methodBody('openSession(session: CodexSessionSummary): Promise<void>');
   const restoreBody = methodBody('restoreActiveSessionIfNeeded(): Promise<void>');
-  const returnHomeBody = methodBody('returnToSessionHome(source: string): void');
+  const returnHomeBody = methodBody('returnToSessionHome(source: string): boolean');
   const sendBody = methodBody("sendMessageToSelectedSession(retryFailedMessageId: string = ''): Promise<boolean>");
   const aboutToAppearBody = methodBody('aboutToAppear(): void');
   const abilityText = entryAbilitySource();
@@ -1346,7 +1406,7 @@ test('session workspace uses responsive landscape columns with a fully hidden co
   assert.match(abilityText, /AppStorage\.setOrCreate<string>\(ACTIVE_SESSION_STORAGE_KEY, ''\)/);
   assert.match(abilityText, /AppStorage\.setOrCreate<string>\(SESSION_DRAFT_STORAGE_KEY, ''\)/);
   assert.match(abilityText, /AppStorage\.setOrCreate<number>\(SESSION_SIDEBAR_WIDTH_STORAGE_KEY, 304\)/);
-  assert.match(moduleText, /"orientation": "auto_rotation"/);
+  assert.match(moduleText, /"orientation": "auto_rotation_restricted"/);
 });
 
 test('failed task overlay is suppressed after the phone prompt has a canonical assistant reply', () => {
@@ -1380,16 +1440,16 @@ test('local terminal task state suppresses stale running summaries before adopti
   assert.match(latestForSessionBody, /if \(ignoreRunning\) \{[\s\S]*continue;/);
 });
 
-test('phone desktop-live repair stays soft and failed-message retry does not restart Codex', () => {
+test('phone desktop-live repair uses control and failed-message retry does not restart Codex', () => {
   const repairBody = methodBody('repairDesktopLiveFromPhone(source: string, desktopOnly: boolean = false): Promise<boolean>');
-  const preflightBody = methodBody('ensureDesktopLiveReadyForSend(targetSessionId: string, source: string): Promise<boolean>');
+  const controlBody = methodBody('runMobileControlRepair(source: string, hard: boolean, existing: MobileControlJob | null = null): Promise<boolean>');
   const clientText = fs.readFileSync(path.resolve('HarmonyCodexRemote/entry/src/main/ets/services/BridgeClient.ets'), 'utf8');
   const cardBody = methodBody('FailedSessionMessageCard(message: FailedSessionMessage)');
 
-  assert.match(repairBody, /BridgeClient\.recoverSystemLink\(this\.normalizedBridgeUrl\(\), this\.bridgeToken, targetSessionId, 'auto'\)/);
-  assert.match(repairBody, /this\.applySystemLinkStatus\(link, targetSessionId\)/);
-  assert.match(preflightBody, /BridgeClient\.getDesktopLiveStatus\(this\.normalizedBridgeUrl\(\), this\.bridgeToken, targetSessionId, true\)/);
-  assert.doesNotMatch(preflightBody, /repairDesktopLive/);
+  assert.match(repairBody, /this\.runMobileControlRepair\(source, false\)/);
+  assert.match(controlBody, /MobileControlService\.repair\(url, token, DEFAULT_CONTROL_TARGET_ID, targetSessionId, hard, progress, isCurrent\)/);
+  assert.match(controlBody, /MobileControlService\.verified\(job, targetSessionId\)/);
+  assert.doesNotMatch(controlBody, /BridgeClient\.(recoverSystemLink|repairSystemLink)/);
   assert.doesNotMatch(cardBody, /repairDesktopLiveFromPhone\('failed_message'\)/);
   assert.match(clientText, /getSystemLinkStatus/);
   assert.match(clientText, /recoverSystemLink/);
@@ -1447,7 +1507,7 @@ test('home plus menu owns account usage and desktop restart actions', () => {
   assert.match(closeUsageBody, /close_ignored/);
   assert.match(usageBody, /BridgeClient\.getCodexAccountUsage/);
   assert.match(confirmBody, /AlertDialog\.show/);
-  assert.match(hardBody, /BridgeClient\.repairSystemLink\(this\.normalizedBridgeUrl\(\), this\.bridgeToken, targetSessionId, 'hard', true\)/);
+  assert.match(hardBody, /this\.runMobileControlRepair\(source, true\)/);
   assert.match(clientText, /getCodexAccountUsage/);
   assert.match(clientText, /confirmHardRestart/);
 });
@@ -1468,7 +1528,7 @@ test('session refresh only follows live activity when the user is already near b
 
 test('stale session detail responses cannot overwrite the current conversation', () => {
   const loadBody = methodBody('loadSessionDetail(sessionId: string): Promise<void>');
-  const homeBody = methodBody('returnToSessionHome(source: string): void');
+  const homeBody = methodBody('returnToSessionHome(source: string): boolean');
 
   assert.match(source(), /private sessionDetailRequestSeq: number = 0/);
   assert.match(loadBody, /const requestSeq = \+\+this\.sessionDetailRequestSeq/);
@@ -1479,14 +1539,12 @@ test('stale session detail responses cannot overwrite the current conversation',
   assert.match(homeBody, /this\.sessionDetailRequestSeq \+= 1/);
 });
 
-test('mobile uses the Bridge runtime contract before skipping CDP and preserves a retry submission identity', () => {
+test('mobile sends the target fingerprint and retry identity directly to the Bridge', () => {
   const sourceText = source();
   const clientText = fs.readFileSync(path.resolve('HarmonyCodexRemote/entry/src/main/ets/services/BridgeClient.ets'), 'utf8');
   const modelText = fs.readFileSync(path.resolve('HarmonyCodexRemote/entry/src/main/ets/model/BridgeModels.ets'), 'utf8');
   const sendBody = methodBody('sendMessageToSelectedSession(retryFailedMessageId: string = \'\'): Promise<boolean>');
   const newBody = methodBody('sendNewSessionMessage(retryFailedMessageId: string = \'\'): Promise<boolean>');
-  const contractBody = methodBody('requiresDesktopLiveForSend(targetSessionId: string, source: string): Promise<boolean>');
-  const desktopReadyBody = methodBody('ensureDesktopLiveReadyForSend(targetSessionId: string, source: string): Promise<boolean>');
   const taskRuntimeBody = methodBody('taskUsesAppServer(task: BridgeTask | BridgeTaskSummary): boolean');
   const retryBody = methodBody('submissionIdForRetry(retryFailedMessageId: string): string');
   const nextRetryBody = methodBody('updateFailedSessionMessageNextRetryAt(failedId: string, nextRetryAt: string): void');
@@ -1500,15 +1558,13 @@ test('mobile uses the Bridge runtime contract before skipping CDP and preserves 
   assert.match(clientText, /JSON\.stringify\(\{ projectId, text, sessionFingerprint, reasoningEffort, model, submissionId \}\)/);
   assert.match(clientText, /JSON\.stringify\(\{ projectId, text, reasoningEffort, model, submissionId \}\)/);
 
-  assert.match(sendBody, /const requiresDesktopLive = await this\.requiresDesktopLiveForSend/);
-  assert.match(sendBody, /if \(requiresDesktopLive\) \{[\s\S]*ensureDesktopLiveReadyForSend/);
-  assert.match(sendBody, /submissionId/);
+  assert.match(sendBody, /BridgeClient\.sendCodexThreadMessage\(\s*bridgeUrl,\s*targetSessionId,\s*messageText,\s*targetProjectId,\s*bridgeToken,\s*targetFingerprint,\s*undefined,\s*undefined,\s*submissionId/);
   assert.match(newBody, /this\.submissionIdForRetry\(retryFailedMessageId\)/);
-  assert.match(contractBody, /BridgeClient\.getRuntimeStatus/);
-  assert.match(contractBody, /runtime\.existingThreadExecution !== 'app_server'/);
-  assert.doesNotMatch(contractBody, /runtime\.existingThreadExecution !== 'desktop_primary'/);
-  assert.match(desktopReadyBody, /status\.sessionVerified === true \|\| status\.targetVerified === true/);
-  assert.match(contractBody, /return true;/);
+  assert.match(newBody, /BridgeClient\.startCodexThread\([\s\S]*?submissionId/);
+  for (const body of [sendBody, newBody]) {
+    assert.doesNotMatch(body, /BridgeClient\.(?:getRuntimeStatus|getDesktopLiveStatus|recoverSystemLink|repairSystemLink)/);
+    assert.doesNotMatch(body, /(?:MobileControlService|repairDesktopLiveFromPhone)/);
+  }
   assert.match(taskRuntimeBody, /task\.runtime\?\.kind === 'app_server'/);
   assert.match(retryBody, /failed\.submissionId/);
   assert.match(sourceText, /submissionId: pending\.submissionId/);
@@ -1554,7 +1610,7 @@ test('notifications are privacy-safe, categorized, and deep-link to the target c
   assert.match(abilityText, /onNewWant/);
   assert.match(abilityText, /applyNotificationTarget/);
   assert.match(navigationBody, /this\.sessions\.find/);
-  assert.match(navigationBody, /await this\.openSession\(target\)/);
+  assert.match(navigationBody, /this\.openSession\(target\)/);
   assert.match(navigationBody, /this\.showTaskEventDetails/);
   assert.match(attentionBody, /AppNotificationService\.publish/);
 });
@@ -1610,7 +1666,7 @@ test('monitoring falls back to a stable privacy-safe notification and an always-
 
 test('history refresh updates an existing native item without moving or duplicating it', () => {
   const body = methodBody('mergeSessionEntryPages');
-  const merge = new Function(`${stripTypeScriptTypes(`function merge(older, newer) {${body}}`)}; return merge;`)();
+  const merge = new Function(`${stripTypeScriptTypes(`function merge(older, newer, completedTurnIds = [], threadId = '') {${body}}`)}; return merge;`)();
   const old = { syncId: 'item-a', text: 'partial' };
   const other = { syncId: 'item-b', text: 'same text' };
   const updated = { syncId: 'item-a', text: 'complete' };
@@ -1620,7 +1676,7 @@ test('history refresh updates an existing native item without moving or duplicat
 
 test('history merge replaces transient activity and removes it when the next snapshot settles', () => {
   const body = methodBody('mergeSessionEntryPages');
-  const merge = new Function(`${stripTypeScriptTypes(`function merge(older, newer) {${body}}`)}; return merge;`)();
+  const merge = new Function(`${stripTypeScriptTypes(`function merge(older, newer, completedTurnIds = [], threadId = '') {${body}}`)}; return merge;`)();
   const history = { syncId: 'history', timestamp: '2026-09-20T10:00:00Z', type: 'response_item', role: 'user', text: 'question' };
   const activity = { timestamp: '2026-09-20T10:01:00Z', type: 'live_activity', liveKind: 'assistant', text: '正在返回内容' };
   const final = { syncId: 'answer', timestamp: '2026-09-20T10:02:00Z', type: 'response_item', role: 'assistant', text: 'answer' };
@@ -1633,7 +1689,7 @@ test('history merge replaces transient activity and removes it when the next sna
 
 test('refreshing a recent page with a wider snapshot keeps latest messages at the bottom', () => {
   const body = methodBody('mergeSessionEntryPages');
-  const merge = new Function(`${stripTypeScriptTypes(`function merge(older, newer) {${body}}`)}; return merge;`)();
+  const merge = new Function(`${stripTypeScriptTypes(`function merge(older, newer, completedTurnIds = [], threadId = '') {${body}}`)}; return merge;`)();
   const history = Array.from({ length: 160 }, (_, index) => ({
     syncId: `message-${index}`, timestamp: new Date(1700000000000 + index * 1000).toISOString(), text: `${index}`
   }));
@@ -1643,18 +1699,32 @@ test('refreshing a recent page with a wider snapshot keeps latest messages at th
   assert.deepEqual(merge(history.slice(0, 80), history.slice(80)), history);
 });
 
-test('phone only reports restart success after an executed hard repair', async () => {
+test('phone only reports hard repair success after control and phone business verification', async () => {
   const body = methodBody('repairDesktopLiveHardFromPhone');
+  const controlBody = methodBody('runMobileControlRepair');
+  const serviceText = fs.readFileSync(path.resolve('HarmonyCodexRemote/entry/src/main/ets/services/MobileControlService.ets'), 'utf8');
   for (const repaired of [false, true]) {
-    const system = { repairMode: 'hard', repaired, desktop: { desktopLive: true } };
-    const run = new Function('BridgeClient', `${stripTypeScriptTypes(`async function run(source) {${body}}`)}; return run;`)({
-      async repairSystemLink() { return system; }
-    });
+    const Service = new Function(stripTypeScriptTypes(serviceText.replace(/^import .*;\r?\n/gm, '').replace('export class', 'class')) + '; return MobileControlService;')();
+    const calls = [];
+    Service.repair = async (...args) => {
+      calls.push(args.slice(0, 5));
+      return { status: repaired ? 'succeeded' : 'failed', sessionId: '', mode: 'hard', message: '本次修复未确认',
+        verification: { bridge: true, sessions: true, targetSession: true, desktopRequired: true, desktop: repaired } };
+    };
+    let businessReads = 0;
+    const control = new Function('MobileControlService', 'BridgeClient', 'DEFAULT_CONTROL_TARGET_ID',
+      `${stripTypeScriptTypes(`async function run(source, hard, existing = null) {${controlBody}}`)}; return run;`)(Service,
+      { async listSessions() { businessReads++; return []; } }, 'desktop-one');
+    const run = new Function(`${stripTypeScriptTypes(`async function run(source) {${body}}`)}; return run;`)();
     const state = { desktopLiveRestarting: false, isNewSessionDraft: true, selectedSession: null,
-      normalizedBridgeUrl() { return ''; }, log() {}, applySystemRepairStatus() {},
-      systemRepairMessageText() { return '本次未执行重启'; }, async refreshDashboard() {} };
+      bridgeToken: 'token', message: '', normalizedBridgeUrl() { return 'https://phone.example'; },
+      readSessionNavigation() { return { revision: 1 }; }, log() {}, errorText(error) { return error.message; },
+      runMobileControlRepair: control, async refreshDashboard() {} };
     assert.equal(await run.call(state, 'test'), repaired);
-    assert.equal(state.message, repaired ? 'Codex 已重启并恢复链路' : '本次未执行重启');
+    assert.deepEqual(calls, [['https://phone.example', 'token', 'desktop-one', '', true]]);
+    assert.equal(businessReads, repaired ? 1 : 0);
+    assert.equal(state.message, repaired ? '链路已恢复，手机与目标会话验证通过' : '');
+    assert.equal(state.mobileControlMessage, repaired ? '链路已恢复，手机与目标会话验证通过' : '本次修复未确认');
     assert.equal(state.desktopLiveRestarting, false);
   }
 });
@@ -1695,11 +1765,11 @@ test('conversation history loads older cursor pages at the top without re-enabli
   assert.match(olderBody, /BridgeClient\.getSessionHistoryPage/);
   assert.match(olderBody, /beforeCursor/);
   assert.match(olderBody, /this\.sessionAutoFollowBottom = false/);
-  assert.match(olderBody, /this\.mergeSessionEntryPages/);
+  assert.match(olderBody, /this\.mergeSessionDetailPreservingHistory\(older, current\)/);
   assert.match(refreshBody, /this\.mergeSessionDetailPreservingHistory/);
 });
 
-test('the ability owns an idempotent data-transfer background runtime across lifecycle transitions', () => {
+test('only HDC relay owns a data-transfer task while chat uses native push and actual ability lifecycle', () => {
   const abilityText = entryAbilitySource();
   const profileText = moduleProfileSource();
   const backgroundText = backgroundRuntimeServiceSource();
@@ -1711,8 +1781,16 @@ test('the ability owns an idempotent data-transfer background runtime across lif
   assert.match(backgroundText, /static async ensureRunning/);
   assert.match(backgroundText, /startPromise/);
   assert.match(backgroundText, /backgroundTaskManager\.startBackgroundRunning/);
-  assert.match(backgroundText, /backgroundTaskManager\.BackgroundMode\.DATA_TRANSFER/);
-  assert.match(abilityText, /onCreate[\s\S]*AppBackgroundRuntimeService\.ensureRunning\(this\.context,\s*'ability_create'\)/);
+  assert.match(profileText, /\"backgroundModes\":\s*\[[^\]]*\"dataTransfer\"/);
+  assert.match(backgroundText, /backgroundTaskManager\.BackgroundTaskMode\.MODE_DATA_TRANSFER/);
+  assert.match(backgroundText, /backgroundTaskManager\.getAllContinuousTasks/);
+  assert.match(abilityText, /codexRemoteAppForeground/);
+  assert.match(abilityText, /onCreate[\s\S]*AppStorage\.setOrCreate<boolean>\(FOREGROUND_STORAGE_KEY, false\)/);
+  assert.match(abilityText, /onForeground[\s\S]*AppStorage\.setOrCreate<boolean>\(FOREGROUND_STORAGE_KEY, true\)/);
+  assert.match(abilityText, /onBackground[\s\S]*AppStorage\.setOrCreate<boolean>\(FOREGROUND_STORAGE_KEY, false\)/);
+  assert.doesNotMatch(abilityText, /'ability_create'/);
+  assert.match(abilityText, /HuaweiPushRegistrationService\.attach\(this\)/);
+  assert.match(abilityText, /AppStorage\.get<boolean>\('codexRemoteHdcRelayActive'\) === true/);
   assert.match(abilityText, /onForeground[\s\S]*AppBackgroundRuntimeService\.ensureRunning\(this\.context,\s*'ability_foreground'\)/);
   assert.match(abilityText, /onBackground[\s\S]*AppBackgroundRuntimeService\.ensureRunning\(this\.context,\s*'ability_background'\)/);
   assert.match(indexText, /AppBackgroundRuntimeService\.ensureRunning\(context,\s*'index_relay'\)/);
@@ -1785,7 +1863,7 @@ test('desktop file links require confirmation before downloading and open with a
     path.resolve('HarmonyCodexRemote/entry/src/main/ets/services/BridgeClient.ets'),
     'utf8'
   );
-  const inlineBody = methodBody(
+  const inlineBody = uiBuilderBody(
     'SessionMarkdownInlineText(text: string, isUser: boolean, fontSize: number, lineHeight: number)'
   );
 
@@ -1881,6 +1959,7 @@ test('model menu scrolls all options under a viewport height limit', () => {
 
 test('same-session reload preserves history and detached reading position without reloading settings', async () => {
   const body = methodBody('loadSessionDetail');
+  const beginSnapshotRead = new Function(`${stripTypeScriptTypes(`function begin(sessionId) {${methodBody('beginSessionDetailSnapshotRead')}}`)}; return begin;`)();
   const run = new Function('BridgeClient', `${stripTypeScriptTypes(`async function run(sessionId) {${body}}`)}; return run;`)({
     async getSessionHistoryPage() { return { id: 'thread', title: 'T', entries: [{ text: 'new' }], entryCount: 1 }; }
   });
@@ -1888,14 +1967,22 @@ test('same-session reload preserves history and detached reading position withou
   let settingsCalls = 0;
   let scrollCalls = 0;
   const state = {
-    selectedSession: current, sessionDetailRequestSeq: 0, sessionAutoFollowBottom: false,
-    normalizedBridgeUrl: () => '', bridgeToken: '', log() {}, markSessionRead() {}, applySessionActivitySnapshot() {},
+    selectedSession: current, sessionDetailRequestSeq: 0, sessionDetailSnapshotRevisions: new Map(),
+    beginSessionDetailSnapshotRead: beginSnapshotRead, sessionAutoFollowBottom: false,
+    normalizedBridgeUrl: () => '', bridgeToken: '', log() {},
+    readSessionNavigation: () => ({ revision: 1, mode: 'session', sessionId: 'thread' }),
+    isSessionNavigationCurrent(revision, id) { const nav = this.readSessionNavigation(); return nav.revision === revision && nav.mode === 'session' && nav.sessionId === id; },
+    reconcileVisibleSessionMessages() { this.reconciles = (this.reconciles || 0) + 1; }, markSessionRead() {}, applySessionActivitySnapshot() {},
     mergeSessionDetailPreservingHistory(old, next) { assert.equal(old, current); return { ...next, entries: [...old.entries, ...next.entries] }; },
+    syncSessionEventStream() {}, async loadOutbox() {}, async refreshDesktopInteractions() {},
     async loadSessionReasoningEffort() { settingsCalls++; },
     scrollSessionToBottomIfFollowing() { if (this.sessionAutoFollowBottom) scrollCalls++; }
   };
   await run.call(state, 'thread');
   assert.equal(state.selectedSession.entries.length, 2);
+  assert.equal(state.sessionDetailSnapshotRevisions.get('thread'), 1);
+  assert.equal(state.reconciles, 1);
+  assert.equal(state.message, '已打开会话：T');
   assert.equal(state.sessionAutoFollowBottom, false);
   assert.equal(scrollCalls, 0);
   assert.equal(settingsCalls, 0);
@@ -1930,11 +2017,12 @@ test('bottom navigation and refresh jump instantly instead of invoking native sc
 test('pending interrupt returns control to the composer and lets existing polling confirm completion', async () => {
   const pending = { id: 'task', status: 'running', interruptDispatching: true };
   const run = new Function('BridgeClient', `${stripTypeScriptTypes(`async function run() {${methodBody('interruptSelectedSessionTask')}}`)}; return run;`)({
-    async interruptTask() { return pending; }
+    async interruptCodexThread() { return pending; }
   });
   let polls = 0;
   const state = {
     selectedSession: { id: 'thread' }, currentTask: pending,
+    readSessionNavigation: () => ({ revision: 1 }), taskStatusById: {}, taskSessionById: {},
     canInterruptSelectedSessionTask: () => true, selectedSessionInterruptTaskId: () => 'task',
     taskUsesCodexRunApi: () => false, normalizedBridgeUrl: () => '', bridgeToken: '',
     guard: async (name, action) => action(), syncSessionTaskMarkers() {},

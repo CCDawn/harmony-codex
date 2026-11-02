@@ -1,5 +1,6 @@
 import { CodexDesktopCdpAdapter } from './codexDesktopCdpAdapter.js';
 import { CodexDesktopScriptAdapter } from './codexDesktopScriptAdapter.js';
+import { probeDesktopCdpLiveness } from './codexDesktopCdpClient.js';
 
 export class HybridCodexAdapter {
   get requiresDeliveryReceipt() { return true; }
@@ -13,6 +14,7 @@ export class HybridCodexAdapter {
     this.desktopAdapter = options.desktopAdapter ?? this.scriptDesktopAdapter ?? this.cdpDesktopAdapter;
     this.desktopProbeTimeoutMs = options.desktopProbeTimeoutMs
       ?? Number.parseInt(process.env.CODEX_DESKTOP_PROBE_TIMEOUT_MS ?? '8000', 10);
+    this.cdpLivenessProbe = options.cdpLivenessProbe ?? probeDesktopCdpLiveness;
     this.lastDesktopUnavailableError = null;
   }
 
@@ -128,41 +130,16 @@ export class HybridCodexAdapter {
   }
 
   async interrupt(context) {
-    const targetSessionId = normalizeSessionId(
-      context?.task?.codexSessionId ?? context?.task?.createdCodexSessionId ?? ''
-    );
-    const desktopStatus = await this.getDesktopLiveStatus(this.desktopProbeTimeoutMs, targetSessionId);
-    this.selectDesktopAdapterForStatus(desktopStatus);
-    this.emitDesktopProbeResult(context, desktopStatus);
-
-    if (!isDesktopTargetReady(desktopStatus, targetSessionId)) {
-      throw createDesktopVerificationError({
-        ...desktopStatus,
-        message: desktopStatus.message
-          ?? desktopStatus.reason
-          ?? '桌面实时通道未校验，已阻止中断当前会话。'
-      });
-    }
-
-    const selectedAdapter = this.desktopAdapter ?? this.scriptDesktopAdapter ?? this.cdpDesktopAdapter;
-    if (!selectedAdapter || typeof selectedAdapter.interrupt !== 'function') {
+    // Stop uses the existing desktop owner's official turn IDs. The send
+    // preflight reads persisted metadata and the visible page, neither of
+    // which is required by turn/interrupt (new turns may not be persisted yet).
+    const pendingOwnerId = context?.interruptScope === 'thread' ? context.pendingTaskId : context?.task?.id;
+    const adapter = pendingOwnerId && this.scriptDesktopAdapter?.pendingTurnStarts?.has(pendingOwnerId)
+      ? this.scriptDesktopAdapter : this.cdpDesktopAdapter;
+    if (!adapter || typeof adapter.interrupt !== 'function') {
       throw new Error('当前桌面实时通道不支持中断');
     }
-    try {
-      return await selectedAdapter.interrupt(context);
-    } catch (error) {
-      if (await this.shouldRetryWithCdp(error, desktopStatus, targetSessionId, selectedAdapter)) {
-        context.emit('codex.desktop_live.transport_retry', {
-          from: desktopStatus.transport ?? 'script',
-          to: 'cdp',
-          targetSessionId,
-          reason: error?.message ?? String(error)
-        });
-        this.desktopAdapter = this.cdpDesktopAdapter;
-        return this.cdpDesktopAdapter.interrupt(context);
-      }
-      throw error;
-    }
+    return adapter.interrupt(context);
   }
 
   async getDesktopLiveStatus(timeoutMs = this.desktopProbeTimeoutMs, targetSessionId = '') {
@@ -358,6 +335,17 @@ export class HybridCodexAdapter {
     }
   }
 
+  async probeScriptTransportCdpLiveness() {
+    if (typeof this.cdpLivenessProbe !== 'function') {
+      return { checked: false, ok: true };
+    }
+    try {
+      return await this.cdpLivenessProbe();
+    } catch (error) {
+      return { checked: true, ok: false, reason: error?.message ?? String(error) };
+    }
+  }
+
   async shouldRetryWithCdp(error, desktopStatus, targetSessionId, attemptedAdapter = this.desktopAdapter) {
     if (!error?.safeToFallback) {
       return false;
@@ -433,6 +421,12 @@ export class HybridCodexAdapter {
     }
     try {
       await withTimeout(adapter.probe(), timeoutMs, '连接桌面脚本桥超时');
+      // 脚本桥心跳可能来自仍在轮询的 live-host：桌面 CDP 已死时心跳并不代表桌面在线。
+      // 判定必须叠加地面真相——CDP DevTools 入口真实应答，否则按不在线处理。
+      const cdpLiveness = await this.probeScriptTransportCdpLiveness();
+      if (cdpLiveness.ok !== true) {
+        return null;
+      }
       const probeStatus = typeof adapter.bridge?.getStatus === 'function'
         ? adapter.bridge.getStatus(targetSessionId)
         : null;

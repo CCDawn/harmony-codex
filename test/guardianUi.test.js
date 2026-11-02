@@ -199,10 +199,22 @@ test('guardian API sends phone heartbeat on GET and only enabled on PUT', async 
   assert.throws(() => bridge.parseGuardianStatus('{}'), /状态格式不完整/);
 });
 
-test('UI preserves manual maintenance actions and exposes force restart policy without another approval', () => {
+test('UI preserves manual maintenance actions and the tray displays the persisted restart policy', () => {
   for (const action of ['soft_repair', 'hard_restart', 'desktop_monitor', 'outbox']) assert.match(settings, new RegExp(`this.Action\\('${action}'`));
-  assert.match(settings, /必要时会强制重启 Codex，可能中断任务和通话/);
-  assert.match(tray, /必要时会强制重启 Codex，可能中断任务和通话/);
+  assert.match(settings, /GuardianPresentation\.restartPolicy\(this\.guardian\)/);
+  assert.match(tray, /LinkStatusPresentation\.GuardianPolicy\(guardian\)/);
+  assert.match(tray, /LinkStatusPresentation\.Flag\(guardian, "allowForceRestart"\)/);
+  assert.match(tray, /ExecuteGuardian\("SetPolicy", false, allowed \? "Allow" : "Deny"\)/);
+  assert.match(tray, /action == "SetPolicy" \? " -RestartPolicy " \+ restartPolicy/);
   assert.match(tray, /ExecuteGuardian\("Ensure", false\)/);
   assert.match(tray, /Task.Run\(delegate[\s\S]*mobile-link-guardian.ps1/);
+});
+
+test('phone restart policy text distinguishes unread, denied and allowed configuration', () => {
+  const source = fs.readFileSync(`${root}services/GuardianPresentation.ets`, 'utf8');
+  const policy = method(source, 'restartPolicy', 'status');
+  assert.equal(policy(null), '自动恢复权限尚未确认');
+  assert.equal(policy(status(true)), '自动恢复权限尚未确认');
+  assert.equal(policy({ ...status(true), allowForceRestart: true }), '允许自动重启 Codex，可能中断任务或通话。');
+  assert.equal(policy({ ...status(true), allowForceRestart: false }), '自动恢复仅重连和恢复服务，不会自动重启 Codex。');
 });

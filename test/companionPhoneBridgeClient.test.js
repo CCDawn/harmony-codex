@@ -68,4 +68,17 @@ test('Companion history preserves call-only records and normalizes an older resp
   rawResponse.value = JSON.stringify({ entries: [], nextCursor: null });
   const legacy = await context.BridgeClient.getCompanionMessages('https://bridge.example', 'assistant-a', 'room-a');
   assert.deepEqual(JSON.parse(JSON.stringify(legacy.calls)), []);
+  const requestId = 'ABCDEF01-1234-4123-8123-123456789ABC';
+  rawResponse.value = JSON.stringify({ entries: [
+    { itemId: 'room:valid', role: 'user', text: 'valid', createdAt: 1234, requestId },
+    { itemId: 'room:invalid', role: 'user', text: 'invalid', createdAt: -1, requestId: 'not-a-uuid' },
+    { itemId: 'room:legacy', role: 'user', text: 'legacy' }
+  ] });
+  const metadata = await context.BridgeClient.getCompanionMessages('https://bridge.example', 'assistant-a', 'room-a');
+  assert.equal(metadata.entries[0].createdAt, 1234);
+  assert.equal(metadata.entries[0].requestId, requestId.toLowerCase());
+  for (const entry of metadata.entries.slice(1)) {
+    assert.equal(entry.createdAt, undefined);
+    assert.equal(entry.requestId, undefined);
+  }
 });

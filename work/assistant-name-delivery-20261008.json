@@ -1,0 +1,18 @@
+{
+  "BuiltAt": "2026-10-08T07:28:00.3827528Z",
+  "NameSource": "Codex /tbo/primary profile.display_name",
+  "Fallback": "个人助手",
+  "PeriodicDiscoverySeconds": 60,
+  "AssistantName": "葱花拌海星",
+  "RenameConfirmedByUser": true,
+  "NameFixedInProduction": false,
+  "TargetedChecksPassed": 108,
+  "BuildPassed": true,
+  "SignedHap": "C:\\Users\\Administrator\\Documents\\Codex\\2026-10-04\\c-users-administrator-zcode-workspace-default\\outputs\\assistant-dynamic-name-20261008-signed.hap",
+  "SHA256": "016192505ADCA4683103D62F6795F0D1A85C4B5600F208D20CA6FF9C67EDEA69",
+  "Installed": false,
+  "InstallBlocker": "Awaiting app reopen and device readback after embedded relay disconnected",
+  "PhoneVisualAcceptance": false,
+  "InstallCommandExit": 0,
+  "AwaitingManualAppOpen": true
+}

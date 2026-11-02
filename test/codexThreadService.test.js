@@ -446,6 +446,9 @@ test('CodexThreadService strict desktop mode never starts or requests the indepe
     allowIndependentAppServer: false,
     projectHistoryPath: null,
     desktopThreadListProvider: async () => ({ data: [{ id: desktopSession.id, name: desktopSession.title, cwd: desktopSession.projectRoot }] }),
+    desktopThreadRequest: async (method, params) => method === 'thread/read'
+      ? { thread: { id: params.threadId, name: desktopSession.title, cwd: desktopSession.projectRoot, status: { type: 'idle' } } }
+      : { data: [{ id: 'native-turn', status: 'completed', items: [{ type: 'agentMessage', id: 'native-message', text: '桌面会话内容' }] }], nextCursor: null, backwardsCursor: null },
     runStatePath: null
   });
 
@@ -472,6 +475,8 @@ test('CodexThreadService strict desktop mode never starts or requests the indepe
   assert.equal(listed[0].id, '019e-desktop-thread');
   assert.equal(projects.some((project) => project.id === 'probe'), true);
   assert.equal(detail.entries[0].text, '桌面会话内容');
+  assert.equal(detail.source, 'desktop-official');
+  assert.equal(detail.entries[0].itemId, 'native-message');
   await assert.rejects(
     () => service.startThread({ projectId: 'probe', prompt: '不允许分叉' }),
     /严格桌面模式已禁用独立 App Server/
@@ -584,6 +589,40 @@ test('CodexThreadService falls back to desktop sessions when app-server thread l
   assert.deepEqual(listed, [desktopSession]);
   assert.equal(client.calls.some((call) => call.method === 'thread/list'), true);
 });
+
+for (const mode of ['desktop', 'app-server']) {
+  test(`CodexThreadService includes projects across model providers in ${mode} listings`, async () => {
+    const calls = [];
+    const list = async (params) => {
+      calls.push(params);
+      // Desktop builds can scope an omitted provider filter to the current
+      // provider. An explicit empty array is needed to include older providers.
+      if (!Array.isArray(params.modelProviders) || params.modelProviders.length !== 0) {
+        return { data: [{ id: 'new', cwd: 'C:\\projects\\BossAi-All', modelProvider: 'openai' }], nextCursor: null };
+      }
+      return params.cursor
+        ? { data: [{ id: 'old', cwd: 'C:\\projects\\Vibelution', modelProvider: 'openai_http' }], nextCursor: null }
+        : { data: [{ id: 'new', cwd: 'C:\\projects\\BossAi-All', modelProvider: 'openai' }], nextCursor: 'older' };
+    };
+    const client = new FakeAppServerClient();
+    client.request = async (method, params) => { assert.equal(method, 'thread/list'); return list(params); };
+    const service = new CodexThreadService({
+      allowIndependentAppServer: mode === 'app-server',
+      desktopThreadListProvider: list,
+      client,
+      projectHistoryPath: null,
+      runStatePath: null
+    });
+    const threads = await service.listThreads({ limit: 200 });
+    assert.deepEqual(threads.map((thread) => thread.id).sort(), ['new', 'old']);
+    assert.equal(calls.length, 2);
+    assert.ok(calls.every((params) => Array.isArray(params.modelProviders) && params.modelProviders.length === 0));
+    assert.equal(calls[1].cursor, 'older');
+    if (mode === 'desktop') assert.ok(calls.every((params) => params.useStateDbOnly === true));
+    const projects = await service.listProjects({ limit: 200 });
+    assert.deepEqual(projects.map((project) => project.name).sort(), ['BossAi-All', 'Vibelution']);
+  });
+}
 
 test('CodexThreadService discovers and persists projects from paginated app-server cwd values', async () => {
   const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-project-catalog-'));
@@ -1511,3 +1550,28 @@ function pathJoinTemp(child) {
 }
 
 
+
+
+for (const serviceTier of ['', 'default', 'priority']) {
+  test(`managed thread service carries speed into new thread, resume, turn, and response: ${serviceTier || 'inherit'}`, async () => {
+    const client = new FakeAppServerClient();
+    const service = new CodexThreadService({ client, projects: [{ id: 'speed', root: process.cwd() }],
+      runStatePath: null, projectHistoryPath: null });
+    try {
+      const result = await service.startThread({ projectId: 'speed', prompt: 'synthetic only', serviceTier });
+      await client.waitForRequest('turn/start');
+      assert.equal(result.run.serviceTier, serviceTier);
+      const writes = client.calls.filter(({ method }) => ['thread/start', 'thread/resume', 'turn/start'].includes(method));
+      assert.deepEqual(writes.map(({ method }) => method), ['thread/start', 'thread/resume', 'turn/start']);
+      for (const { params } of writes) {
+        assert.equal(Object.hasOwn(params, 'serviceTier'), Boolean(serviceTier));
+        if (serviceTier) assert.equal(params.serviceTier, serviceTier);
+      }
+      await service.handleNotification({ method: 'thread/settings/updated', params: {
+        threadId: 'unmatched-speed-target', threadSettings: { serviceTier: 'priority' }
+      } });
+      assert.equal(service.getThreadSettings('unmatched-speed-target').serviceTier, 'priority');
+      assert.equal(service.getThreadSettings('other'), null);
+    } finally { service.userInputBroker.stop?.(); }
+  });
+}

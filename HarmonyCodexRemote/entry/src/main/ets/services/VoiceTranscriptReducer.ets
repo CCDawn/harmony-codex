@@ -13,7 +13,8 @@ export function reduceVoiceTranscriptEntries(
   let targetIndex = -1;
 
   if (hasItemId) {
-    targetIndex = entries.findIndex((entry: VoiceTranscriptEntry) => entry.itemId === event.itemId);
+    targetIndex = entries.findIndex((entry: VoiceTranscriptEntry) => entry.itemId === event.itemId
+      && entry.role === event.role);
   } else {
     for (let index = entries.length - 1; index >= 0; index -= 1) {
       const entry = entries[index];
@@ -33,6 +34,14 @@ export function reduceVoiceTranscriptEntries(
     };
     if (event.phoneTranscript !== undefined) {
       created.phoneTranscript = event.phoneTranscript;
+    }
+    if (event.createdAt !== undefined) {
+      created.createdAt = event.createdAt;
+    } else if (event.phoneTranscript === true) {
+      created.createdAt = Date.now();
+    }
+    if (event.requestId !== undefined) {
+      created.requestId = event.requestId;
     }
     if (event.callId !== undefined) {
       created.callId = event.callId;
@@ -66,6 +75,12 @@ export function reduceVoiceTranscriptEntries(
   if (current.phoneTranscript !== undefined || event.phoneTranscript !== undefined) {
     updated.phoneTranscript = current.phoneTranscript ?? event.phoneTranscript;
   }
+  if (current.createdAt !== undefined || event.createdAt !== undefined) {
+    updated.createdAt = current.createdAt ?? event.createdAt;
+  }
+  if (current.requestId !== undefined || event.requestId !== undefined) {
+    updated.requestId = current.requestId ?? event.requestId;
+  }
   if (current.callId !== undefined || event.callId !== undefined) {
     updated.callId = current.callId ?? event.callId;
   }
@@ -92,12 +107,37 @@ export class VoiceTranscriptReducer {
       if ((entry.role !== 'user' && entry.role !== 'assistant') || entry.text.length === 0) {
         continue;
       }
-      normalized.push({
+      const normalizedEntry: VoiceTranscriptEntry = {
         itemId: entry.itemId,
         role: entry.role,
         text: entry.text,
         final: true
-      });
+      };
+      if (entry.createdAt !== undefined) {
+        normalizedEntry.createdAt = entry.createdAt;
+      }
+      if (entry.requestId !== undefined) {
+        normalizedEntry.requestId = entry.requestId;
+      }
+      if (entry.phoneTranscript !== undefined) {
+        normalizedEntry.phoneTranscript = entry.phoneTranscript;
+      }
+      if (entry.callId !== undefined) {
+        normalizedEntry.callId = entry.callId;
+      }
+      if (entry.localStorageStatus !== undefined) {
+        normalizedEntry.localStorageStatus = entry.localStorageStatus;
+      }
+      if (entry.localBridgeOrigin !== undefined) {
+        normalizedEntry.localBridgeOrigin = entry.localBridgeOrigin;
+      }
+      if (entry.localAssistantId !== undefined) {
+        normalizedEntry.localAssistantId = entry.localAssistantId;
+      }
+      if (entry.localRoomId !== undefined) {
+        normalizedEntry.localRoomId = entry.localRoomId;
+      }
+      normalized.push(normalizedEntry);
     }
     return normalized;
   }

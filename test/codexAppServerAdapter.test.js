@@ -196,3 +196,26 @@ class FakeAppServerClient extends EventEmitter {
     ready.forEach((waiter) => waiter.resolve());
   }
 }
+
+
+for (const serviceTier of ['', 'default', 'priority']) {
+  for (const existing of [false, true]) {
+    test(`App Server fallback carries speed through ${existing ? 'resume' : 'start'} and turn: ${serviceTier || 'inherit'}`, async () => {
+      const client = new FakeAppServerClient();
+      const adapter = new CodexAppServerAdapter({ client });
+      const threadId = existing ? '019e-existing-thread' : '019e-app-thread';
+      const pending = adapter.run({ task: { id: 'speed', prompt: 'synthetic only', serviceTier,
+        codexSessionId: existing ? threadId : null }, project: { root: process.cwd() }, emit() {} });
+      await client.waitForRequest('turn/start');
+      client.emit('notification', { method: 'turn/completed', params: { threadId,
+        turn: { id: 'turn-1', status: 'completed', items: [] } } });
+      await pending;
+      const writes = client.calls.filter(({ method }) => method !== 'thread/read');
+      assert.deepEqual(writes.map(({ method }) => method), [existing ? 'thread/resume' : 'thread/start', 'turn/start']);
+      for (const { params } of writes) {
+        assert.equal(Object.hasOwn(params, 'serviceTier'), Boolean(serviceTier));
+        if (serviceTier) assert.equal(params.serviceTier, serviceTier);
+      }
+    });
+  }
+}

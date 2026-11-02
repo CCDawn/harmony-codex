@@ -4,7 +4,7 @@
 authentication gate. It writes to the current official personal assistant's
 messaging room. It does not create a Codex thread or route through the ordinary
 session outbox. Existing `GET /companion/profile` and `GET /companion/messages`
-responses and pagination are unchanged.
+pagination remains unchanged; history entries may include the optional metadata below.
 
 ## Request
 
@@ -56,7 +56,11 @@ HTTP 200 returns exactly `requestId`, `state`, and `itemId`:
 
 `submitted` confirms server submission only. It does not confirm delivery to,
 reading by, a reply from, or completed work by the assistant. Reconcile the
-optimistic user entry against the existing history `itemId` before replacing it.
+optimistic user entry against official user history before replacing it. An exact
+`itemId` match confirms the entry; when the receipt was lost, a valid matching
+`requestId` plus identical original text can also confirm it. Both paths require
+an official `room:` user entry in the same profile/room partition, never a local
+voice transcript. Reads do not retry the POST.
 Optional official response `room_id` and `request_id`, when present, must match.
 A malformed or mismatched receipt, timeout, lost CDP result, HTTP 408 or HTTP 5xx
 produces `uncertain`. The bridge never converts these into a definite failure or
@@ -65,8 +69,10 @@ automatically resubmits them.
 Invalid input returns HTTP 400; changed identity or reusing a request ID with
 different content/target returns HTTP 409. A definite upstream HTTP 4xx rejection
 other than 408 remains a failed HTTP request. A discovery failure occurs before
-the official POST and returns HTTP 502. Error bodies contain only a safe generic
-message. HTTP 413 denotes a body that exceeded the local limit.
+the official POST and normally returns HTTP 502. A missing desktop API module
+or `safePost` capability is rejected before any POST with HTTP 422 and
+`failureClass: api_compatibility`. Error bodies contain only a safe generic
+message and an optional fixed failure classification. HTTP 413 denotes a body that exceeded the local limit.
 
 ## Duplicate protection and recovery boundary
 
@@ -87,3 +93,25 @@ There is no automatic or explicit resend action in this bridge operation.
 Offline tests validate the generated official API request, identity gates,
 duplicate prevention and receipt states. They do not establish live server
 submission, desktop rendering, phone rendering or assistant response behavior.
+
+
+## Optional history metadata and phone ordering
+
+`GET /companion/messages` projects optional `createdAt` (UTC epoch milliseconds)
+from a valid timezone-qualified official `created_at`, and optional lowercase
+`requestId` from a valid official UUID `request_id`. Rows without a usable original
+message ID are omitted; the adapter never constructs confirmation IDs from
+missing values. Missing metadata remains absent, not a guessed time or ID.
+
+A read-only live check on 2026-10-19 observed timezone-qualified ISO timestamps
+on all 32 sampled official rows, request IDs on 9, and timestamps on all 23
+projected text entries. This proves field availability in that sample, not that
+every historical message has a request ID or that a pending send succeeded.
+
+The phone merges official pages, local voice transcripts, and its text outbox
+into one chronological timeline. Legacy local entries without timestamps retain
+their relative order before dated entries; they are neither deleted nor marked
+as synchronized. New local voice entries preserve their first timestamp through
+streaming, persistence, status updates, and retries. Exact official confirmation
+retires the outbox entry; matching text alone never does. The bridge may also
+update its existing in-memory uncertain receipt from the same official identity.

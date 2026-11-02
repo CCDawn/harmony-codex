@@ -188,7 +188,7 @@ test('HybridCodexAdapter runs existing sessions only when desktop session is ver
   assert.equal(fallbackAdapter.runs, 0);
 });
 
-test('HybridCodexAdapter reprobes desktop live before interrupting', async () => {
+test('HybridCodexAdapter stops through the existing desktop owner without send preflight', async () => {
   const events = [];
   const desktopAdapter = {
     probes: 0,
@@ -219,13 +219,12 @@ test('HybridCodexAdapter reprobes desktop live before interrupting', async () =>
   });
 
   assert.deepEqual(result, { threadId: '019e-existing-session', turnId: 'turn-1' });
-  assert.equal(desktopAdapter.probes, 1);
+  assert.equal(desktopAdapter.probes, 0);
   assert.equal(desktopAdapter.interrupts, 1);
-  const available = events.find((event) => event.type === 'codex.desktop_live.available');
-  assert.equal(available.payload.sessionVerified, true);
+  assert.deepEqual(events, []);
 });
 
-test('HybridCodexAdapter blocks interrupt when desktop live is unavailable', async () => {
+test('HybridCodexAdapter surfaces the official interrupt transport failure without retrying', async () => {
   const events = [];
   const desktopAdapter = {
     interrupts: 0,
@@ -234,7 +233,7 @@ test('HybridCodexAdapter blocks interrupt when desktop live is unavailable', asy
     },
     async interrupt() {
       this.interrupts += 1;
-      throw new Error('should not interrupt without a live desktop');
+      throw new Error('CDP channel is gone');
     }
   };
 
@@ -247,12 +246,11 @@ test('HybridCodexAdapter blocks interrupt when desktop live is unavailable', asy
       },
       emit: (type, payload) => events.push({ type, payload })
     }),
-    /桌面实时通道未连接/
+    /CDP channel is gone/
   );
 
-  assert.equal(desktopAdapter.interrupts, 0);
-  const unavailable = events.find((event) => event.type === 'codex.desktop_live.unavailable');
-  assert.equal(unavailable.payload.reason, 'CDP channel is gone');
+  assert.equal(desktopAdapter.interrupts, 1);
+  assert.deepEqual(events, []);
 });
 
 test('HybridCodexAdapter sends through the desktop app-server when another desktop thread is visible', async () => {
@@ -388,7 +386,8 @@ test('HybridCodexAdapter uses script bridge only when CDP is unavailable and the
 
   const adapter = new HybridCodexAdapter({
     scriptDesktopAdapter,
-    cdpDesktopAdapter
+    cdpDesktopAdapter,
+    cdpLivenessProbe: async () => ({ checked: true, ok: true, port: 9229 })
   });
   const result = await adapter.run({
     task: { codexSessionId: '019e-existing-session' },
@@ -399,6 +398,66 @@ test('HybridCodexAdapter uses script bridge only when CDP is unavailable and the
   assert.equal(scriptDesktopAdapter.runs, 1);
   const available = events.find((event) => event.type === 'codex.desktop_live.available');
   assert.equal(available.payload.transport, 'script');
+});
+
+test('HybridCodexAdapter refuses the script bridge heartbeat when the CDP endpoint never answers', async () => {
+  // 2026-10-19 事故形态：live-host 仍在心跳（脚本桥 online），但半死桌面外壳
+  // 占住 9229，CDP 无真实应答——此时必须判不在线，不能让手机端继续投递。
+  const scriptDesktopAdapter = {
+    runs: 0,
+    async probe() {
+      return {};
+    },
+    async run() {
+      this.runs += 1;
+      throw new Error('script adapter must not run when CDP is unresponsive');
+    }
+  };
+  const cdpDesktopAdapter = {
+    async probe() {
+      throw new Error('请求 Codex 桌面 CDP 入口超时');
+    }
+  };
+
+  const adapter = new HybridCodexAdapter({
+    scriptDesktopAdapter,
+    cdpDesktopAdapter,
+    cdpLivenessProbe: async () => ({
+      checked: true,
+      ok: false,
+      ports: [9229],
+      reason: 'CDP 端口有监听但无真实应答（127.0.0.1:9229）'
+    })
+  });
+  const status = await adapter.getDesktopLiveStatus();
+
+  assert.equal(status.desktopLive, false);
+  assert.equal(status.status, 'unavailable');
+  assert.match(status.reason, /CDP 入口超时/);
+  assert.equal(scriptDesktopAdapter.runs, 0);
+});
+
+test('HybridCodexAdapter accepts the script bridge heartbeat when CDP liveness truly answers', async () => {
+  const scriptDesktopAdapter = {
+    async probe() {
+      return {};
+    }
+  };
+  const cdpDesktopAdapter = {
+    async probe() {
+      throw new Error('未找到 Codex 桌面窗口 CDP 入口：127.0.0.1:9229');
+    }
+  };
+
+  const adapter = new HybridCodexAdapter({
+    scriptDesktopAdapter,
+    cdpDesktopAdapter,
+    cdpLivenessProbe: async () => ({ checked: true, ok: true, port: 9229 })
+  });
+  const status = await adapter.getDesktopLiveStatus();
+
+  assert.equal(status.desktopLive, true);
+  assert.equal(status.transport, 'script');
 });
 
 test('HybridCodexAdapter accepts script bridge target verification when the current route cannot be read', async () => {
@@ -427,7 +486,8 @@ test('HybridCodexAdapter accepts script bridge target verification when the curr
 
   const adapter = new HybridCodexAdapter({
     scriptDesktopAdapter,
-    cdpDesktopAdapter
+    cdpDesktopAdapter,
+    cdpLivenessProbe: async () => ({ checked: true, ok: true, port: 9229 })
   });
   const result = await adapter.run({
     task: { codexSessionId: '019e-existing-session' },
@@ -482,7 +542,8 @@ test('HybridCodexAdapter uses CDP when it knows the target but cannot read the c
 
   const adapter = new HybridCodexAdapter({
     scriptDesktopAdapter,
-    cdpDesktopAdapter
+    cdpDesktopAdapter,
+    cdpLivenessProbe: async () => ({ checked: true, ok: true, port: 9229 })
   });
 
   const result = await adapter.run({

@@ -1,6 +1,6 @@
-import http from 'node:http';
 import {
   buildDesktopCdpWebSocketOptions,
+  getCdpTargets,
   selectCodexDesktopCdpTarget
 } from '../src/codexDesktopCdpClient.js';
 
@@ -592,7 +592,7 @@ async function waitForTarget(timeoutMs = 30000) {
   let lastError = null;
   while (Date.now() < deadline) {
     try {
-      const targets = await getCdpTargets(cdpPort);
+      const targets = await getCdpTargets(cdpPort, Math.min(5000, Math.max(1, deadline - Date.now())));
       const page = selectCodexDesktopCdpTarget(targets);
       if (page) return page;
     } catch (error) {
@@ -601,36 +601,6 @@ async function waitForTarget(timeoutMs = 30000) {
     await sleep(700);
   }
   throw lastError ?? new Error(`No Codex CDP target found on 127.0.0.1:${cdpPort}`);
-}
-
-async function getCdpTargets(port) {
-  for (const url of [`http://127.0.0.1:${port}/json`, `http://127.0.0.1:${port}/json/list`]) {
-    try {
-      const targets = await getJson(url);
-      if (Array.isArray(targets)) return targets;
-    } catch {
-      // Try the next endpoint.
-    }
-  }
-  throw new Error(`CDP target response is not available on 127.0.0.1:${port}`);
-}
-
-function getJson(url, timeoutMs = 5000) {
-  return new Promise((resolve, reject) => {
-    const request = http.get(url, (response) => {
-      let body = '';
-      response.on('data', (chunk) => { body += chunk; });
-      response.on('end', () => {
-        try {
-          resolve(JSON.parse(body));
-        } catch (error) {
-          reject(error);
-        }
-      });
-    });
-    request.setTimeout(timeoutMs, () => request.destroy(new Error(`request timed out: ${url}`)));
-    request.on('error', reject);
-  });
 }
 
 async function post(path, body, timeoutMs = 10000) {

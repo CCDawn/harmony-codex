@@ -1,0 +1,711 @@
+--- before/Index.ets
++++ after/Index.ets
+@@ -1,3 +1,5 @@
++import { PairingPanel } from '../components/PairingPanel';
++import { SettingsPanel } from '../components/SettingsPanel';
+ import { CompanionComputerPanel } from '../components/CompanionComputerPanel';
+ import { VoiceTranscriptReducer } from '../services/VoiceTranscriptReducer';
+ import { CompanionProfile } from '../model/CompanionModels';
+@@ -91,6 +93,14 @@
+ PersistentStorage.persistProp(FONT_SCALE_STORAGE_KEY, DEFAULT_FONT_SCALE_MODE);
+ PersistentStorage.persistProp(SESSION_READ_BASELINE_STORAGE_KEY, '{}');
+ 
++interface PairingComputerStatus {
++  ready?: boolean;
++  assistantId?: string;
++  roomId?: string;
++  threadId?: string;
++  environmentId?: string;
++}
++
+ interface PendingSessionImage {
+   id: string;
+   uri: string;
+@@ -232,6 +242,17 @@
+   @State message: string = '就绪';
+   @State isBusy: boolean = false;
+   @State activeTab: string = 'sessions';
++  @State pairingDraftUrl: string = '';
++  @State pairingDraftToken: string = '';
++  @State pairingChecking: boolean = false;
++  @State pairingConnectionFailed: boolean = false;
++  @State pairingMessageStatus: string = '未检测';
++  @State pairingComputerStatus: string = '未检测';
++  private pairingCheckGeneration: number = 0;
++  private homeMenuScroller: Scroller = new Scroller();
++  @State homeMenuCanScrollUp: boolean = false;
++  @State homeMenuCanScrollDown: boolean = false;
++  @StorageLink('codexRemoteBackgroundRuntimeState') backgroundRuntimeState: string = 'stopped';
+   @State logSessionId: string = `app-${Date.now()}`;
+   @State sessionSidebarCollapsed: boolean = false;
+   @State sessionSidebarUserCollapsed: boolean = false;
+@@ -461,6 +482,11 @@
+   }
+ 
+   onBackPress(): boolean {
++    if (this.homeActionMenuVisible) {
++      this.homeActionMenuVisible = false;
++      this.homeActionMenuSource = '';
++      return true;
++    }
+     if (this.companionComputerVisible) {
+       this.companionComputerVisible = false;
+       return true;
+@@ -485,6 +511,10 @@
+       this.closeDesktopMonitor('system_back');
+       return true;
+     }
++    if (this.activeTab !== 'sessions') {
++      this.closeConfigurationPage();
++      return true;
++    }
+     if (this.companionSelected) {
+       this.returnToSessionHome('companion_system_back');
+       return true;
+@@ -506,30 +536,10 @@
+ 
+   build() {
+     Stack({ alignContent: Alignment.TopStart }) {
+-      if (this.activeTab === 'sessions') {
+-        this.SessionWorkspace()
+-      } else {
+-        Scroll() {
+-          Column({ space: 12 }) {
+-            this.Header()
+-            this.SummaryStrip()
+-            this.TabBar()
+-            if (this.activeTab === 'overview') {
+-            this.ConnectionPanel()
+-            this.DashboardPanel()
+-            } else {
+-              this.TaskPanel()
+-              this.StatusPanel()
+-              this.EventPanel()
+-            }
+-          }
+-          .width('100%')
+-          .padding({ left: this.contentLeftPadding(), right: 14, top: 16, bottom: 24 })
+-        }
+-        .width('100%')
+-        .height('100%')
+-        .scrollBar(BarState.Auto)
+-        .edgeEffect(EdgeEffect.Spring)
++      // Keep the conversation mounted so navigation preserves its draft and scroll state.
++      this.SessionWorkspace()
++      if (this.activeTab !== 'sessions') {
++        this.ConfigurationWorkspace()
+       }
+ 
+       if (this.previewImageUrl.length > 0) {
+@@ -601,7 +611,7 @@
+           void this.startVoiceCallSession('permission_retry');
+         } else {
+           this.voiceCallVisible = false;
+-          this.pairingGuideVisible = true;
++          this.openConfigurationPage('pairing');
+         }
+       },
+       assistantName: this.voiceCallAssistantName,
+@@ -730,161 +740,67 @@
+   }
+ 
+   @Builder
+-  TabBar() {
+-    Row({ space: 8 }) {
+-      this.TabButton('overview', '总览')
+-      this.TabButton('sessions', '会话')
+-      this.TabButton('tasks', '任务')
+-    }
+-    .width('100%')
+-  }
+-
+-  @Builder
+-  TabButton(tab: string, label: string) {
+-    Button(label)
+-      .height(38)
+-      .layoutWeight(1)
+-      .fontSize(this.scaledFontSize(13))
+-      .fontColor(this.activeTab === tab ? this.theme().textOnAccent : this.themeColor('#17202A'))
+-      .backgroundColor(this.activeTab === tab ? this.themeColor('#1F6FEB') : this.themeColor('#FFFFFF'))
+-      .onClick(() => {
+-        this.activeTab = tab;
+-        this.log('info', 'ui.tab.changed', `tab=${tab}`);
++  ConfigurationWorkspace() {
++    if (this.activeTab === 'pairing') {
++      this.ConnectionPanel()
++    } else if (this.activeTab === 'settings') {
++      SettingsPanel({
++        darkMode: this.usesDarkTheme(), themeMode: this.themeMode,
++        fontScaleMode: this.fontScaleMode,
++        backgroundState: this.backgroundRuntimeState === 'running' ? '运行中' : '未运行',
++        voiceState: this.pairingVoiceStatus(),
++        onBack: () => this.closeConfigurationPage(),
++        onTheme: (mode: string) => this.changeThemeMode(mode),
++        onFontScale: (mode: string) => this.changeFontScaleMode(mode),
++        onAction: (action: string) => this.handleHomeAction(action, 'settings')
+       })
++    } else {
++      Column() {
++        Row({ space: 12 }) {
++          Button('返回设置').height(44).fontSize(this.scaledFontSize(14))
++            .fontColor(this.theme().textPrimary).backgroundColor(this.theme().surfaceMuted)
++            .onClick(() => this.closeConfigurationPage())
++          Text(this.activeTab === 'overview' ? '项目总览' : '任务与事件')
++            .fontSize(this.scaledFontSize(18)).fontColor(this.theme().textPrimary)
++          Blank()
++        }.width('100%').padding(16)
++        Scroll() {
++          Column({ space: 12 }) {
++            if (this.activeTab === 'overview') {
++              this.DashboardPanel()
++            } else {
++              this.TaskPanel()
++              this.StatusPanel()
++              this.EventPanel()
++            }
++          }.width('100%').padding({ left: 16, right: 16, bottom: 32 })
++        }.width('100%').layoutWeight(1).scrollBar(BarState.Auto)
++      }.width('100%').height('100%').backgroundColor(this.theme().canvas)
++    }
+   }
+ 
+   @Builder
+   ConnectionPanel() {
+-    Column({ space: 10 }) {
+-      Text('桥接地址')
+-        .fontSize(this.scaledFontSize(15))
+-        .fontWeight(FontWeight.Medium)
+-        .fontColor(this.themeColor('#17202A'))
+-
+-      TextInput({ text: this.bridgeUrl, placeholder: 'http://电脑地址:8787' })
+-        .height(44)
+-        .fontSize(this.scaledFontSize(14))
+-        .backgroundColor(this.themeColor('#FFFFFF'))
+-        .borderRadius(6)
+-        .onChange((value: string) => {
+-          this.bridgeUrl = value.trim();
+-          this.log('info', 'bridge.url.changed', `bridgeUrl=${this.bridgeUrl}`);
+-        })
+-
+-      TextInput({ text: this.bridgeToken, placeholder: '公网访问令牌（本地 USB 可留空）' })
+-        .height(44)
+-        .fontSize(this.scaledFontSize(14))
+-        .backgroundColor(this.themeColor('#FFFFFF'))
+-        .borderRadius(6)
+-        .type(InputType.Password)
+-        .onChange((value: string) => {
+-          this.bridgeToken = value.trim();
+-          this.log('info', 'bridge.token.changed', `hasToken=${this.bridgeToken.length > 0}`);
+-        })
+-
+-      Text('设备配对')
+-        .fontSize(this.scaledFontSize(15))
+-        .fontWeight(FontWeight.Medium)
+-        .fontColor(this.themeColor('#17202A'))
+-
+-      if (this.pairingGuideVisible) {
+-        Text('尚未配对：点击「扫码配对」扫描电脑端二维码，或手输配对码完成绑定')
+-          .fontSize(this.scaledFontSize(12))
+-          .fontColor(this.themeColor('#B68A00'))
+-      }
+-
+-      if (this.pairedDeviceId.length > 0) {
+-        Text(`已配对：${this.pairedDeviceName}（${this.pairedDeviceId}）`)
+-          .fontSize(this.scaledFontSize(12))
+-          .fontColor(this.themeColor('#14853D'))
+-      }
+-
+-      Row({ space: 10 }) {
+-        Button('扫码配对')
+-          .height(40)
+-          .layoutWeight(1)
+-          .enabled(!this.pairingBusy)
+-          .fontSize(this.scaledFontSize(14))
+-          .fontColor(this.themeColor('#FFFFFF'))
+-          .backgroundColor(this.themeColor('#1F6FEB'))
+-          .onClick(() => {
+-            this.log('info', 'ui.click.pairing_scan', '');
+-            void this.startScanPairing();
+-          })
+-
+-        Button('解除配对')
+-          .height(40)
+-          .layoutWeight(1)
+-          .enabled(!this.pairingBusy && this.pairedDeviceId.length > 0)
+-          .fontSize(this.scaledFontSize(14))
+-          .fontColor(this.themeColor('#FFFFFF'))
+-          .backgroundColor(this.themeColor('#8A95A3'))
+-          .onClick(() => {
+-            this.log('info', 'ui.click.pairing_unpair', `deviceId=${this.pairedDeviceId}`);
+-            void this.unpairBridgeCredential('panel');
+-          })
+-      }
+-      .width('100%')
+-
+-      TextInput({ text: $$this.pairingManualCode, placeholder: '手输配对码：XXXXX-XXXXX 或 10 位连串' })
+-        .height(44)
+-        .fontSize(this.scaledFontSize(14))
+-        .backgroundColor(this.themeColor('#FFFFFF'))
+-        .borderRadius(6)
+-        .enterKeyType(EnterKeyType.Done)
+-        .onSubmit(() => {
+-          void this.pairWithManualCode();
+-        })
+-
+-      Text(`已识别 ${this.pairingManualCode.replace(/[^0-9A-Za-z]/g, '').length}/10 位（输完可点键盘回车确认）`)
+-        .fontSize(this.scaledFontSize(11))
+-        .fontColor(this.themeColor('#68717D'))
+-
+-      Button('使用配对码配对')
+-        .height(40)
+-        .width('100%')
+-        .enabled(!this.pairingBusy)
+-        .fontSize(this.scaledFontSize(14))
+-        .fontColor(this.themeColor('#FFFFFF'))
+-        .backgroundColor(this.themeColor('#14853D'))
+-        .onClick(() => {
+-          this.log('info', 'ui.click.pairing_manual', '');
+-          void this.pairWithManualCode();
+-        })
+-
+-      if (!this.pairingScanAvailable) {
+-        Text('本机不支持系统扫码，请使用手输配对码完成配对')
+-          .fontSize(this.scaledFontSize(12))
+-          .fontColor(this.themeColor('#68717D'))
+-      }
+-
+-      if (this.pairingStatusText.length > 0) {
+-        Text(this.pairingStatusText)
+-          .fontSize(this.scaledFontSize(12))
+-          .fontColor(this.themeColor('#68717D'))
+-      }
+-
+-      Row({ space: 10 }) {
+-        Button('加载项目')
+-          .height(40)
+-          .layoutWeight(1)
+-          .enabled(!this.isBusy)
+-          .onClick(() => {
+-            this.log('info', 'ui.click.load_projects', '');
+-            void this.loadProjects();
+-          })
+-
+-        Button('刷新任务')
+-          .height(40)
+-          .layoutWeight(1)
+-          .enabled(!this.isBusy)
+-          .onClick(() => {
+-            this.log('info', 'ui.click.refresh_task', `taskId=${this.currentTask?.id ?? ''}`);
+-            void this.refreshDashboard(true);
+-          })
+-      }
+-    }
+-    .cardStyle(this.theme().surface)
++    PairingPanel({
++      darkMode: this.usesDarkTheme(), fontScaleMode: this.fontScaleMode,
++      paired: this.pairedDeviceId.length > 0,
++      deviceName: this.pairedDeviceName || '已绑定设备',
++      checking: this.pairingChecking, busy: this.pairingBusy,
++      connectionFailed: this.pairingConnectionFailed,
++      messageStatus: this.pairingMessageStatus, voiceStatus: this.pairingVoiceStatus(),
++      computerStatus: this.pairingComputerStatus, statusText: this.pairingStatusText,
++      scanAvailable: this.pairingScanAvailable,
++      draftUrl: this.pairingDraftUrl, draftToken: this.pairingDraftToken, manualCode: this.pairingManualCode,
++      onBack: () => this.closeConfigurationPage(),
++      onScan: () => { void this.startScanPairing(); },
++      onRetry: () => { void this.checkPairingConnection(); },
++      onUnpair: () => this.confirmUnpair(),
++      onSave: () => { void this.savePairingDraft(); },
++      onManualPair: () => { void this.pairWithManualCode(); },
++      onUrlChange: (value: string) => { this.pairingDraftUrl = value; },
++      onTokenChange: (value: string) => { this.pairingDraftToken = value; },
++      onCodeChange: (value: string) => { this.pairingManualCode = value; }
++    })
+   }
+ 
+   @Builder
+@@ -1438,40 +1354,31 @@
+ 
+   @Builder
+   HomeActionMenu(source: string) {
+-    Column({ space: 6 }) {
+-      this.HomeActionMenuItem('go_overview', '前往总览', '桥接连接、设备配对与运行状态', this.themeColor('#1F6FEB'), source)
+-      this.HomeActionMenuItem('go_tasks', '前往任务', '任务列表与事件动态', this.themeColor('#0E7490'), source)
+-
+-      Text('设置')
+-        .fontSize(this.scaledFontSize(10))
+-        .fontWeight(FontWeight.Medium)
+-        .fontColor(this.theme().textSecondary)
+-        .width('100%')
+-        .padding({ left: 8, top: 4, bottom: 2 })
+-
+-      this.HomeActionMenuItem('theme', '主题', `当前：${themeModeLabel(this.themeMode)}`, this.theme().accent, source)
+-      if (this.themeModeChooserVisible) {
+-        this.ThemeModeSelector()
+-      }
+-      this.HomeActionMenuItem(
+-        'font_size',
+-        '字体大小',
+-        `当前：${fontScaleLabel(this.fontScaleMode)} · ${fontScalePercent(this.fontScaleMode)}%`,
+-        this.theme().accent,
+-        source
+-      )
+-      if (this.fontScaleChooserVisible) {
+-        this.FontScaleSelector()
+-      }
+-      this.HomeActionMenuItem('desktop_monitor', '桌面监控', '常亮显示任务、未读与额度', '#5FC7FF', source)
+-      this.HomeActionMenuItem('voice_call', '熊大语音', '和熊大个人助手实时语音对话', '#5FC7FF', source)
+-      this.HomeActionMenuItem('usage', '账号用量', '读取 Codex 桌面当前可见套餐信息', this.themeColor('#1F6FEB'), source)
+-      this.HomeActionMenuItem('outbox', '发送队列', '查看、编辑、排序或取消待发送消息', this.themeColor('#7C3AED'), source)
+-      this.HomeActionMenuItem('soft_repair', '恢复链路', '检测 bridge、CDP 与无线 HDC', this.themeColor('#B68A00'), source)
+-      this.HomeActionMenuItem('hard_restart', '重启 Codex', '需要确认，会重启桌面 Codex', this.themeColor('#B42318'), source)
++    Column({ space: 0 }) {
++      if (this.homeMenuCanScrollUp) {
++        Text('向上滑动 ▴').fontSize(this.scaledFontSize(10)).fontColor(this.theme().textSecondary)
++          .height(22).width('100%').hitTestBehavior(HitTestMode.None)
++      }
++      Scroll(this.homeMenuScroller) {
++        Column({ space: 6 }) {
++          this.HomeActionMenuItem('pairing', '配对', '设备与连接状态', this.theme().accent, source)
++          this.HomeActionMenuItem('settings', '设置', '语音、外观与账号维护', this.theme().accent, source)
++          this.HomeActionMenuItem('voice_call', '熊大语音', '和个人助手实时对话', this.theme().accent, source)
++        }.width('100%').padding(8)
++      }
++      .width('100%')
++      .height(Math.min(this.homeActionMenuMaxHeight(source), 3 * Math.max(48, this.scaledFontSize(12) * 3.5) + 28))
++      .constraintSize({ maxHeight: this.homeActionMenuMaxHeight(source) })
++      .scrollBar(BarState.Auto)
++      .edgeEffect(EdgeEffect.None)
++      .onDidScroll(() => this.updateHomeMenuScrollHints())
++      .onAreaChange(() => this.updateHomeMenuScrollHints())
++      if (this.homeMenuCanScrollDown) {
++        Text('向下滑动 ▾').fontSize(this.scaledFontSize(10)).fontColor(this.theme().textSecondary)
++          .height(22).width('100%').hitTestBehavior(HitTestMode.None)
++      }
+     }
+     .width(248)
+-    .padding(8)
+     .backgroundColor(this.themeColor('#FFFFFF'))
+     .border({ width: 1, color: this.themeColor('#DDE3EA') })
+     .borderRadius(14)
+@@ -1480,73 +1387,15 @@
+     .zIndex(60)
+   }
+ 
+-  @Builder
+-  ThemeModeSelector() {
+-    Column({ space: 6 }) {
+-      Text('选择外观')
+-        .fontSize(this.scaledFontSize(10))
+-        .fontWeight(FontWeight.Medium)
+-        .fontColor(this.theme().textSecondary)
+-        .width('100%')
+-      Row({ space: 6 }) {
+-        this.ThemeModeButton('dark', '夜晚')
+-        this.ThemeModeButton('light', '浅色')
+-        this.ThemeModeButton('system', '跟随系统')
+-      }
+-      .width('100%')
+-    }
+-    .width('100%')
+-    .padding({ left: 8, right: 8, top: 2, bottom: 4 })
+-  }
+-
+-  @Builder
+-  ThemeModeButton(mode: string, label: string) {
+-    Button(label)
+-      .layoutWeight(1)
+-      .height(30)
+-      .fontSize(this.scaledFontSize(10))
+-      .fontColor(this.themeMode === mode ? this.theme().textOnAccent : this.theme().textSecondary)
+-      .backgroundColor(this.themeMode === mode ? this.theme().accent : this.theme().surfaceMuted)
+-      .border({ width: 1, color: this.themeMode === mode ? this.theme().accent : this.theme().border })
+-      .borderRadius(8)
+-      .onClick(() => {
+-        this.changeThemeMode(mode);
+-      })
+-  }
+-
+-  @Builder
+-  FontScaleSelector() {
+-    Column({ space: 6 }) {
+-      Text('整体字体大小')
+-        .fontSize(this.scaledFontSize(10))
+-        .fontWeight(FontWeight.Medium)
+-        .fontColor(this.theme().textSecondary)
+-        .width('100%')
+-      Row({ space: 6 }) {
+-        this.FontScaleButton('small', '小')
+-        this.FontScaleButton('standard', '标准')
+-        this.FontScaleButton('large', '大')
+-        this.FontScaleButton('extra_large', '特大')
+-      }
+-      .width('100%')
+-    }
+-    .width('100%')
+-    .padding({ left: 8, right: 8, top: 2, bottom: 4 })
+-  }
+-
+-  @Builder
+-  FontScaleButton(mode: string, label: string) {
+-    Button(label)
+-      .layoutWeight(1)
+-      .height(30)
+-      .fontSize(this.scaledFontSize(10))
+-      .fontColor(this.fontScaleMode === mode ? this.theme().textOnAccent : this.theme().textSecondary)
+-      .backgroundColor(this.fontScaleMode === mode ? this.theme().accent : this.theme().surfaceMuted)
+-      .border({ width: 1, color: this.fontScaleMode === mode ? this.theme().accent : this.theme().border })
+-      .borderRadius(8)
+-      .onClick(() => {
+-        this.changeFontScaleMode(mode);
+-      })
++  private homeActionMenuMaxHeight(source: string): number {
++    const height = this.sessionWindowHeightVp() || 568;
++    // Reserve the header, system safe margins, hints and keyboard area.
++    return Math.max(44, height - (source === 'sidebar_header' ? 180 : 162));
++  }
++
++  private updateHomeMenuScrollHints(): void {
++    this.homeMenuCanScrollUp = this.homeMenuScroller.currentOffset().yOffset > 1;
++    this.homeMenuCanScrollDown = !this.homeMenuScroller.isAtEnd();
+   }
+ 
+   @Builder
+@@ -1571,8 +1420,8 @@
+       .alignItems(VerticalAlign.Center)
+     }
+       .width('100%')
+-      .height(42)
+-      .padding({ left: 8, right: 8 })
++      .constraintSize({ minHeight: Math.max(48, this.scaledFontSize(12) * 3.5) })
++      .padding({ left: 8, right: 8, top: 8, bottom: 8 })
+       .backgroundColor(this.themeColor('#FFFFFF'))
+       .borderRadius(9)
+       .enabled(this.canRunHomeAction(action))
+@@ -7960,6 +7809,134 @@
+     }
+   }
+ 
++  private openConfigurationPage(page: string): void {
++    this.homeActionMenuVisible = false;
++    this.homeActionMenuSource = '';
++    this.activeTab = page;
++    if (page === 'pairing') {
++      this.pairingDraftUrl = this.bridgeUrl;
++      this.pairingDraftToken = this.bridgeToken;
++      this.pairingStatusText = '';
++      this.refreshPairingUiState();
++      void this.checkPairingConnection();
++    }
++  }
++
++  private closeConfigurationPage(): void {
++    this.pairingCheckGeneration++;
++    this.pairingChecking = false;
++    this.activeTab = this.activeTab === 'overview' || this.activeTab === 'tasks' ? 'settings' : 'sessions';
++  }
++
++  private pairingVoiceStatus(): string {
++    if (this.voiceCallStatus === 'ready' || this.voiceCallStatus === 'active') {
++      return this.voiceCallMuted ? '通话已接通，麦克风静音' : '通话已接通';
++    }
++    if (this.voiceCallStatus === 'connecting') { return '正在连接语音'; }
++    if (this.voiceCallStatus === 'error') { return '上次通话失败，请重新发起验证'; }
++    return '未检测，通话时验证';
++  }
++
++  private confirmUnpair(): void {
++    AlertDialog.show({
++      title: '解除配对', message: '解除后需要重新扫码才能连接。是否继续？',
++      primaryButton: { value: '取消', action: () => {} },
++      secondaryButton: { value: '解除配对', action: () => { void this.unpairBridgeCredential('panel'); } }
++    });
++  }
++
++  private async savePairingDraft(): Promise<void> {
++    if (this.pairingBusy || this.pairingChecking) { return; }
++    const url = BridgePairingService.normalizeBaseUrl(this.pairingDraftUrl);
++    if (!/^https?:\/\/[^\s/?#]+/i.test(url)) {
++      this.pairingStatusText = '请输入有效的 http:// 或 https:// 桥接地址';
++      return;
++    }
++    this.pairingBusy = true;
++    try {
++      const current = CredentialRuntime.getRuntimeCredential();
++      if (current !== null) {
++        const credential: BridgeCredential = {
++          deviceId: current.deviceId, deviceName: current.deviceName, bridgeUrl: url,
++          token: this.pairingDraftToken.trim(), totpSecret: current.totpSecret, pairedAt: current.pairedAt
++        };
++        if (credential.token.length === 0) {
++          this.pairingStatusText = '已配对设备的访问令牌不能为空';
++          return;
++        }
++        await BridgeCredentialStore.saveCredential(getContext(this) as common.UIAbilityContext, credential);
++        this.applyRuntimeCredential(credential, 'manual_settings');
++      } else {
++        // Legacy, unpaired configuration is only applied for this app run.
++        this.bridgeUrl = url;
++        this.bridgeToken = this.pairingDraftToken.trim();
++        this.pairingStatusText = '参数已应用到当前运行；扫码配对后可安全保存';
++      }
++    } catch (_) {
++      this.pairingStatusText = '保存连接参数失败，当前连接未更改';
++      return;
++    } finally {
++      this.pairingBusy = false;
++    }
++    await this.checkPairingConnection();
++  }
++
++  private async checkPairingConnection(): Promise<void> {
++    if (this.pairingBusy || this.pairingChecking) { return; }
++    const generation = ++this.pairingCheckGeneration;
++    const url = this.normalizedBridgeUrl();
++    const token = this.bridgeToken;
++    this.pairingChecking = true;
++    this.pairingConnectionFailed = false;
++    this.pairingMessageStatus = '正在检测…';
++    this.pairingComputerStatus = '正在检测…';
++    try {
++      const profile = await BridgeClient.getCompanionProfile(url, token);
++      if (generation !== this.pairingCheckGeneration) { return; }
++      await Promise.all([
++        this.checkPairingMessages(url, token, profile, generation),
++        this.checkPairingComputer(url, token, profile, generation)
++      ]);
++    } catch (_) {
++      if (generation === this.pairingCheckGeneration) {
++        this.pairingConnectionFailed = true;
++        this.pairingMessageStatus = '连接失败，无法读取个人助手';
++        this.pairingComputerStatus = '未检测，个人助手连接失败';
++      }
++    } finally {
++      if (generation === this.pairingCheckGeneration) { this.pairingChecking = false; }
++    }
++  }
++
++  private async checkPairingMessages(url: string, token: string, profile: CompanionProfile, generation: number): Promise<void> {
++    try {
++      await BridgeClient.getCompanionMessages(url, profile.id, profile.roomId, token);
++      if (generation === this.pairingCheckGeneration) { this.pairingMessageStatus = '消息读取正常，发送结果以会话为准'; }
++    } catch (_) {
++      if (generation === this.pairingCheckGeneration) {
++        this.pairingMessageStatus = '消息读取失败';
++        this.pairingConnectionFailed = true;
++      }
++    }
++  }
++
++  private async checkPairingComputer(url: string, token: string, profile: CompanionProfile, generation: number): Promise<void> {
++    try {
++      const raw = await BridgeClient.getCompanionComputerStatus(url, profile.id, profile.roomId, token);
++      const status = JSON.parse(raw) as PairingComputerStatus;
++      if (generation !== this.pairingCheckGeneration) { return; }
++      this.pairingComputerStatus = status.ready === true
++        && status.assistantId === profile.id && status.roomId === profile.roomId
++        && !!status.threadId && !!status.environmentId
++        ? '云环境已就绪，画面与操作需进入后验证' : '云环境尚未就绪';
++    } catch (_) {
++      if (generation === this.pairingCheckGeneration) {
++        this.pairingComputerStatus = '云电脑状态读取失败';
++        this.pairingConnectionFailed = true;
++      }
++    }
++  }
++
+   private async initializeBridgeCredential(): Promise<void> {
+     this.pairingScanAvailable = this.detectScanPairingSupport();
+     try {
+@@ -7981,6 +7958,8 @@
+     CredentialRuntime.setRuntimeCredential(credential);
+     this.bridgeUrl = credential.bridgeUrl;
+     this.bridgeToken = credential.token;
++    this.pairingDraftUrl = credential.bridgeUrl;
++    this.pairingDraftToken = this.bridgeToken;
+     void this.refreshBridgeOtp();
+     this.log('info', 'pairing.credential.applied',
+       `source=${source}; deviceId=${credential.deviceId}; host=${this.safeBridgeHost(credential.bridgeUrl)}`);
+@@ -8027,6 +8006,7 @@
+       this.log('warn', 'pairing.scan.failed', `message=${this.errorText(error as Error)}`);
+     } finally {
+       this.pairingBusy = false;
++      if (this.activeTab === 'pairing') { void this.checkPairingConnection(); }
+     }
+   }
+ 
+@@ -8053,6 +8033,7 @@
+       this.applyRuntimeCredential(credential, `enroll_${source}`);
+       this.pairingManualCode = '';
+       this.pairingGuideVisible = false;
++      this.refreshPairingUiState();
+       this.log('info', 'pairing.enroll.success',
+         `source=${source}; deviceId=${credential.deviceId}; host=${this.safeBridgeHost(credential.bridgeUrl)}`);
+       try {
+@@ -8061,7 +8042,7 @@
+         this.log('info', 'pairing.verify.passed', `deviceId=${credential.deviceId}`);
+       } catch (verifyError) {
+         this.pairingStatusText =
+-          `配对成功：${credential.deviceName}（${credential.deviceId}），暂时未连通电脑端，可稍后在总览页重试`;
++          `配对成功：${credential.deviceName}（${credential.deviceId}），暂时未连通电脑端，可在配对页重试`;
+         this.log('warn', 'pairing.verify.failed', `message=${this.errorText(verifyError as Error)}`);
+       }
+     } catch (error) {
+@@ -8081,7 +8062,7 @@
+       this.pairingStatusText = '请输入 10 位配对码（XXXXX-XXXXX 或连续 10 位字母数字）';
+       return;
+     }
+-    const bridgeUrl = BridgePairingService.normalizeBaseUrl(this.bridgeUrl);
++    const bridgeUrl = BridgePairingService.normalizeBaseUrl(this.pairingDraftUrl);
+     if (bridgeUrl.length === 0) {
+       this.pairingStatusText = '请先在上方填写电脑端桥接地址（http:// 或 https://）';
+       return;
+@@ -8091,6 +8072,7 @@
+       await this.enrollPairing(bridgeUrl, pairingCode, 'manual');
+     } finally {
+       this.pairingBusy = false;
++      if (this.activeTab === 'pairing') { void this.checkPairingConnection(); }
+     }
+   }
+ 
+@@ -8098,6 +8080,8 @@
+     if (this.pairingBusy) {
+       return;
+     }
++    this.pairingCheckGeneration++;
++    this.pairingChecking = false;
+     this.pairingBusy = true;
+     try {
+       const context = getContext(this) as common.UIAbilityContext;
+@@ -8113,6 +8097,11 @@
+     this.pairedDeviceId = '';
+     this.pairingManualCode = '';
+     this.pairingStatusText = '已解除配对';
++    this.pairingDraftUrl = this.bridgeUrl;
++    this.pairingDraftToken = this.bridgeToken;
++    this.pairingMessageStatus = '未检测';
++    this.pairingComputerStatus = '未检测';
++    this.pairingConnectionFailed = false;
+     this.pairingGuideVisible = DEFAULT_BRIDGE_TOKEN.trim().length === 0;
+     void this.refreshBridgeOtp();
+     this.log('info', 'pairing.credential.cleared', `source=${source}`);
+@@ -8645,7 +8634,7 @@
+   }
+ 
+   private handleHomeAction(action: string, source: string): void {
+-    if (this.shouldIgnoreHomeActionMenuAction(action, source)) {
++    if (!this.canRunHomeAction(action) || (source !== 'settings' && this.shouldIgnoreHomeActionMenuAction(action, source))) {
+       return;
+     }
+     if (action === 'theme') {
+@@ -8666,6 +8655,10 @@
+     this.themeModeChooserVisible = false;
+     this.fontScaleChooserVisible = false;
+     this.log('info', 'ui.home_action_menu.action', `action=${action}; source=${source}`);
++    if (action === 'pairing' || action === 'settings') {
++      this.openConfigurationPage(action);
++      return;
++    }
+     if (action === 'go_overview') {
+       this.activeTab = 'overview';
+       return;

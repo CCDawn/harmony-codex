@@ -1,0 +1,8 @@
+usage: help [-ahu] [COMMAND]
+
+-a	All commands
+-u	Usage only
+-h	HTML output
+
+Show usage information for toybox commands.
+Run "toybox" with no arguments for a list of available commands.

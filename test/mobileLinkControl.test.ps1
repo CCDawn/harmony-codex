@@ -1,5 +1,9 @@
 ﻿$ErrorActionPreference='Stop'
 Set-StrictMode -Version Latest
+# The controller pins UTF-8 output and ConvertTo-Json leaves native text
+# unescaped; decoding child stdout with the OEM code page mangles the Chinese
+# diagnostics JSON. Same reader the hidden-status block below already uses.
+[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
 $repo=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 . (Join-Path $repo 'tools\windows\mobile-link-lifecycle.ps1')
 $root=Join-Path ([IO.Path]::GetTempPath()) ('mobile-link-control-test-'+[guid]::NewGuid().ToString('N'))
@@ -14,7 +18,7 @@ function Control([string]$Action) {
 }
 try {
   foreach($dir in @('tools\windows','tools\harmony','scripts','src','HarmonyCodexRemote\entry\src\main\ets\config')) { New-Item -ItemType Directory -Force -Path (Join-Path $root $dir)|Out-Null }
-  foreach($file in @('mobile-link-control.ps1','mobile-link-lifecycle.ps1','mobile-voice-tunnel.ps1','mobile-link-diagnostics.mjs')) { Copy-Item -LiteralPath (Join-Path $repo ('tools\windows\'+$file)) -Destination (Join-Path $root ('tools\windows\'+$file)) }
+  foreach($file in @('mobile-link-control.ps1','mobile-link-operation.ps1','mobile-link-lifecycle.ps1','mobile-voice-tunnel.ps1','mobile-link-diagnostics.mjs')) { Copy-Item -LiteralPath (Join-Path $repo ('tools\windows\'+$file)) -Destination (Join-Path $root ('tools\windows\'+$file)) }
   Copy-Item -LiteralPath (Join-Path $repo 'src\totp.js') -Destination (Join-Path $root 'src\totp.js')
   @'
 export const DEFAULT_BRIDGE_TOKEN: string = 'isolated-master-token';
@@ -104,7 +108,9 @@ while($true) { $gate=Enter-MobileLinkCycle $root; if($null -ne $gate) { try { [I
   Assert ($soft.desktopRecovery.state -eq 'recovered' -and $soft.desktopLive) 'A recoverable desktop connection must use soft recovery'
   $request=Get-Content -Raw -LiteralPath (Join-Path $root 'recovery-called.txt') | ConvertFrom-Json
   Assert ($request.mode -eq 'soft') 'Safe recovery must never request hard mode'
-  Assert ($soft.diagnostics.severity -eq 'unverified') 'Read checks must not claim end-to-end voice verification'
+  $voiceCheck=@($soft.diagnostics.checks | Where-Object id -eq 'voice')
+  Assert ($voiceCheck.Count -eq 1 -and $voiceCheck[0].state -eq 'unverified') 'Read checks must not claim end-to-end voice verification'
+  Assert (@($soft.diagnostics.checks | Where-Object {$_.id -eq 'public' -and $_.state -eq 'error'}).Count -eq 1) 'A passing local desktop read must retain the failed public-route result'
   $pair=Control Pair
   Assert ($controlExit -eq 0 -and (Test-Path $pair.pairingFile)) 'Pairing display was not created'
   $html=Get-Content -Raw $pair.pairingFile

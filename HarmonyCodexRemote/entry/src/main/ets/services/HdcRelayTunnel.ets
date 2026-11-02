@@ -40,6 +40,8 @@ export class HdcRelayTunnel {
   private readonly onMetric: HdcRelayMetricCallback;
   private relayToHdcdBytes: number = 0;
   private hdcdToRelayBytes: number = 0;
+  private finishRelayConnection: (() => void) | null = null;
+  private sleepTimers: Map<number, () => void> = new Map<number, () => void>();
 
   constructor(onStatus: HdcRelayStatusCallback, onMetric: HdcRelayMetricCallback = () => {}) {
     this.onStatus = onStatus;
@@ -101,65 +103,81 @@ export class HdcRelayTunnel {
     this.onStatus('连接中', `连接 Relay ${config.relayHost}:${config.relayPort}`);
     const relay = socket.constructTCPSocketInstance();
     this.relaySocket = relay;
-    relay.on('message', (info: socket.SocketMessageInfo) => {
-      void this.handleRelayMessage(config, info.message, generation);
+    // Register completion before connect/send: either operation can emit close first.
+    const closed = new Promise<void>((resolve) => {
+      this.finishRelayConnection = resolve;
+      relay.on('close', () => {
+        resolve();
+        if (this.isCurrentRelay(relay, generation)) {
+          this.onStatus('重连中', 'Relay 连接已关闭');
+          this.closeSockets();
+        }
+      });
     });
-    relay.on('close', () => {
-      if (this.running && this.generation === generation) {
-        this.onStatus('重连中', 'Relay 连接已关闭');
-      }
+    relay.on('message', (info: socket.SocketMessageInfo) => {
+      void this.handleRelayMessage(config, info.message, relay, generation);
     });
     relay.on('error', (error: Error) => {
-      if (this.running && this.generation === generation) {
+      if (this.isCurrentRelay(relay, generation)) {
         this.onStatus('错误', `Relay 错误：${this.errorText(error)}`);
         this.closeSockets();
       }
     });
 
     try {
-      await relay.connect({
+      await Promise.race([relay.connect({
         address: {
           address: config.relayHost,
           port: config.relayPort,
           family: 1
         },
         timeout: 8000
-      });
-      await relay.send({
+      }), closed]);
+      if (!this.isCurrentRelay(relay, generation)) {
+        return;
+      }
+      await Promise.race([relay.send({
         data: JSON.stringify({
           role: 'phone',
           deviceId: config.deviceId,
           token: config.token
         }) + '\n',
         encoding: 'utf-8'
-      });
+      }), closed]);
     } catch (error) {
+      if (!this.isCurrentRelay(relay, generation)) {
+        return;
+      }
+      this.closeSockets();
       throw new Error(`连接 Relay 失败：${this.errorText(error)}`);
+    }
+    if (!this.isCurrentRelay(relay, generation)) {
+      return;
     }
     this.onStatus('等待电脑', '已连接 Relay，等待本地电脑接入');
 
-    await new Promise<void>((resolve) => {
-      relay.on('close', () => resolve());
-    });
+    await closed;
   }
 
-  private async handleRelayMessage(config: HdcRelayConfig, data: ArrayBuffer, generation: number): Promise<void> {
-    if (!this.running || this.generation !== generation) {
+  private async handleRelayMessage(config: HdcRelayConfig, data: ArrayBuffer,
+    relay: socket.TCPSocket, generation: number): Promise<void> {
+    if (!this.isCurrentRelay(relay, generation)) {
       return;
     }
     try {
-      await this.handleRelayMessageInner(config, data, generation);
+      await this.handleRelayMessageInner(config, data, relay, generation);
     } catch (error) {
-      if (this.running && this.generation === generation) {
+      if (this.isCurrentRelay(relay, generation)) {
         this.onStatus('错误', this.errorText(error));
         this.closeSockets();
       }
     }
   }
 
-  private async handleRelayMessageInner(config: HdcRelayConfig, data: ArrayBuffer, generation: number): Promise<void> {
+  private async handleRelayMessageInner(config: HdcRelayConfig, data: ArrayBuffer,
+    relay: socket.TCPSocket, generation: number): Promise<void> {
     if (this.paired) {
-      await this.sendToHdcd(data);
+      await this.sendToHdcd(data, relay, generation);
       return;
     }
     if (this.pairing) {
@@ -195,35 +213,38 @@ export class HdcRelayTunnel {
 
     this.onStatus('已配对', `通道 ${hello.channelId ?? ''}`);
     this.pairing = true;
-    await this.connectHdcd(config, generation);
+    await this.connectHdcd(config, relay, generation);
+    if (!this.isCurrentRelay(relay, generation)) {
+      return;
+    }
     this.paired = true;
     this.pairing = false;
     this.onStatus('转发中', '电脑 HDC 已接入，正在转发 hdcd 字节流');
     if (rest.byteLength > 0) {
-      await this.sendToHdcd(rest);
+      await this.sendToHdcd(rest, relay, generation);
     }
-    await this.flushPendingHdcdBytes();
+    await this.flushPendingHdcdBytes(relay, generation);
   }
 
-  private async connectHdcd(config: HdcRelayConfig, generation: number): Promise<void> {
+  private async connectHdcd(config: HdcRelayConfig, relay: socket.TCPSocket, generation: number): Promise<void> {
     const hdcd = socket.constructTCPSocketInstance();
     this.hdcdSocket = hdcd;
     hdcd.on('message', (info: socket.SocketMessageInfo) => {
-      if (this.running && this.generation === generation) {
-        void this.sendToRelay(info.message);
+      if (this.isCurrentHdcd(hdcd, relay, generation)) {
+        void this.sendToRelay(info.message, hdcd, relay, generation);
       }
     });
     hdcd.on('close', () => {
-      if (this.running && this.generation === generation) {
+      if (this.isCurrentHdcd(hdcd, relay, generation)) {
         this.onStatus('重连中', '本机 hdcd 连接已关闭');
-        this.relaySocket?.close();
+        this.closeSockets();
       }
     });
     hdcd.on('error', (error: Error) => {
       if (this.isConnectInProgress(error)) {
         return;
       }
-      if (this.running && this.generation === generation) {
+      if (this.isCurrentHdcd(hdcd, relay, generation)) {
         this.onStatus('错误', `hdcd 错误：${this.errorText(error)}`);
         this.closeSockets();
       }
@@ -238,6 +259,9 @@ export class HdcRelayTunnel {
         timeout: 5000
       });
     } catch (error) {
+      if (!this.isCurrentHdcd(hdcd, relay, generation)) {
+        return;
+      }
       if (this.isConnectInProgress(error)) {
         await this.waitForSocketConnected(hdcd, generation, 5000);
         return;
@@ -254,10 +278,13 @@ export class HdcRelayTunnel {
       }
       try {
         const state = await hdcd.getState();
-        if (state.isConnected) {
+        if (state.isConnected && this.running && this.generation === generation && this.hdcdSocket === hdcd) {
           return;
         }
       } catch (_) {
+      }
+      if (!this.running || this.generation !== generation || this.hdcdSocket !== hdcd) {
+        throw new Error('本机 hdcd 连接已取消');
       }
       await this.sleep(50);
     }
@@ -275,57 +302,100 @@ export class HdcRelayTunnel {
     return detail.includes(`${this.CONNECT_IN_PROGRESS_CODE}`) || detail.includes('Operation in progress');
   }
 
-  private async sendToRelay(data: ArrayBuffer): Promise<void> {
+  private isCurrentRelay(relay: socket.TCPSocket, generation: number): boolean {
+    return this.running && this.generation === generation && this.relaySocket === relay;
+  }
+
+  private isCurrentHdcd(hdcd: socket.TCPSocket, relay: socket.TCPSocket, generation: number): boolean {
+    return this.isCurrentRelay(relay, generation) && this.hdcdSocket === hdcd;
+  }
+
+  private async sendToRelay(data: ArrayBuffer, hdcd: socket.TCPSocket,
+    relay: socket.TCPSocket, generation: number): Promise<void> {
+    if (!this.isCurrentHdcd(hdcd, relay, generation)) {
+      return;
+    }
     try {
-      if (this.relaySocket) {
-        await this.relaySocket.send({ data });
+      await relay.send({ data });
+      if (this.isCurrentHdcd(hdcd, relay, generation)) {
         this.hdcdToRelayBytes += data.byteLength;
         this.emitMetric();
       }
     } catch (error) {
-      this.onStatus('错误', `发送到 Relay 失败：${this.errorText(error)}`);
-      this.closeSockets();
+      if (this.isCurrentHdcd(hdcd, relay, generation)) {
+        this.onStatus('错误', `发送到 Relay 失败：${this.errorText(error)}`);
+        this.closeSockets();
+      }
     }
   }
 
-  private async sendToHdcd(data: ArrayBuffer): Promise<void> {
+  private async sendToHdcd(data: ArrayBuffer, relay: socket.TCPSocket, generation: number): Promise<void> {
+    const hdcd = this.hdcdSocket;
+    if (!hdcd || !this.isCurrentHdcd(hdcd, relay, generation)) {
+      return;
+    }
     try {
-      if (this.hdcdSocket) {
-        await this.hdcdSocket.send({ data });
+      await hdcd.send({ data });
+      if (this.isCurrentHdcd(hdcd, relay, generation)) {
         this.relayToHdcdBytes += data.byteLength;
         this.emitMetric();
       }
     } catch (error) {
-      this.onStatus('错误', `发送到 hdcd 失败：${this.errorText(error)}`);
-      this.closeSockets();
+      if (this.isCurrentHdcd(hdcd, relay, generation)) {
+        this.onStatus('错误', `发送到 hdcd 失败：${this.errorText(error)}`);
+        this.closeSockets();
+      }
     }
   }
 
-  private async flushPendingHdcdBytes(): Promise<void> {
+  private async flushPendingHdcdBytes(relay: socket.TCPSocket, generation: number): Promise<void> {
+    if (!this.isCurrentRelay(relay, generation)) {
+      return;
+    }
     const pending = this.pendingHdcdBytes;
     this.pendingHdcdBytes = [];
     for (let index = 0; index < pending.length; index += 1) {
-      await this.sendToHdcd(pending[index]);
+      await this.sendToHdcd(pending[index], relay, generation);
     }
   }
 
   private closeSockets(): void {
-    this.pairing = false;
-    this.pendingHdcdBytes = [];
-    try {
-      this.relaySocket?.close();
-    } catch (_) {
-    }
-    try {
-      this.hdcdSocket?.close();
-    } catch (_) {
-    }
+    // Detach first so synchronous or delayed close callbacks cannot own another connection.
+    const relay = this.relaySocket;
+    const hdcd = this.hdcdSocket;
+    const finish = this.finishRelayConnection;
     this.relaySocket = null;
     this.hdcdSocket = null;
+    this.finishRelayConnection = null;
+    this.paired = false;
+    this.pairing = false;
+    this.pendingHdcdBytes = [];
+    this.sleepTimers.forEach((resolve: () => void, timer: number) => {
+      clearTimeout(timer);
+      resolve();
+    });
+    this.sleepTimers.clear();
+    if (finish) {
+      finish();
+    }
+    try {
+      relay?.close();
+    } catch (_) {
+    }
+    try {
+      hdcd?.close();
+    } catch (_) {
+    }
   }
 
   private sleep(ms: number): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, ms));
+    return new Promise<void>((resolve) => {
+      const timer = setTimeout(() => {
+        this.sleepTimers.delete(timer);
+        resolve();
+      }, ms);
+      this.sleepTimers.set(timer, resolve);
+    });
   }
 
   private emitMetric(): void {

@@ -1,4 +1,6 @@
+import { serviceTierParams } from './sessionSettingsStore.js';
 import { CodexAppServerClient } from './codexAppServerClient.js';
+import { extractLocalImageInputs } from './codexTurnInput.js';
 import {
   buildSessionSnapshot,
   extractChangedFiles,
@@ -62,10 +64,11 @@ export class CodexAppServerAdapter {
           type: 'text',
           text: task.prompt,
           text_elements: []
-        }],
+        }, ...extractLocalImageInputs(task.prompt)],
         approvalPolicy: this.approvalPolicy,
         model: this.taskModel(task),
-        effort: normalizeReasoningEffort(task.reasoningEffort)
+        effort: normalizeReasoningEffort(task.reasoningEffort),
+        ...serviceTierParams(task.serviceTier)
       });
 
       emit('codex.app_server.turn.started', sanitize(turnResponse));
@@ -121,6 +124,7 @@ export class CodexAppServerAdapter {
       approvalPolicy: this.approvalPolicy,
       sandbox: this.sandbox,
       model: this.taskModel(task),
+      ...serviceTierParams(task.serviceTier),
       threadSource: 'user'
     });
     emit('codex.app_server.thread.started', summarizeThreadForEvent(response));
@@ -133,7 +137,8 @@ export class CodexAppServerAdapter {
       cwd: null,
       approvalPolicy: this.approvalPolicy,
       sandbox: this.sandbox,
-      model: this.taskModel(task)
+      model: this.taskModel(task),
+      ...serviceTierParams(task.serviceTier)
     });
     emit('codex.app_server.thread.resumed', summarizeThreadForEvent(response));
     return response.thread;

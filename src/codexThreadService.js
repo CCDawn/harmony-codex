@@ -10,8 +10,9 @@ import { isLiveActivityEntry } from './codexLiveActivity.js';
 import { classifyCodexClientNotice, createCodexClientNoticeEntry } from './codexClientNotices.js';
 import { CodexProjectCatalog } from './codexProjectCatalog.js';
 import { extractLocalImageInputs } from './codexTurnInput.js';
-import { normalizeModelId } from './sessionSettingsStore.js';
+import { normalizeModelId, normalizeServiceTier, serviceTierParams } from './sessionSettingsStore.js';
 import { SessionRuntimeSnapshotTracker } from './sessionRuntimeSnapshot.js';
+import { mergeRecentSessionProjection } from './recentSessionProjection.js';
 import { isSameOrChildPath, resolveSafeProjectRoot } from './workspaceGuard.js';
 
 const VALID_THREAD_ID = /^[A-Za-z0-9_-]+$/;
@@ -30,6 +31,8 @@ export class CodexThreadService {
     this.desktopOpener = options.desktopOpener ?? null;
     this.runtimeStateProvider = options.runtimeStateProvider ?? null;
     this.desktopThreadListProvider = options.desktopThreadListProvider ?? null;
+    this.desktopThreadRequest = options.desktopThreadRequest ?? null;
+    this.desktopSessionProjectionProvider = options.desktopSessionProjectionProvider ?? null;
     this.archiveThreadProvider = options.archiveThreadProvider ?? null;
     this.autoOpenDesktop = options.autoOpenDesktop ?? process.env.CODEX_BRIDGE_AUTO_OPEN_DESKTOP === '1';
     this.model = options.model ?? process.env.CODEX_BRIDGE_MODEL ?? '';
@@ -46,6 +49,7 @@ export class CodexThreadService {
     this.newThreadRunsBySubmissionId = new Map();
     this.newThreadSubmissionPromises = new Map();
     this.liveSessions = new Map();
+    this.threadSettings = new Map();
     this.activeRunsByTurnId = new Map();
     this.activeRunsByThreadId = new Map();
     this.runtimeSnapshotTracker = new SessionRuntimeSnapshotTracker({
@@ -213,6 +217,9 @@ export class CodexThreadService {
     do {
       const params = {
         archived: false,
+        // Omission can scope desktop builds to the current provider, hiding
+        // existing projects after a provider change. [] explicitly lists all.
+        modelProviders: [],
         limit: pageSize,
         searchTerm: query || null,
         sortKey: 'updated_at',
@@ -298,6 +305,10 @@ export class CodexThreadService {
 
   async getThread(threadId, { tail = 120 } = {}) {
     assertThreadId(threadId);
+    if (!this.allowIndependentAppServer) {
+      if (typeof this.desktopThreadRequest !== 'function') throw officialHistoryUnavailable();
+      return this.readOfficialDesktopHistory(threadId, { limit: tail });
+    }
     const local = await this.readLocalThread(threadId, { tail });
     if (local) {
       const merged = mergeLocalThreadWithLiveState(local, this.liveSessions.get(threadId));
@@ -324,6 +335,10 @@ export class CodexThreadService {
 
   async syncThread(threadId, { limit = 80, after = '', before = '' } = {}) {
     assertThreadId(threadId);
+    if (!this.allowIndependentAppServer) {
+      if (typeof this.desktopThreadRequest !== 'function') throw officialHistoryUnavailable();
+      return this.readOfficialDesktopHistory(threadId, { limit, after, before });
+    }
     const local = await this.readLocalThreadSync(threadId, { limit, after, before });
     if (local) {
       const merged = mergeLocalThreadWithLiveState(local, this.liveSessions.get(threadId));
@@ -349,6 +364,75 @@ export class CodexThreadService {
         entryCount: fallback.entries?.length ?? 0
       }
     };
+  }
+
+  async readOfficialDesktopHistory(threadId, { limit = 80, after = '', before = '' } = {}) {
+    if (after && before) throw officialHistoryCursorError('Cannot combine history cursors', 400);
+    const mode = after ? 'after' : before ? 'before' : 'recent';
+    const direction = mode === 'after' ? 'asc' : 'desc';
+    const supplied = after || before;
+    const cursor = supplied ? decodeOfficialHistoryCursor(supplied, threadId, direction) : null;
+    const request = this.desktopThreadRequest;
+    const [detail, page, projection] = await Promise.all([
+      request('thread/read', { threadId, includeTurns: false }),
+      request('thread/turns/list', { threadId, limit: Math.max(1, Math.min(10, clampLimit(limit, 200))),
+        itemsView: 'full', sortDirection: direction, ...(cursor ? { cursor } : {}) }),
+      mode === 'recent' && typeof this.desktopSessionProjectionProvider === 'function'
+        ? this.readDesktopSessionProjection(threadId) : null
+    ]);
+    if (!detail?.thread || detail.thread.id !== threadId || !Array.isArray(page?.data)
+      || page.data.some(turn => !turn || typeof turn.id !== 'string' || !turn.id || !Array.isArray(turn.items)
+        || (turn.itemsView != null && turn.itemsView !== 'full')
+        || turn.items.some(item => !item || typeof item.id !== 'string' || !item.id))) {
+      throw new Error('Codex 官方历史响应无效');
+    }
+    let turns = direction === 'desc' ? [...page.data].reverse() : [...page.data];
+    if (projection) {
+      let merged;
+      try { merged = mergeRecentSessionProjection(threadId, turns, projection); }
+      catch { merged = { turns, diagnostic: 'projection_invalid' }; }
+      turns = merged.turns;
+      if (merged.diagnostic) this.addServiceEvent('codex.desktop_session_projection.fallback', {
+        threadId, reason: merged.diagnostic
+      });
+    }
+    const thread = { ...detail.thread, turns };
+    const session = buildSessionSnapshot(thread, { threadId, mobileImagesDir: this.sessions?.mobileImagesDir });
+    const statusType = typeof thread.status === 'string' ? thread.status : thread.status?.type;
+    const status = statusType === 'active' ? 'running'
+      : mode !== 'before' ? (runtimeStateFromDesktopThread(thread) || 'idle') : 'idle';
+    const updatedAt = session.updatedAt;
+    const nextBefore = direction === 'desc' && typeof page.nextCursor === 'string' && page.nextCursor
+      ? encodeOfficialHistoryCursor(threadId, 'desc', page.nextCursor) : '';
+    const nextAfter = direction === 'asc'
+      ? (typeof page.nextCursor === 'string' && page.nextCursor
+        ? encodeOfficialHistoryCursor(threadId, 'asc', page.nextCursor) : String(after))
+      : (mode === 'recent' && typeof page.backwardsCursor === 'string' && page.backwardsCursor
+        ? encodeOfficialHistoryCursor(threadId, 'asc', page.backwardsCursor) : '');
+    return { ...session, source: 'desktop-official', activitySource: 'desktop-thread-read', activityStatus: status,
+      activityUpdatedAt: updatedAt, runtimeSource: 'desktop-thread-read', runtimeState: status, runtimeUpdatedAt: updatedAt,
+      canInterrupt: status === 'running', terminalReason: terminalReasonForStatus(status) || '',
+      sync: { mode, source: 'desktop-official', filePath: session.filePath ?? '', fileSize: 0,
+        fileUpdatedAt: updatedAt, cursorStart: nextBefore, cursorEnd: nextAfter,
+        hasMoreBefore: Boolean(nextBefore), hasMoreAfter: direction === 'asc' && Boolean(page.nextCursor),
+        // Completion evidence comes from a validated full official page or a
+        // complete, bounded canonical turn mapped above. Thread activity and
+        // unsupported/over-limit native candidates cannot add completed IDs.
+        completedTurnIds: turns.filter(turn => ['completed', 'interrupted', 'failed'].includes(turn.status)).map(turn => turn.id),
+        entryCount: session.entries.length } };
+  }
+
+  async readDesktopSessionProjection(threadId) {
+    let timer;
+    try {
+      return await Promise.race([
+        Promise.resolve().then(() => this.desktopSessionProjectionProvider(threadId)),
+        new Promise((_, reject) => { timer = setTimeout(() => reject(Object.assign(new Error(), { code: 'projection_timeout' })), 500); })
+      ]);
+    } catch (error) {
+      return { threadId, source: 'mounted-canonical', turns: [],
+        diagnostic: error?.code === 'projection_timeout' ? 'projection_timeout' : 'projection_unavailable' };
+    } finally { clearTimeout(timer); }
   }
 
   async deleteThread(threadId) {
@@ -541,7 +625,7 @@ export class CodexThreadService {
     }
   }
 
-  async startThread({ projectId = '', cwd = '', prompt = '', model = '', reasoningEffort = '', submissionId = '' } = {}) {
+  async startThread({ projectId = '', cwd = '', prompt = '', model = '', reasoningEffort = '', serviceTier = '', submissionId = '' } = {}) {
     this.assertIndependentAppServerEnabled('通过独立 App Server 新建会话');
     await this.projectCatalog.initialize();
     const project = this.resolveProject(projectId, cwd);
@@ -578,6 +662,7 @@ export class CodexThreadService {
         approvalPolicy: this.approvalPolicy,
         sandbox: appServerSandboxFromMode(this.sandbox),
         model: this.optionalModel(model),
+        ...serviceTierParams(serviceTier),
         serviceName: 'codex_harmony_remote',
         threadSource: 'user'
       });
@@ -597,6 +682,7 @@ export class CodexThreadService {
         createdThreadId: thread.id,
         model,
         reasoningEffort,
+        serviceTier,
         submissionId: normalizedSubmissionId
       });
       if (newThreadSubmissionKey) {
@@ -623,6 +709,7 @@ export class CodexThreadService {
     createdThreadId = null,
     model = '',
     reasoningEffort = '',
+    serviceTier = '',
     submissionId = '',
     deliveryMode = 'app_server'
   }) {
@@ -665,6 +752,7 @@ export class CodexThreadService {
       createdThreadId,
       model,
       reasoningEffort,
+      serviceTier,
       submissionId: normalizedSubmissionId,
       deliveryMode
     });
@@ -1089,7 +1177,7 @@ export class CodexThreadService {
     return isTerminalActivityStatus(run.status);
   }
 
-  createRun({ threadId, prompt, projectId, createdThreadId, model, reasoningEffort, submissionId = '', deliveryMode = 'app_server' }) {
+  createRun({ threadId, prompt, projectId, createdThreadId, model, reasoningEffort, serviceTier, submissionId = '', deliveryMode = 'app_server' }) {
     const now = new Date().toISOString();
     const run = {
       id: randomUUID(),
@@ -1106,6 +1194,7 @@ export class CodexThreadService {
       session: this.liveSessions.get(threadId) ?? null,
       model: normalizeModelId(model),
       reasoningEffort: normalizeReasoningEffort(reasoningEffort),
+      serviceTier: normalizeServiceTier(serviceTier),
       submissionId: String(submissionId ?? '').trim(),
       deliveryMode: normalizeDeliveryMode(deliveryMode),
       promptLength: String(prompt ?? '').length,
@@ -1365,7 +1454,8 @@ export class CodexThreadService {
         cwd: null,
         approvalPolicy: this.approvalPolicy,
         sandbox: appServerSandboxFromMode(this.sandbox),
-        model: this.optionalModel(run.model)
+        model: this.optionalModel(run.model),
+        ...serviceTierParams(run.serviceTier)
       });
     } catch (error) {
       this.addRunEvent(run, 'codex.thread.resume.warning', { threadId: run.threadId, message: error.message });
@@ -1382,7 +1472,8 @@ export class CodexThreadService {
         approvalPolicy: this.approvalPolicy,
         sandboxPolicy: sandboxPolicyFromMode(this.sandbox),
         model: this.optionalModel(run.model),
-        effort: normalizeReasoningEffort(run.reasoningEffort)
+        effort: normalizeReasoningEffort(run.reasoningEffort),
+        ...serviceTierParams(run.serviceTier)
       });
       run.turnId = response?.turn?.id ?? null;
       run.activeCodexTurnId = run.turnId;
@@ -1401,7 +1492,14 @@ export class CodexThreadService {
     }
   }
 
+  getThreadSettings(threadId) {
+    return this.threadSettings.get(threadId) ?? null;
+  }
+
   async handleNotification(message) {
+    if (message?.method === 'thread/settings/updated' && message.params?.threadId && message.params?.threadSettings) {
+      this.threadSettings.set(message.params.threadId, { ...message.params.threadSettings });
+    }
     const threadId = extractThreadIdFromNotification(message);
     const turnId = extractTurnIdFromNotification(message);
     const run = this.resolveRunForNotification(threadId, turnId);
@@ -1665,6 +1763,7 @@ export class CodexThreadService {
       activeCodexTurnId: run.activeCodexTurnId ?? run.turnId,
       model: run.model,
       reasoningEffort: run.reasoningEffort,
+      serviceTier: normalizeServiceTier(run.serviceTier),
       status: run.status,
       createdAt: run.createdAt,
       updatedAt: run.updatedAt,
@@ -1758,6 +1857,39 @@ export class CodexThreadService {
   addServiceEvent(type, payload) {
     void this.writeLog(type, payload);
   }
+}
+
+function officialHistoryUnavailable() {
+  const error = new Error('桌面官方历史接口未连接');
+  error.statusCode = 503;
+  error.code = 'official_history_unavailable';
+  return error;
+}
+
+function officialHistoryCursorError(message, statusCode) {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  error.code = 'official_history_cursor_invalid';
+  return error;
+}
+
+function encodeOfficialHistoryCursor(threadId, direction, cursor) {
+  return `official-v1.${Buffer.from(JSON.stringify({ threadId, direction, cursor })).toString('base64url')}`;
+}
+
+function decodeOfficialHistoryCursor(value, threadId, direction) {
+  const input = String(value ?? '');
+  if (!input.startsWith('official-v1.')) throw officialHistoryCursorError('History source changed; reload the conversation', 409);
+  if (input.length > 8192 || !/^official-v1\.[A-Za-z0-9_-]+$/.test(input)) {
+    throw officialHistoryCursorError('Invalid history cursor', 400);
+  }
+  let parsed;
+  try { parsed = JSON.parse(Buffer.from(input.slice('official-v1.'.length), 'base64url').toString('utf8')); }
+  catch { throw officialHistoryCursorError('Invalid history cursor', 400); }
+  if (parsed?.threadId !== threadId || parsed?.direction !== direction || typeof parsed?.cursor !== 'string' || !parsed.cursor) {
+    throw officialHistoryCursorError('Invalid history cursor', 400);
+  }
+  return parsed.cursor;
 }
 
 function assertThreadId(threadId) {

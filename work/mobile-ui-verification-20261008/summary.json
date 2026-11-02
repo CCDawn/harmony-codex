@@ -1,0 +1,465 @@
+{
+  "generatedAt": "2026-10-08T11:03:08.753Z",
+  "logDir": "C:\\Users\\Administrator\\Documents\\Codex\\2026-09-08\\https-github-com-ccdawn-codex-harmony-2\\work\\codex-harmony-local-1.0.14\\work\\mobile-ui-verification-20261008",
+  "run": null,
+  "totals": {
+    "entries": 487,
+    "files": 3,
+    "sources": {
+      "harmony-app": 132,
+      "bridge": 355
+    },
+    "levels": {
+      "info": 485,
+      "warn": 2
+    },
+    "events": {
+      "runtime.contract.negotiated": 8,
+      "runtime.snapshot.synced": 19,
+      "standby_monitor.snapshot.published": 19,
+      "session.activity.snapshot": 1,
+      "session.detail.auto_refreshed": 1,
+      "http.request.completed": 326,
+      "model.catalog.loaded": 2,
+      "runtime.snapshot.reconciled": 20,
+      "system.link.status": 7,
+      "ui.theme.apply": 2,
+      "ui.keyboard_avoid.enabled": 2,
+      "app.appear": 2,
+      "hdc_relay.background.started": 2,
+      "notification.permission.ready": 2,
+      "pairing.credential.applied": 2,
+      "hdc_relay.state": 45,
+      "hdc_relay.auto_start": 2,
+      "session.model_catalog.refreshed": 2,
+      "slash.index.loaded": 2,
+      "session.running.reconciled": 2,
+      "ui.keyboard.dismissed": 5,
+      "ui.home_action_menu.toggle": 5,
+      "ui.home_action_menu.action": 4,
+      "session.navigation.committed": 2,
+      "ui.session_home.returned": 2,
+      "companion.history.synced": 1
+    }
+  },
+  "health": {
+    "status": "ok",
+    "reason": "No important errors detected in the current run"
+  },
+  "latest": [
+    {
+      "id": "log_7ec0e857-252e-4aaf-a680-4de8e8a4b421",
+      "timestamp": "2026-10-08T11:03:00.528Z",
+      "source": "bridge",
+      "level": "info",
+      "event": "http.request.completed",
+      "data": {
+        "method": "GET",
+        "url": "/desktop/live/status",
+        "statusCode": 200,
+        "durationMs": 1021,
+        "responseBytes": 617,
+        "trafficClass": "small"
+      }
+    },
+    {
+      "id": "log_8d852558-f8a4-46b8-a9d0-4002cbe8d5c1",
+      "timestamp": "2026-10-08T11:03:00.991Z",
+      "source": "bridge",
+      "level": "info",
+      "event": "http.request.completed",
+      "data": {
+        "method": "GET",
+        "url": "/desktop/live/status",
+        "statusCode": 200,
+        "durationMs": 970,
+        "responseBytes": 617,
+        "trafficClass": "small"
+      }
+    },
+    {
+      "id": "log_39c963b2-551c-4af5-a542-ffb37d5219bd",
+      "timestamp": "2026-10-08T11:03:01.901Z",
+      "source": "bridge",
+      "level": "info",
+      "event": "http.request.completed",
+      "data": {
+        "method": "GET",
+        "url": "/companion/profile",
+        "statusCode": 200,
+        "durationMs": 2393,
+        "responseBytes": 579,
+        "trafficClass": "small"
+      }
+    },
+    {
+      "id": "log_82cf4008-855f-42db-89d1-b89a5d7969a5",
+      "timestamp": "2026-10-08T11:03:05.086Z",
+      "source": "bridge",
+      "level": "info",
+      "event": "http.request.completed",
+      "data": {
+        "method": "GET",
+        "url": "/tasks",
+        "statusCode": 200,
+        "durationMs": 0,
+        "responseBytes": 12,
+        "trafficClass": "small"
+      }
+    },
+    {
+      "id": "log_6e70c9de-4ae4-47ea-ab28-dca5c88506a9",
+      "timestamp": "2026-10-08T11:03:05.599Z",
+      "source": "bridge",
+      "level": "info",
+      "event": "http.request.completed",
+      "data": {
+        "method": "GET",
+        "url": "/api/codex/threads?limit=50&",
+        "statusCode": 200,
+        "durationMs": 10,
+        "responseBytes": 5174,
+        "trafficClass": "small"
+      }
+    },
+    {
+      "id": "log_1609beca-0526-4ff4-a5a5-f445b6503945",
+      "timestamp": "2026-10-08T11:03:05.625Z",
+      "source": "bridge",
+      "level": "info",
+      "event": "http.request.completed",
+      "data": {
+        "method": "GET",
+        "url": "/health",
+        "statusCode": 200,
+        "durationMs": 1,
+        "responseBytes": 783,
+        "trafficClass": "small"
+      }
+    },
+    {
+      "id": "log_26e817e3-7699-4f14-a6b3-d855c6643393",
+      "timestamp": "2026-10-08T11:03:05.749Z",
+      "source": "bridge",
+      "level": "info",
+      "event": "http.request.completed",
+      "data": {
+        "method": "GET",
+        "url": "/companion/messages?profileId=ad167057-050b-4810-9a76-3192e805531f~6abc6e03a45081a0bfd34312e38a2adf&roomId=ba08e53db1bc8197a227791b54bfb585",
+        "statusCode": 200,
+        "durationMs": 3846,
+        "responseBytes": 10436,
+        "trafficClass": "small"
+      }
+    },
+    {
+      "id": "log_7f14b5f7-f65a-4eed-9fca-1bdbd5cff72f",
+      "timestamp": "2026-10-08T11:03:05.975Z",
+      "source": "bridge",
+      "level": "info",
+      "event": "runtime.snapshot.reconciled",
+      "data": {
+        "epoch": "d3efe2ba-65b8-4811-a312-2bf33ac46f57",
+        "revision": 25,
+        "stale": false,
+        "sessionCount": 7,
+        "conflictCount": 0,
+        "decisions": []
+      }
+    },
+    {
+      "id": "log_d769f4a5-c18b-408f-8f90-6596f6dba3e1",
+      "timestamp": "2026-10-08T11:03:05.975Z",
+      "source": "bridge",
+      "level": "info",
+      "event": "http.request.completed",
+      "data": {
+        "method": "GET",
+        "url": "/api/codex/runtime-snapshot",
+        "statusCode": 200,
+        "durationMs": 23,
+        "responseBytes": 5064,
+        "trafficClass": "small"
+      }
+    },
+    {
+      "id": "log_50a35d63-5582-4112-9a03-7e8a032f5679",
+      "timestamp": "2026-10-08T11:03:07.682Z",
+      "source": "bridge",
+      "level": "info",
+      "event": "http.request.completed",
+      "data": {
+        "method": "GET",
+        "url": "/companion/computer/status?assistantId=ad167057-050b-4810-9a76-3192e805531f~6abc6e03a45081a0bfd34312e38a2adf&roomId=ba08e53db1bc8197a227791b54bfb585",
+        "statusCode": 200,
+        "durationMs": 5779,
+        "responseBytes": 300,
+        "trafficClass": "small"
+      }
+    }
+  ],
+  "important": [
+    {
+      "id": "log_38c2457d-4086-42e1-ba27-1f543ba8295f",
+      "timestamp": "2026-10-08T10:55:41.357Z",
+      "source": "bridge",
+      "level": "warn",
+      "event": "system.link.status",
+      "data": {
+        "severity": "degraded",
+        "recommendedAction": "reconnect_hdc",
+        "message": "HDC target 离线，等待 watchdog 重连",
+        "desktopLive": true,
+        "sessionVerified": false,
+        "targetVerified": false,
+        "relayOk": true,
+        "hdcOk": false
+      }
+    },
+    {
+      "id": "log_4b16e1bb-8830-4af3-b066-075107dabe26",
+      "timestamp": "2026-10-08T11:01:19.086Z",
+      "source": "bridge",
+      "level": "warn",
+      "event": "system.link.status",
+      "data": {
+        "severity": "degraded",
+        "recommendedAction": "reconnect_hdc",
+        "message": "HDC proxy 正在监听，但 hdc target 未连接",
+        "desktopLive": true,
+        "sessionVerified": false,
+        "targetVerified": false,
+        "relayOk": true,
+        "hdcOk": false
+      }
+    }
+  ],
+  "bridge": {
+    "entries": 355,
+    "requests": 326,
+    "failures": []
+  },
+  "app": {
+    "entries": 132,
+    "latest": [
+      {
+        "id": "log_cf31ec8c-79c9-4d64-889c-c829ec57b18f",
+        "timestamp": "2026-10-08T11:01:25.229Z",
+        "source": "harmony-app",
+        "level": "info",
+        "event": "hdc_relay.state",
+        "data": "sessionId=app-1791457281951; appMessage=已同步 7 个会话; currentTaskId=; currentTaskStatus=idle; state=连接中; detail=连接 Relay 47.98.197.156:19078; relayToHdcdBytes=0; hdcdToRelayBytes=0"
+      },
+      {
+        "id": "log_3e389b71-176e-4252-93c7-ce12d5b91304",
+        "timestamp": "2026-10-08T11:01:25.230Z",
+        "source": "harmony-app",
+        "level": "info",
+        "event": "hdc_relay.state",
+        "data": "sessionId=app-1791457281951; appMessage=已同步 7 个会话; currentTaskId=; currentTaskStatus=idle; state=等待电脑; detail=已连接 Relay，等待本地电脑接入; relayToHdcdBytes=0; hdcdToRelayBytes=0"
+      },
+      {
+        "id": "log_182b89f8-e680-4374-977b-efa6423eaee8",
+        "timestamp": "2026-10-08T11:01:25.231Z",
+        "source": "harmony-app",
+        "level": "info",
+        "event": "hdc_relay.state",
+        "data": "sessionId=app-1791457281951; appMessage=已同步 7 个会话; currentTaskId=; currentTaskStatus=idle; state=等待电脑; detail=Relay 在线，等待电脑代理连接; relayToHdcdBytes=0; hdcdToRelayBytes=0"
+      },
+      {
+        "id": "log_8622aeee-5c0b-4864-8744-926ba68f695f",
+        "timestamp": "2026-10-08T11:01:45.111Z",
+        "source": "harmony-app",
+        "level": "info",
+        "event": "runtime.snapshot.synced",
+        "data": "sessionId=app-1791457281951; appMessage=已同步 7 个会话; currentTaskId=; currentTaskStatus=idle; source=dashboard; epoch=d3efe2ba-65b8-4811-a312-2bf33ac46f57; revision=21; applied=true; sessions=7"
+      },
+      {
+        "id": "log_dadc7b6e-fcd8-479a-a1cd-9ad7211c2f51",
+        "timestamp": "2026-10-08T11:01:45.112Z",
+        "source": "harmony-app",
+        "level": "info",
+        "event": "standby_monitor.snapshot.published",
+        "data": "sessionId=app-1791457281951; appMessage=已同步 7 个会话; currentTaskId=; currentTaskStatus=idle; source=sessions_dashboard; running=2; unread=0; connected=true; notificationAction=updated; notificationState=connected; liveView=disabled"
+      },
+      {
+        "id": "log_610488de-fc3f-4006-bf67-05454f2b5a9a",
+        "timestamp": "2026-10-08T11:01:55.125Z",
+        "source": "harmony-app",
+        "level": "info",
+        "event": "hdc_relay.state",
+        "data": "sessionId=app-1791457281951; appMessage=已同步 7 个会话; currentTaskId=; currentTaskStatus=idle; state=已配对; detail=通道 hdc_a9d4720e-b1e9-4e08-968b-9c83abb8df01; relayToHdcdBytes=0; hdcdToRelayBytes=0"
+      },
+      {
+        "id": "log_eb38a8dd-f05d-424b-9c2d-532574d6f02c",
+        "timestamp": "2026-10-08T11:01:55.126Z",
+        "source": "harmony-app",
+        "level": "info",
+        "event": "hdc_relay.state",
+        "data": "sessionId=app-1791457281951; appMessage=已同步 7 个会话; currentTaskId=; currentTaskStatus=idle; state=转发中; detail=电脑 HDC 已接入，正在转发 hdcd 字节流; relayToHdcdBytes=0; hdcdToRelayBytes=0"
+      },
+      {
+        "id": "log_cc37d975-8fc5-4e47-8249-702553259b84",
+        "timestamp": "2026-10-08T11:02:05.137Z",
+        "source": "harmony-app",
+        "level": "info",
+        "event": "runtime.snapshot.synced",
+        "data": "sessionId=app-1791457281951; appMessage=已同步 7 个会话; currentTaskId=; currentTaskStatus=idle; source=dashboard; epoch=d3efe2ba-65b8-4811-a312-2bf33ac46f57; revision=22; applied=true; sessions=7"
+      },
+      {
+        "id": "log_3a634027-1cbf-4a8e-93eb-6f7308ecc665",
+        "timestamp": "2026-10-08T11:02:05.137Z",
+        "source": "harmony-app",
+        "level": "info",
+        "event": "standby_monitor.snapshot.published",
+        "data": "sessionId=app-1791457281951; appMessage=已同步 7 个会话; currentTaskId=; currentTaskStatus=idle; source=sessions_dashboard; running=2; unread=0; connected=true; notificationAction=updated; notificationState=connected; liveView=disabled"
+      },
+      {
+        "id": "log_499f1da7-71d7-4395-a9be-eed9b612f028",
+        "timestamp": "2026-10-08T11:02:25.158Z",
+        "source": "harmony-app",
+        "level": "info",
+        "event": "runtime.contract.negotiated",
+        "data": "sessionId=app-1791457281951; appMessage=已同步 7 个会话; currentTaskId=; currentTaskStatus=idle; mode=desktop; execution=desktop; protocol=1; bridgeVersion=0.1.0"
+      },
+      {
+        "id": "log_509334db-1893-4b3f-949b-8644d3dffb48",
+        "timestamp": "2026-10-08T11:02:25.159Z",
+        "source": "harmony-app",
+        "level": "info",
+        "event": "runtime.snapshot.synced",
+        "data": "sessionId=app-1791457281951; appMessage=已同步 7 个会话; currentTaskId=; currentTaskStatus=idle; source=dashboard; epoch=d3efe2ba-65b8-4811-a312-2bf33ac46f57; revision=23; applied=true; sessions=7"
+      },
+      {
+        "id": "log_48f34cd7-c435-4657-9dd8-75d46166e646",
+        "timestamp": "2026-10-08T11:02:25.159Z",
+        "source": "harmony-app",
+        "level": "info",
+        "event": "standby_monitor.snapshot.published",
+        "data": "sessionId=app-1791457281951; appMessage=已同步 7 个会话; currentTaskId=; currentTaskStatus=idle; source=sessions_dashboard; running=2; unread=0; connected=true; notificationAction=updated; notificationState=connected; liveView=disabled"
+      },
+      {
+        "id": "log_66afc9c4-72f5-4d95-ad2b-6fddd2f3db8f",
+        "timestamp": "2026-10-08T11:02:35.471Z",
+        "source": "harmony-app",
+        "level": "info",
+        "event": "ui.keyboard.dismissed",
+        "data": "sessionId=app-1791457281951; appMessage=已同步 7 个会话; currentTaskId=; currentTaskStatus=idle; source=home_menu; method=text_area_stop_editing"
+      },
+      {
+        "id": "log_75c50f09-10ed-40e0-9f62-b21dc416a389",
+        "timestamp": "2026-10-08T11:02:35.471Z",
+        "source": "harmony-app",
+        "level": "info",
+        "event": "ui.home_action_menu.toggle",
+        "data": "sessionId=app-1791457281951; appMessage=已同步 7 个会话; currentTaskId=; currentTaskStatus=idle; visible=true; source=sidebar_header; owner=sidebar_header"
+      },
+      {
+        "id": "log_410935bf-c972-4eef-bbb7-c02781d8452a",
+        "timestamp": "2026-10-08T11:02:35.472Z",
+        "source": "harmony-app",
+        "level": "info",
+        "event": "ui.home_action_menu.action",
+        "data": "sessionId=app-1791457281951; appMessage=已同步 7 个会话; currentTaskId=; currentTaskStatus=idle; action=settings; source=sidebar_header"
+      },
+      {
+        "id": "log_1947914d-dd7e-419a-b1c9-a21cd07ac9db",
+        "timestamp": "2026-10-08T11:02:35.472Z",
+        "source": "harmony-app",
+        "level": "info",
+        "event": "ui.keyboard.dismissed",
+        "data": "sessionId=app-1791457281951; appMessage=已同步 7 个会话; currentTaskId=; currentTaskStatus=idle; source=home_menu; method=text_area_stop_editing"
+      },
+      {
+        "id": "log_14a9d23e-104d-4c8c-aa6d-f2fc93e93e11",
+        "timestamp": "2026-10-08T11:02:35.473Z",
+        "source": "harmony-app",
+        "level": "info",
+        "event": "ui.home_action_menu.toggle",
+        "data": "sessionId=app-1791457281951; appMessage=已同步 7 个会话; currentTaskId=; currentTaskStatus=idle; visible=true; source=sidebar_header; owner=sidebar_header"
+      },
+      {
+        "id": "log_e8f4f51c-1a21-4a3f-9c40-4dbdce12c10d",
+        "timestamp": "2026-10-08T11:02:35.473Z",
+        "source": "harmony-app",
+        "level": "info",
+        "event": "ui.home_action_menu.action",
+        "data": "sessionId=app-1791457281951; appMessage=已同步 7 个会话; currentTaskId=; currentTaskStatus=idle; action=pairing; source=sidebar_header"
+      },
+      {
+        "id": "log_7233f7a8-2a6a-4612-b1d0-2e9edd9f10ba",
+        "timestamp": "2026-10-08T11:02:45.178Z",
+        "source": "harmony-app",
+        "level": "info",
+        "event": "runtime.snapshot.synced",
+        "data": "sessionId=app-1791457281951; appMessage=已同步 7 个会话; currentTaskId=; currentTaskStatus=idle; source=dashboard; epoch=d3efe2ba-65b8-4811-a312-2bf33ac46f57; revision=24; applied=true; sessions=7"
+      },
+      {
+        "id": "log_2572bbde-af4b-4480-a17d-494b1f3f205c",
+        "timestamp": "2026-10-08T11:02:45.524Z",
+        "source": "harmony-app",
+        "level": "info",
+        "event": "standby_monitor.snapshot.published",
+        "data": "sessionId=app-1791457281951; appMessage=已同步 7 个会话; currentTaskId=; currentTaskStatus=idle; source=sessions_dashboard; running=2; unread=0; connected=true; notificationAction=updated; notificationState=connected; liveView=disabled"
+      }
+    ],
+    "errors": []
+  },
+  "task": {
+    "entries": 0,
+    "taskIds": [],
+    "latest": [],
+    "failures": []
+  },
+  "stateSync": {
+    "interrupts": {
+      "requested": 0,
+      "confirmed": 0,
+      "failed": 0,
+      "unresolved": []
+    },
+    "submissions": {
+      "blockedByInterrupt": 0,
+      "released": 0,
+      "submitted": 0,
+      "stuck": []
+    },
+    "policy": {
+      "effective": null,
+      "mismatches": []
+    },
+    "modelCatalog": "sessionId=app-1791457281951; appMessage=就绪; currentTaskId=; currentTaskStatus=idle; force=true; source=desktop_cdp; revision=gpt-6.1-sol|gpt-6.1-sol|gpt-6-astra|gpt-6-sol|gpt-6-luna|gpt-5.6-sol|gpt-5.6-terra|gpt-5.6-luna; defaultModel=gpt-6.1-sol; modelCount=7; defaultEffort=xhigh; display=GPT-6.1-Sol 自动·极高",
+    "runtime": {
+      "reconciliations": 20,
+      "conflicts": 0,
+      "latest": {
+        "epoch": "d3efe2ba-65b8-4811-a312-2bf33ac46f57",
+        "revision": 25,
+        "stale": false,
+        "sessionCount": 7,
+        "conflictCount": 0,
+        "decisions": []
+      },
+      "projections": 0,
+      "latestProjection": null
+    },
+    "anomalies": []
+  },
+  "files": [
+    {
+      "name": "all.jsonl",
+      "bytes": 156091,
+      "modifiedAt": "2026-10-08T11:03:08.636Z"
+    },
+    {
+      "name": "summary.json",
+      "bytes": 17053,
+      "modifiedAt": "2026-10-08T10:58:52.330Z"
+    },
+    {
+      "name": "summary.md",
+      "bytes": 1043,
+      "modifiedAt": "2026-10-08T10:58:52.331Z"
+    }
+  ]
+}

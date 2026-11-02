@@ -266,3 +266,34 @@ test('health checks require the expected runtime mode instead of any successful 
   const result = await inspect({ '/health': { ok: true, runtime: { mode: 'app-server-primary' } } });
   assert.equal(result.checks.find(c => c.id === 'bridge').state, 'error');
 });
+
+test('a 5xx companion response never inherits a stale body auth tag as an auth fault', async () => {
+  const reply = (status, body) => ({ ok: status === 200, status, json: async () => body });
+  const fetchImpl = async (url) => {
+    const route = url.replace('http://127.0.0.1:1234', '');
+    if (route === '/health') return reply(200, { ok: true, runtime: { mode: 'desktop' } });
+    if (route === '/desktop/live/status') return reply(200, { desktop: { desktopLive: true } });
+    if (route === '/codex/sessions?limit=1') return reply(200, { sessions: [] });
+    if (route === '/companion/profile') return reply(502, { failureClass: 'auth' });
+    return reply(200, {});
+  };
+  const result = await inspectMobileLink({ baseUrl: 'http://127.0.0.1:1234', fetchImpl, collectSignals: true });
+  const fault = result.guardianSignals.faults.find(entry => entry.id === 'companion');
+  assert.equal(fault.kind, 'upstream');
+  assert.equal(fault.repairable, false);
+});
+
+test('a genuine 401 companion response still classifies as auth', async () => {
+  const reply = (status, body) => ({ ok: status === 200, status, json: async () => body });
+  const fetchImpl = async (url) => {
+    const route = url.replace('http://127.0.0.1:1234', '');
+    if (route === '/health') return reply(200, { ok: true, runtime: { mode: 'desktop' } });
+    if (route === '/desktop/live/status') return reply(200, { desktop: { desktopLive: true } });
+    if (route === '/codex/sessions?limit=1') return reply(200, { sessions: [] });
+    if (route === '/companion/profile') return reply(401, { failureClass: 'auth' });
+    return reply(200, {});
+  };
+  const result = await inspectMobileLink({ baseUrl: 'http://127.0.0.1:1234', fetchImpl, collectSignals: true });
+  const fault = result.guardianSignals.faults.find(entry => entry.id === 'companion');
+  assert.equal(fault.kind, 'auth');
+});

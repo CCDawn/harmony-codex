@@ -1,10 +1,14 @@
 import { http } from '@kit.NetworkKit';
 import { GuardianStatus } from '../model/BridgeModels';
+import { MobileControlJob, MobileControlJobResponse, MobileControlStatus } from '../model/MobileControlModels';
 import { BridgeDesktopInteraction, BridgeDesktopInteractionResponse } from '../model/BridgeModels';
 import { CredentialRuntime } from '../config/CredentialRuntime';
+import { MobilePushResponse, MobilePushRegistrationPayload } from '../model/MobilePushModels';
 import { TotpGenerator } from '../utils/TotpGenerator';
 import { CompanionCallRecord, CompanionMessagesResponse, CompanionProfile, CompanionProfileResponse, CompanionTextReceipt } from '../model/CompanionModels';
-import { BridgeOutboxItem, BridgeProject, BridgeRuntimeStatus, BridgeTask, BridgeTaskSummary, BridgeUserInput, CodexAccountUsage, CodexRuntimeSnapshot, CodexSessionDetail, CodexSessionFingerprint, CodexSessionSummary, DesktopLiveStatus, DesktopScreenshotImage, MobileFileUpload, MobileImageUpload, RemoteSessionFile, SessionSettings, SlashIndexItem, SystemLinkStatus, SystemRepairStatus, VoiceTranscriptEntry } from '../model/BridgeModels';
+import { BridgeOutboxItem, BridgeProject, BridgeRuntimeStatus, BridgeTask, BridgeTaskSummary, BridgeUserInput, CodexAccountUsage, CodexRuntimeSnapshot, CodexSessionDetail, CodexSessionFingerprint, CodexSessionSummary, DesktopLiveStatus, DesktopScreenshotImage, MobileFileUpload, MobileImageUpload, RemoteSessionFile, SessionSettings, SessionSettingsPatch, SlashIndexItem, SystemLinkStatus, SystemRepairStatus, VoiceTranscriptEntry } from '../model/BridgeModels';
+
+import { CodexContinueResult, CodexContinueStatus } from '../model/BridgeModels';
 
 interface ProjectsResponse {
   projects?: BridgeProject[];
@@ -150,6 +154,7 @@ export class AppLogPayload {
 }
 
 interface BridgeRequestOptions {
+  acceptConflictResponse?: boolean;
   connectTimeout?: number;
   readTimeout?: number;
   retries?: number;
@@ -160,6 +165,77 @@ const BRIDGE_CLIENT_PROTOCOL: number = 1;
 const BRIDGE_CLIENT_VERSION: string = '1.0.13';
 
 export class BridgeClient {
+  static async registerMobilePush(baseUrl: string, token: string, installationId: string,
+    pushToken: string, threadIds: string[]): Promise<MobilePushResponse> {
+    const raw = await BridgeClient.request(http.RequestMethod.POST,
+      `${baseUrl}/api/mobile-push/registration`,
+      JSON.stringify(new MobilePushRegistrationPayload(installationId, pushToken, threadIds)), token);
+    const result = JSON.parse(raw) as MobilePushResponse;
+    if (result.version !== 1 || typeof result.configured !== 'boolean'
+      || result.registration?.registered !== true || typeof result.registration.ready !== 'boolean') {
+      throw new Error('后台提醒登记未确认');
+    }
+    return result;
+  }
+
+  static async unregisterMobilePush(baseUrl: string, token: string, installationId: string): Promise<void> {
+    await BridgeClient.request(http.RequestMethod.DELETE, `${baseUrl}/api/mobile-push/registration`,
+      JSON.stringify(new MobilePushRegistrationPayload(installationId, '', [])), token);
+  }
+
+  private static mobileControlPath(baseUrl: string, targetId: string): string {
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(targetId)) {
+      throw new Error('电脑管理目标尚未配置，请更新电脑管理应用和手机应用。');
+    }
+    return `${baseUrl.replace(/\/$/, '')}/control/v1/targets/${targetId}`;
+  }
+
+  static async getMobileControlStatus(baseUrl: string, token: string, targetId: string): Promise<MobileControlStatus> {
+    const path = BridgeClient.mobileControlPath(baseUrl, targetId);
+    const raw = await BridgeClient.request(http.RequestMethod.GET, `${path}/status`, '', token,
+      { connectTimeout: 8000, readTimeout: 15000 });
+    const result = JSON.parse(raw) as MobileControlStatus;
+    if (result.version !== 1 || result.agent?.online !== true || result.agent.targetId !== targetId) {
+      throw new Error('电脑管理通道响应不兼容，请更新电脑管理应用。');
+    }
+    if (result.activeJob !== null) {
+      result.activeJob = BridgeClient.parseMobileControlJob(JSON.stringify({ version: 1, job: result.activeJob }));
+    }
+    if (result.lastJob !== null) {
+      result.lastJob = BridgeClient.parseMobileControlJob(JSON.stringify({ version: 1, job: result.lastJob }));
+    }
+    return result;
+  }
+
+  static async startMobileControlRepair(baseUrl: string, token: string, targetId: string,
+    sessionId: string, hard: boolean, requestId: string): Promise<MobileControlJob> {
+    const path = BridgeClient.mobileControlPath(baseUrl, targetId);
+    const body = JSON.stringify({ requestId, sessionId, mode: hard ? 'hard' : 'auto', confirmHardRestart: hard });
+    const raw = await BridgeClient.request(http.RequestMethod.POST, `${path}/repairs`, body, token,
+      { connectTimeout: 8000, readTimeout: 20000, retries: 1, retryDelayMs: 800 });
+    return BridgeClient.parseMobileControlJob(raw);
+  }
+
+  static async getMobileControlRepair(baseUrl: string, token: string, targetId: string, jobId: string): Promise<MobileControlJob> {
+    if (!/^[a-f0-9]{32}$/.test(jobId)) throw new Error('修复任务编号格式无效');
+    const path = BridgeClient.mobileControlPath(baseUrl, targetId);
+    const raw = await BridgeClient.request(http.RequestMethod.GET, `${path}/repairs/${jobId}`, '', token,
+      { connectTimeout: 8000, readTimeout: 15000 });
+    return BridgeClient.parseMobileControlJob(raw);
+  }
+
+  private static parseMobileControlJob(raw: string): MobileControlJob {
+    const result = JSON.parse(raw) as MobileControlJobResponse;
+    const job = result.job;
+    if (result.version !== 1 || !job || job.version !== 1 || !/^[a-f0-9]{32}$/.test(job.id)
+      || typeof job.sessionId !== 'string' || typeof job.message !== 'string'
+      || ['auto', 'hard'].indexOf(job.mode) < 0
+      || ['queued', 'running', 'succeeded', 'failed', 'needs_confirmation'].indexOf(job.status) < 0) {
+      throw new Error('电脑修复任务响应格式不兼容，请更新电脑管理应用。');
+    }
+    return job;
+  }
+
   static async getGuardianStatus(baseUrl: string, token: string = ''): Promise<GuardianStatus> {
     const raw = await BridgeClient.request(http.RequestMethod.GET, `${baseUrl}/system/guardian?client=phone`, '', token);
     return BridgeClient.parseGuardianStatus(raw);
@@ -225,11 +301,12 @@ export class BridgeClient {
           throw new Error(`桥接请求失败：${err.message}`);
         });
       const raw = typeof response.result === 'string' ? response.result : String(response.result ?? '');
-      if (response.responseCode < 200 || response.responseCode >= 300) {
+      if ((response.responseCode < 200 || response.responseCode >= 300)
+        && !(response.responseCode === 409 && options.acceptConflictResponse === true)) {
         if (response.responseCode === 401 && BridgeClient.is2faRequired(response.header)) {
           throw new Error('桥接返回异常 HTTP 401：动态验证码缺失或不正确，请核对手机端与电脑端的 TOTP 密钥配置');
         }
-        throw new Error(`桥接返回异常 HTTP ${response.responseCode}：${BridgeClient.formatErrorBody(raw)}`);
+        throw new Error(`桥接返回异常 HTTP ${response.responseCode}：${BridgeClient.formatErrorBody(raw, response.responseCode)}`);
       }
       return raw;
     } finally {
@@ -257,7 +334,14 @@ export class BridgeClient {
     return false;
   }
 
-  private static formatErrorBody(raw: string): string {
+  private static formatErrorBody(raw: string, statusCode: number = 0): string {
+    const trimmed = raw.trim();
+    const sizeLimitMessage = '上传内容超过连接服务的大小限制，请压缩附件后重试';
+    if (/^(?:<!doctype\s+html|<html|<head|<body)(?:\s|>)/i.test(trimmed)) {
+      return statusCode === 413 ? sizeLimitMessage : '连接服务暂时不可用，请稍后重试';
+    }
+    const fallback = statusCode === 413 ? sizeLimitMessage
+      : trimmed.length > 240 ? trimmed.slice(0, 240) + '…' : trimmed;
     try {
       const parsed = JSON.parse(raw) as ErrorResponse;
       const parts: string[] = [];
@@ -276,13 +360,14 @@ export class BridgeClient {
       if (parsed.desktop?.reason && parsed.desktop.reason.length > 0) {
         parts.push(`原因=${parsed.desktop.reason}`);
       }
-      return parts.length > 0 ? parts.join('；') : raw;
+      return parts.length > 0 ? parts.join('；') : fallback;
     } catch (_) {
-      return raw;
+      return fallback;
     }
   }
 
   private static isTransientBridgeError(message: string): boolean {
+    if (/\bHTTP\s+413\b/i.test(message)) return false;
     const normalized = message.toLowerCase();
     return normalized.indexOf('operation timeout') >= 0
       || normalized.indexOf('timed out') >= 0
@@ -355,8 +440,27 @@ export class BridgeClient {
     return JSON.parse(raw) as CodexRuntimeSnapshot;
   }
 
-  static async getSession(baseUrl: string, sessionId: string, token: string = ''): Promise<CodexSessionDetail> {
-    const raw = await BridgeClient.request(http.RequestMethod.GET, `${baseUrl}/api/codex/threads/${sessionId}?tail=160`, '', token, { connectTimeout: 10000, readTimeout: 45000, retries: 1, retryDelayMs: 800 });
+  static async getContinueStatus(baseUrl: string, sessionId: string, token: string): Promise<CodexContinueStatus> {
+    const raw = await BridgeClient.request(http.RequestMethod.GET,
+      `${baseUrl}/api/codex/threads/${encodeURIComponent(sessionId)}/continue-status`, '', token,
+      { connectTimeout: 8000, readTimeout: 15000, retries: 0, retryDelayMs: 0 });
+    return JSON.parse(raw) as CodexContinueStatus;
+  }
+
+  static async continueSession(baseUrl: string, sessionId: string, token: string,
+    operationId: string, expectedTurnId: string): Promise<CodexContinueResult> {
+    const raw = await BridgeClient.request(http.RequestMethod.POST,
+      `${baseUrl}/api/codex/threads/${encodeURIComponent(sessionId)}/continue`,
+      JSON.stringify({ operationId, expectedTurnId }), token,
+      { connectTimeout: 8000, readTimeout: 45000, retries: 0, retryDelayMs: 0, acceptConflictResponse: true });
+    const result = JSON.parse(raw) as CodexContinueResult;
+    if (result.threadId !== sessionId || result.operationId !== operationId || result.expectedTurnId !== expectedTurnId
+      || !['confirmed', 'uncertain', 'rejected'].includes(result.state)) throw new Error('继续会话回执无法确认');
+    return result;
+  }
+
+  static async getSession(baseUrl: string, sessionId: string, token: string = '', tail: number = 160): Promise<CodexSessionDetail> {
+    const raw = await BridgeClient.request(http.RequestMethod.GET, `${baseUrl}/api/codex/threads/${sessionId}?tail=${Math.max(1, Math.min(200, Math.floor(tail)))}&view=session`, '', token, { connectTimeout: 10000, readTimeout: 45000, retries: 1, retryDelayMs: 800 });
     const parsed = JSON.parse(raw) as SessionResponse;
     if (!parsed.session) {
       throw new Error('桥接服务没有返回会话详情');
@@ -372,7 +476,7 @@ export class BridgeClient {
     beforeCursor: string = '',
     afterCursor: string = ''
   ): Promise<CodexSessionDetail> {
-    const params: string[] = [`limit=${Math.max(1, Math.min(200, Math.floor(limit)))}`];
+    const params: string[] = [`limit=${Math.max(1, Math.min(200, Math.floor(limit)))}`, 'view=session'];
     if (beforeCursor.trim().length > 0) {
       params.push(`before=${encodeURIComponent(beforeCursor.trim())}`);
     }
@@ -409,7 +513,7 @@ export class BridgeClient {
   static async sendCompanionText(baseUrl: string, profileId: string, roomId: string,
     text: string, requestId: string, token: string = ''): Promise<CompanionTextReceipt> {
     if (!profileId.trim() || !roomId.trim() || !text.trim() || text.length > 20000
-      || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(requestId)) {
+      || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(requestId)) {
       throw new Error('文字消息内容或个人助手身份无效');
     }
     const raw = await BridgeClient.request(http.RequestMethod.POST, `${baseUrl}/companion/messages`,
@@ -476,7 +580,12 @@ export class BridgeClient {
         itemId: entry.itemId,
         role: entry.role === 'user' ? 'user' : 'assistant',
         text: entry.text,
-        final: entry.final === true
+        final: entry.final === true,
+        createdAt: typeof entry.createdAt === 'number' && Number.isFinite(entry.createdAt) && entry.createdAt >= 0
+          ? entry.createdAt : undefined,
+        requestId: typeof entry.requestId === 'string'
+          && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(entry.requestId)
+          ? entry.requestId.toLowerCase() : undefined
       }));
     const calls: CompanionCallRecord[] = (Array.isArray(parsed.calls) ? parsed.calls : [])
       .filter((call: CompanionCallRecord) => typeof call.messageId === 'string' && call.messageId.trim().length > 0
@@ -610,8 +719,10 @@ export class BridgeClient {
     return parsed.task;
   }
 
-  static async startCodexThread(baseUrl: string, projectId: string, text: string, token: string = '', reasoningEffort: string = '', model: string = '', submissionId: string = ''): Promise<BridgeTask> {
-    const body = JSON.stringify({ projectId, text, reasoningEffort, model, submissionId });
+  static async startCodexThread(baseUrl: string, projectId: string, text: string, token: string = '', reasoningEffort: string = '', model: string = '', submissionId: string = '', serviceTier?: string): Promise<BridgeTask> {
+    const body = serviceTier === undefined
+      ? JSON.stringify({ projectId, text, reasoningEffort, model, submissionId })
+      : JSON.stringify({ projectId, text, reasoningEffort, model, submissionId, serviceTier });
     const raw = await BridgeClient.request(http.RequestMethod.POST, `${baseUrl}/api/codex/threads?afterSeq=0&eventLimit=100`, body, token, { readTimeout: 45000 });
     const parsed = JSON.parse(raw) as StartThreadResponse;
     if (!parsed.run) {
@@ -620,7 +731,7 @@ export class BridgeClient {
     return parsed.run;
   }
 
-  static async sendCodexThreadMessage(baseUrl: string, threadId: string, text: string, projectId: string, token: string = '', sessionFingerprint: CodexSessionFingerprint | null = null, reasoningEffort: string = '', model: string = '', submissionId: string = ''): Promise<BridgeTask> {
+  static async sendCodexThreadMessage(baseUrl: string, threadId: string, text: string, projectId: string, token: string = '', sessionFingerprint: CodexSessionFingerprint | null = null, reasoningEffort: string | undefined = undefined, model: string | undefined = undefined, submissionId: string = ''): Promise<BridgeTask> {
     const body = JSON.stringify({ projectId, text, sessionFingerprint, reasoningEffort, model, submissionId });
     const raw = await BridgeClient.request(http.RequestMethod.POST, `${baseUrl}/api/codex/threads/${threadId}/messages?afterSeq=0&eventLimit=100`, body, token, { connectTimeout: 10000, readTimeout: 90000, retries: 2, retryDelayMs: 900 });
     const parsed = JSON.parse(raw) as RunResponse;
@@ -642,10 +753,33 @@ export class BridgeClient {
     return parsed.settings ?? { reasoningEffort: '' };
   }
 
-  static async updateSessionSettings(baseUrl: string, threadId: string, settings: SessionSettings, token: string = ''): Promise<SessionSettings> {
-    const raw = await BridgeClient.request(http.RequestMethod.POST, `${baseUrl}/api/codex/threads/${threadId}/settings`, JSON.stringify(settings), token, { connectTimeout: 8000, readTimeout: 30000, retries: 1, retryDelayMs: 600 });
+  static async updateSessionSettings(baseUrl: string, threadId: string, patch: SessionSettingsPatch, token: string = ''): Promise<SessionSettings> {
+    const payload: SessionSettingsPatch = {};
+    if (patch.model !== undefined) {
+      payload.model = patch.model;
+    }
+    if (patch.reasoningEffort !== undefined) {
+      payload.reasoningEffort = patch.reasoningEffort;
+    }
+    if (patch.serviceTier !== undefined) {
+      payload.serviceTier = patch.serviceTier;
+    }
+    const raw = await BridgeClient.request(http.RequestMethod.POST, `${baseUrl}/api/codex/threads/${threadId}/settings`, JSON.stringify(payload), token, { connectTimeout: 8000, readTimeout: 30000, retries: 1, retryDelayMs: 600 });
     const parsed = JSON.parse(raw) as SessionSettingsResponse;
-    return parsed.settings ?? settings;
+    if (parsed.settings) {
+      return parsed.settings;
+    }
+    const fallback: SessionSettings = { reasoningEffort: '' };
+    if (payload.model !== undefined) {
+      fallback.model = payload.model;
+    }
+    if (payload.reasoningEffort !== undefined) {
+      fallback.reasoningEffort = payload.reasoningEffort;
+    }
+    if (payload.serviceTier !== undefined) {
+      fallback.serviceTier = payload.serviceTier;
+    }
+    return fallback;
   }
 
   static async getCodexRun(baseUrl: string, runId: string, token: string = '', afterSeq: number = 0): Promise<BridgeTask> {

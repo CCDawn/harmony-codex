@@ -14,9 +14,12 @@ export struct SessionInteractionPanel {
   @Param busy: boolean = false;
   @Event onAnswer: (request: BridgeDesktopInteraction, questionId: string, value: string) => void = () => {};
   @Event onRespond: (request: BridgeDesktopInteraction, decision: string) => void = () => {};
+  @Event onSkip: (request: BridgeDesktopInteraction, questionId: string) => void = () => {};
 
   private answer(questionId: string): string {
-    return this.answers[JSON.stringify(['desktop', this.request.threadId, this.request.id, questionId])] ?? '';
+    const scope = this.request.turnId && this.request.itemId
+      ? JSON.stringify(['async', this.request.turnId, this.request.itemId]) : this.request.id;
+    return this.answers[JSON.stringify(['desktop', this.request.threadId, scope, questionId])] ?? '';
   }
 
   private canRespond(): boolean {
@@ -62,6 +65,12 @@ export struct SessionInteractionPanel {
           .backgroundColor(appThemeTokens(this.darkMode).surface).borderRadius(8)
           .onChange((value: string) => this.onAnswer(this.request, question.id, value))
       }
+      if (this.request.supportsSkip === true) {
+        Button('跳过此问题').height(40).enabled(!this.busy)
+          .fontColor(appThemeTokens(this.darkMode).accent)
+          .backgroundColor(appThemeTokens(this.darkMode).surface)
+          .onClick(() => this.onSkip(this.request, question.id))
+      }
     }.width('100%').padding(10).borderRadius(8).backgroundColor(appThemeTokens(this.darkMode).surfaceMuted)
   }
 
@@ -82,7 +91,7 @@ export struct SessionInteractionPanel {
           Button(this.busy ? '提交中…' : '同意').layoutWeight(1).height(44).enabled(!this.busy)
             .fontColor(appThemeTokens(this.darkMode).textOnAccent).backgroundColor(appThemeTokens(this.darkMode).success)
             .onClick(() => this.onRespond(this.request, 'approved'))
-          Button('拒绝').layoutWeight(1).height(44).enabled(!this.busy)
+          Button(this.request.rejectLabel || '拒绝').layoutWeight(1).height(44).enabled(!this.busy)
             .fontColor(appThemeTokens(this.darkMode).textOnAccent).backgroundColor(appThemeTokens(this.darkMode).danger)
             .onClick(() => this.onRespond(this.request, 'denied'))
         }.width('100%')

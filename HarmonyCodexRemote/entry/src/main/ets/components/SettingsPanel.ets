@@ -8,11 +8,13 @@ export struct SettingsPanel {
   @Param darkMode: boolean = false;
   @Param themeMode: string = 'system';
   @Param fontScaleMode: string = 'standard';
-  @Param backgroundState: string = '未运行';
+  @Param pushState: string = '正在准备';
   @Param voiceState: string = '未开始通话';
   @Param guardian: GuardianStatus | null = null;
   @Param guardianBusy: boolean = false;
   @Param guardianError: string = '';
+  @Param repairMessage: string = '';
+  @Param repairActive: boolean = false;
   @Param initialSection: string = '';
   @Event onGuardianToggle: (enabled: boolean) => void = () => {};
   @Event onGuardianRefresh: () => void = () => {};
@@ -35,7 +37,7 @@ export struct SettingsPanel {
         .accessibilityText('自动守护')
         .onChange((enabled: boolean) => this.onGuardianToggle(enabled))
     }.width('100%').constraintSize({ minHeight: 44 })
-    Text('必要时会强制重启 Codex，可能中断任务和通话。模式保存在电脑，桌面重开后继续；手机退出不影响守护。')
+    Text(`${GuardianPresentation.restartPolicy(this.guardian)} 模式保存在电脑，桌面重开后继续；手机退出不影响守护。`)
       .width('100%').fontSize(scaleFontSize(12, this.fontScaleMode))
       .fontColor(appThemeTokens(this.darkMode).textSecondary)
     if (this.guardianError.length > 0) {
@@ -130,9 +132,16 @@ export struct SettingsPanel {
         Column({ space: 12 }) {
           this.Section('guardian', '自动守护', GuardianPresentation.summary(this.guardian, this.guardianError))
           if (this.section === 'guardian') { this.GuardianDetails() }
-          this.Section('voice', '语音与后台', this.voiceState)
+          this.Section('notifications', '后台提醒', this.pushState)
+          if (this.section === 'notifications') {
+            Text('任务在电脑继续运行。手机可收到完成和待处理提醒，打开后自动同步对话。')
+              .width('100%').fontSize(scaleFontSize(13, this.fontScaleMode))
+              .fontColor(appThemeTokens(this.darkMode).textSecondary)
+            this.Action('enable_push', '启用或刷新后台提醒')
+          }
+          this.Section('voice', '语音通话', this.voiceState)
           if (this.section === 'voice') {
-            Text(`后台连接：${this.backgroundState}。锁屏通话还受系统权限和网络状态影响。`)
+            Text('通话使用系统通话能力，结束后释放通话资源。')
               .width('100%').fontSize(scaleFontSize(13, this.fontScaleMode))
               .fontColor(appThemeTokens(this.darkMode).textSecondary)
           }
@@ -152,6 +161,13 @@ export struct SettingsPanel {
             this.Action('go_tools', '高级工具')
           }
           if (this.section === 'tools') {
+            if (this.repairMessage.length > 0) {
+              Row({ space: 8 }) {
+                if (this.repairActive) { LoadingProgress().width(16).height(16).color(appThemeTokens(this.darkMode).accent) }
+                Text(this.repairMessage).fontSize(scaleFontSize(12, this.fontScaleMode))
+                  .fontColor(appThemeTokens(this.darkMode).textSecondary).layoutWeight(1)
+              }.width('100%').padding({ top: 8, bottom: 8 })
+            }
             this.Action('go_overview', '项目总览')
             this.Action('go_tasks', '任务与事件')
             this.Action('desktop_monitor', '桌面监控')

@@ -10,7 +10,7 @@ test('voice tunnel recovery respects termination, persistent stop and task owner
   const result = JSON.parse(execFileSync('pwsh', ['-NoProfile', '-File', script], {
     encoding: 'utf8', windowsHide: true, timeout: 15_000
   }).trim());
-  assert.equal(result.passed, 27);
+  assert.equal(result.passed, 71);
   assert.equal(result.terminationRecovery, true);
   assert.equal(result.pauseResume, true);
   assert.equal(result.foreignTaskProtected, true);

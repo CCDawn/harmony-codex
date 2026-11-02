@@ -168,6 +168,7 @@ function runtimeSession(session, activeRun, officialState, epoch) {
         ? String(officialState?.terminalReason ?? session?.terminalReason ?? state)
         : '',
       lastVisibleRole: String(session?.lastVisibleRole ?? ''),
+      nativeState: String(officialState?.nativeState ?? session?.nativeState ?? ''),
       detailAvailable: session?.detailAvailable !== false
     },
     decision

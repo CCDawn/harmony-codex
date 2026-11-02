@@ -1,0 +1,2 @@
+import {CodexDesktopCdpClient} from '../src/codexDesktopCdpClient.js';
+const c=new CodexDesktopCdpClient();try{await c.ensureConnected();console.log(JSON.stringify(await c.evaluate(`(async()=>{const s=await(await fetch('app://-/assets/app-initial-25361a10f2bf.js')).text();const at=s.indexOf(' as Rm');return {import:s.slice(Math.max(0,at-40),at+60),qRo:s.slice(s.indexOf('async function qRo'),s.indexOf('async function qRo')+2400)};})()`)));}finally{c.close();}

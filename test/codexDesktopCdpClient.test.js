@@ -1,18 +1,136 @@
 import assert from 'node:assert/strict';
+import http from 'node:http';
+import net from 'node:net';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { once } from 'node:events';
 import {
   buildDesktopCdpWebSocketOptions,
   CodexDesktopCdpClient,
   extractConversationIdFromDesktopThreadKey,
   extractConversationIdFromPath,
   isRetryableCdpTransportError,
+  probeDesktopCdpLiveness,
   resolveDesktopCdpPort,
   resolveDesktopCdpPortCandidates,
   selectCodexDesktopCdpTarget
 } from '../src/codexDesktopCdpClient.js';
+
+function notificationHarness({ legacyCount = 0 } = {}) {
+  const listeners = [];
+  let window;
+  function newRenderer() {
+    listeners.length = 0;
+    window = { addEventListener(_type, callback) { listeners.push(callback); } };
+  }
+  function push(index, hostId = 'local') {
+    const data = { type: 'mcp-notification', hostId, method: 'item/agentMessage/delta',
+      params: { threadId: 'synthetic-thread', itemId: 'synthetic-item', delta: String(index) } };
+    for (const listener of listeners) listener({ data });
+  }
+  newRenderer();
+  if (legacyCount) {
+    // Simulate the collector already injected by the previous bridge version.
+    window.__codexHramonyBridge = { notifications: [], installed: true };
+    window.addEventListener('message', ({ data }) => {
+      const buffer = window.__codexHramonyBridge.notifications;
+      buffer.push({ at: Date.now(), hostId: data.hostId, method: data.method, params: data.params });
+      if (buffer.length > 1000) buffer.splice(0, buffer.length - 1000);
+    });
+    for (let index = 0; index < legacyCount; index++) push(index);
+  }
+  function client(hostId = 'local') {
+    const instance = new CodexDesktopCdpClient({ hostId });
+    instance.ensureConnected = async () => {};
+    instance.evaluate = async expression => structuredClone(new Function('window', `return (${expression});`)(window));
+    return instance;
+  }
+  return { client, push, newRenderer };
+}
+
+test('desktop deltas keep arriving after the 1000-entry renderer cache saturates', async () => {
+  const harness = notificationHarness();
+  const client = harness.client();
+  await client.installNotificationCollector();
+  for (let index = 0; index < 1000; index++) harness.push(index);
+  assert.equal((await client.drainNotifications()).length, 1000);
+  harness.push(1000);
+  assert.deepEqual((await client.drainNotifications()).map(item => item.params.delta), ['1000']);
+  harness.push(1001);
+  assert.deepEqual((await client.drainNotifications()).map(item => item.params.delta), ['1001']);
+  assert.deepEqual(await client.drainNotifications(), []);
+  // More than one full buffer can arrive between reads. Deliver the retained
+  // suffix once, then keep following later deltas instead of freezing again.
+  for (let index = 1002; index < 2502; index++) harness.push(index);
+  const retained = await client.drainNotifications();
+  assert.equal(retained.length, 1000);
+  assert.equal(retained[0].params.delta, '1502');
+  assert.equal(retained.at(-1).params.delta, '2501');
+  harness.push(2502);
+  assert.deepEqual((await client.drainNotifications()).map(item => item.params.delta), ['2502']);
+});
+
+test('session replay is non-consuming and shares stable identities with the live notification drain', async () => {
+  const h = notificationHarness();
+  const client = h.client();
+  await client.installNotificationCollector();
+  h.push('one'); h.push('two'); h.push('other-host', 'remote');
+  const offset = client.notificationOffset;
+  const first = await client.readRetainedNotifications('synthetic-thread');
+  assert.equal(client.notificationOffset, offset);
+  assert.equal(first.length, 2);
+  assert.ok(first[0].notificationId);
+  assert.notEqual(first[0].notificationId, first[1].notificationId);
+  const live = await client.drainNotifications();
+  assert.deepEqual(live.map(event => event.notificationId), first.map(event => event.notificationId));
+  assert.deepEqual(await client.readRetainedNotifications('synthetic-thread'), first);
+  assert.deepEqual(await client.drainNotifications(), []);
+  assert.deepEqual(await client.readRetainedNotifications('another-thread'), []);
+});
+
+test('a legacy full cache is baselined without replay and remains readable by independent clients', async () => {
+  const harness = notificationHarness({ legacyCount: 1000 });
+  const first = harness.client();
+  const second = harness.client();
+  await first.installNotificationCollector();
+  await second.installNotificationCollector();
+  assert.deepEqual(await first.drainNotifications(), []);
+  assert.deepEqual(await second.drainNotifications(), []);
+  harness.push(1000);
+  for (const client of [first, second]) {
+    assert.deepEqual((await client.drainNotifications()).map(item => item.params.delta), ['1000']);
+    assert.deepEqual(await client.drainNotifications(), []);
+  }
+});
+
+test('collector reinstall preserves unread deltas on the same renderer and baselines a replacement renderer', async () => {
+  const harness = notificationHarness();
+  const client = harness.client();
+  await client.installNotificationCollector();
+  harness.push('first');
+  await client.drainNotifications();
+  client.close();
+  harness.push('during-disconnect');
+  await client.installNotificationCollector();
+  assert.deepEqual((await client.drainNotifications()).map(item => item.params.delta), ['during-disconnect']);
+  harness.newRenderer();
+  await client.installNotificationCollector();
+  harness.push('new-renderer');
+  assert.deepEqual((await client.drainNotifications()).map(item => item.params.delta), ['new-renderer']);
+});
+
+test('concurrent drains on one client deliver each notification once and keep other hosts isolated', async () => {
+  const harness = notificationHarness();
+  const client = harness.client();
+  await client.installNotificationCollector();
+  harness.push('local');
+  harness.push('remote', 'other-host');
+  const results = await Promise.all([client.drainNotifications(), client.drainNotifications()]);
+  assert.deepEqual(results.flat().map(item => item.params.delta), ['local']);
+  assert.deepEqual(await client.drainNotifications(), []);
+});
 
 test('current turn lookup uses bounded official pages in chronological order', async () => {
   const client = new CodexDesktopCdpClient();
@@ -191,7 +309,7 @@ test('resolveDesktopCdpPort accepts fresh desktop live status files', () => {
   }
 });
 
-test('resolveDesktopCdpPort ignores non-injected desktop live status files', () => {
+test('resolveDesktopCdpPort probes the selected port while desktop injection is starting', () => {
   const tempRoot = mkdtempSync(path.join(tmpdir(), 'codex-cdp-status-'));
   try {
     const statusPath = path.join(tempRoot, 'desktop-live-status.json');
@@ -204,7 +322,19 @@ test('resolveDesktopCdpPort ignores non-injected desktop live status files', () 
     assert.equal(resolveDesktopCdpPort({
       CODEX_DESKTOP_CDP_STATUS_PATH: statusPath,
       CODEX_DESKTOP_CDP_STATUS_MAX_AGE_MS: '600000'
-    }), 9229);
+    }), 51415);
+  } finally {
+    rmSync(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test('resolveDesktopCdpPort ignores failed desktop live status files', () => {
+  const tempRoot = mkdtempSync(path.join(tmpdir(), 'codex-cdp-status-'));
+  try {
+    const statusPath = path.join(tempRoot, 'desktop-live-status.json');
+    writeFileSync(statusPath, JSON.stringify({ status: 'failed', cdpPort: 51415,
+      updatedAt: new Date().toISOString() }));
+    assert.deepEqual(resolveDesktopCdpPortCandidates({ CODEX_DESKTOP_CDP_STATUS_PATH: statusPath }), [9229]);
   } finally {
     rmSync(tempRoot, { recursive: true, force: true });
   }
@@ -420,4 +550,114 @@ test('CodexDesktopCdpClient does not retry non-idempotent turn starts', async ()
 test('isRetryableCdpTransportError only matches CDP transport failures', () => {
   assert.equal(isRetryableCdpTransportError(new Error('Codex 桌面 CDP 连接错误')), true);
   assert.equal(isRetryableCdpTransportError(new Error('Codex 桌面 app-server 请求失败')), false);
+});
+
+// —— 桌面在线判定的地面真相：CDP DevTools 入口必须真实应答 ——
+// 复现 2026-10-19 事故：半死桌面外壳占住监听 socket，TCP 可达但 CDP 无应答。
+
+function startSilentPortHolder() {
+  // 只接受 TCP 连接、永不回字节——等价于半死外壳占住的 9229 监听 socket。
+  const server = net.createServer(() => {});
+  server.listen(0, '127.0.0.1');
+  return server;
+}
+
+function startHealthyCdpEndpoint() {
+  const server = http.createServer((request, response) => {
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({
+      Browser: 'Codex/26.721.4979.0',
+      'Protocol-Version': '1.3',
+      'User-Agent': 'Codex',
+      'V8-Version': '13.0'
+    }));
+  });
+  server.listen(0, '127.0.0.1');
+  return server;
+}
+
+async function serverPort(server) {
+  if (!server.listening) {
+    await once(server, 'listening');
+  }
+  return server.address().port;
+}
+
+test('CDP liveness marks a silent port holder as not alive', async () => {
+  const server = startSilentPortHolder();
+  try {
+    const port = await serverPort(server);
+    const startedAt = Date.now();
+    const result = await probeDesktopCdpLiveness({ ports: [port], timeoutMs: 400 });
+    assert.equal(result.checked, true);
+    assert.equal(result.ok, false);
+    assert.deepEqual(result.ports, [port]);
+    assert.match(result.reason, /无真实应答/);
+    // 短超时必须真的生效：半死 socket 不能把判定拖成无限等待。
+    assert.ok(Date.now() - startedAt < 5000, `liveness probe took ${Date.now() - startedAt}ms`);
+  } finally {
+    server.close();
+  }
+});
+
+test('CDP liveness accepts an endpoint that truly answers /json/version', async () => {
+  const server = startHealthyCdpEndpoint();
+  try {
+    const port = await serverPort(server);
+    const result = await probeDesktopCdpLiveness({ ports: [port], timeoutMs: 2000 });
+    assert.equal(result.checked, true);
+    assert.equal(result.ok, true);
+    assert.equal(result.port, port);
+    assert.equal(result.browser, 'Codex/26.721.4979.0');
+  } finally {
+    server.close();
+  }
+});
+
+test('CDP liveness marks connection-refused ports as not alive', async () => {
+  // 先占用再释放，得到一个确定没有监听者的端口。
+  const placeholder = startSilentPortHolder();
+  const port = await serverPort(placeholder);
+  await new Promise((resolve) => placeholder.close(resolve));
+
+  const result = await probeDesktopCdpLiveness({ ports: [port], timeoutMs: 2000 });
+  assert.equal(result.checked, true);
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /无真实应答/);
+});
+
+test('CDP liveness falls through dead candidates to a live one and reports no ports', async () => {
+  const silent = startSilentPortHolder();
+  const healthy = startHealthyCdpEndpoint();
+  try {
+    const deadPort = await serverPort(silent);
+    const livePort = await serverPort(healthy);
+    const recovered = await probeDesktopCdpLiveness({ ports: [deadPort, livePort], timeoutMs: 400 });
+    assert.equal(recovered.ok, true);
+    assert.equal(recovered.port, livePort);
+
+    const none = await probeDesktopCdpLiveness({ ports: [], timeoutMs: 400 });
+    assert.equal(none.ok, false);
+    assert.equal(none.checked, true);
+    assert.match(none.reason, /没有可探测的 CDP 候选端口/);
+  } finally {
+    silent.close();
+    healthy.close();
+  }
+});
+
+test('CDP liveness rejects endpoints that answer with non-JSON bytes', async () => {
+  const server = http.createServer((request, response) => {
+    response.writeHead(200, { 'content-type': 'text/html' });
+    response.end('<html>not chrome devtools</html>');
+  });
+  server.listen(0, '127.0.0.1');
+  try {
+    const port = await serverPort(server);
+    const result = await probeDesktopCdpLiveness({ ports: [port], timeoutMs: 2000 });
+    assert.equal(result.ok, false);
+    assert.match(result.reason, /无法识别|无真实应答/);
+  } finally {
+    server.close();
+  }
 });

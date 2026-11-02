@@ -16,7 +16,8 @@ function fixture(requests = [command()]) {
 }
 function command(overrides = {}) {
   return { id: 7, method: 'item/commandExecution/requestApproval',
-    params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'item-1', command: 'echo test', cwd: 'C:/test' },
+    params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'item-1', command: 'echo test', cwd: 'C:/test',
+      availableDecisions: ['accept', 'decline'] },
     __desktopGeneration: 'generation-a', ...overrides };
 }
 function input() {
@@ -37,6 +38,68 @@ test('desktop-origin request needs no bridge run and only explicit response forw
   assert.deepEqual(calls[0].result, { decision: 'accept' });
   assert.equal(calls[0].threadId, 'thread-1');
   assert.equal((await service.list('thread-1')).length, 0);
+});
+
+test('native command accepts once or cancels when the desktop offers cancel without decline', async () => {
+  for (const [decision, expected] of [['approved', 'accept'], ['denied', 'cancel']]) {
+    const request = command({ id: 18, params: { ...command().params,
+      command: '"C:\\Program Files\\PowerShell\\7\\pwsh.exe" -Command Get-Date',
+      availableDecisions: ['accept', { acceptWithExecpolicyAmendment: { execpolicy_amendment: ['Get-Date'] } }, 'cancel'] } });
+    const { service, calls } = fixture([request]);
+    const [ticket] = await service.list('thread-1');
+    assert.equal(ticket.supportsResponse, true);
+    assert.equal(ticket.rejectLabel, '取消');
+    assert.match(ticket.detail, /Get-Date/);
+    await service.respond(ticket.id, { threadId: 'thread-1', decision });
+    assert.equal(calls.length, 1);
+    assert.deepEqual(calls[0].result, { decision: expected });
+  }
+});
+
+test('command decline wins over cancel and incomplete explicit decisions cannot be submitted', async () => {
+  const both = command({ params: { ...command().params, availableDecisions: ['accept', 'cancel', 'decline'] } });
+  const f = fixture([both]);
+  const [ticket] = await f.service.list('thread-1');
+  assert.equal(ticket.rejectLabel, undefined);
+  await f.service.respond(ticket.id, { threadId: 'thread-1', decision: 'denied' });
+  assert.deepEqual(f.calls[0].result, { decision: 'decline' });
+  for (const decisions of [[], ['accept'], ['cancel'], ['acceptForSession', 'cancel'], 'accept']) {
+    const h = fixture([command({ params: { ...command().params, availableDecisions: decisions } })]);
+    const [request] = await h.service.list('thread-1');
+    assert.equal(request.supportsResponse, false);
+    await assert.rejects(h.service.respond(request.id, { threadId: 'thread-1', decision: 'approved' }), { statusCode: 422 });
+    assert.equal(h.calls.length, 0);
+  }
+});
+
+test('legacy commands without an available decision list keep accept and decline behavior', async () => {
+  for (const decisions of [undefined, null]) {
+    for (const [decision, expected] of [['approved', 'accept'], ['denied', 'decline']]) {
+      const request = command({ params: { ...command().params, availableDecisions: decisions } });
+      const h = fixture([request]);
+      const [ticket] = await h.service.list('thread-1');
+      assert.equal(ticket.supportsResponse, true);
+      assert.equal(ticket.rejectLabel, undefined);
+      await h.service.respond(ticket.id, { threadId: 'thread-1', decision });
+      assert.deepEqual(h.calls[0].result, { decision: expected });
+    }
+  }
+});
+
+test('only async user input carries its original message and turn identity', async () => {
+  const asyncRequest = input();
+  asyncRequest.method = 'desktop/asyncUserInput';
+  asyncRequest.params.itemId = 'message-1';
+  asyncRequest.params.turnId = 'turn-1';
+  const syncRequest = input();
+  syncRequest.params.itemId = 'sync-message';
+  syncRequest.params.turnId = 'sync-turn';
+  const { service } = fixture([asyncRequest, { ...syncRequest, id: 9 }]);
+  const [asyncTicket, syncTicket] = await service.list('thread-1');
+  assert.equal(asyncTicket.itemId, 'message-1');
+  assert.equal(asyncTicket.turnId, 'turn-1');
+  assert.equal(syncTicket.itemId, undefined);
+  assert.equal(syncTicket.turnId, undefined);
 });
 
 test('desktop dismissal and changed request with reused id reject old phone action', async () => {
@@ -75,6 +138,34 @@ test('read transport failure expires tickets; ambiguous write never retries', as
   await assert.rejects(service.respond(next.id, { threadId: 'thread-1', decision: 'approved' }), { statusCode: 503 });
   await assert.rejects(service.respond(next.id, { threadId: 'thread-1', decision: 'approved' }), { statusCode: 409 });
   assert.equal(attempts, 1);
+});
+
+test('read failures preserve fixed diagnostic stage with a sanitized cause and expire old tickets', async () => {
+  const { service, client } = fixture();
+  const [ticket] = await service.list('thread-1');
+  client.listRequests = async () => {
+    throw Object.assign(new Error('PRIVATE_BODY_AND_SOURCE'), { code: 'PRIVATE_CODE',
+      stage: 'mounted-manager-ambiguous', cause: new Error('PRIVATE_CAUSE') });
+  };
+  await assert.rejects(service.list('thread-1'), error => {
+    assert.equal(error.statusCode, 503);
+    assert.deepEqual(error.diagnostic, { code: 'DESKTOP_INTERACTIONS_UNAVAILABLE', stage: 'mounted-manager-ambiguous' });
+    assert.equal(error.cause.message, 'DESKTOP_INTERACTIONS_UNAVAILABLE');
+    assert.equal(error.cause.stage, 'mounted-manager-ambiguous');
+    assert.equal(error.cause.cause, undefined);
+    assert.doesNotMatch(JSON.stringify(error), /PRIVATE/);
+    return true;
+  });
+  await assert.rejects(service.respond(ticket.id, { threadId: 'thread-1', decision: 'approved' }), { statusCode: 409 });
+  client.listRequests = async () => { throw Object.assign(new Error('PRIVATE'), { stage: 'PRIVATE_STAGE' }); };
+  await assert.rejects(service.list('thread-1'), { stage: 'transport' });
+  client.listRequests = async () => { throw Object.assign(new Error('PRIVATE'), { stage: 'mounted-manager-scan-timeout' }); };
+  await assert.rejects(service.list('thread-1'), error => {
+    assert.deepEqual(error.diagnostic, { code: 'DESKTOP_INTERACTIONS_UNAVAILABLE', stage: 'mounted-manager-scan-timeout' });
+    assert.equal(error.cause.stage, 'mounted-manager-scan-timeout');
+    assert.doesNotMatch(JSON.stringify(error), /PRIVATE/);
+    return true;
+  });
 });
 
 test('structured questions validate completeness, option membership and original ids', async () => {
@@ -158,4 +249,54 @@ test('async question answers use original question keys and conflict does not re
   await assert.rejects(service.respond(ticket.id, { threadId: 'thread-1', answers: { q: ['乙'] } }),
     error => error.statusCode === 409 && /不同答案/.test(error.message));
   assert.equal(attempts, 1);
+});
+
+
+test('only native-writable async questions advertise and forward per-question skip', async () => {
+  const request = input();
+  request.method = 'desktop/asyncUserInput';
+  request.__skipBindings = [['owner', 'binding']];
+  request.params.questions.push({ id: 'second', question: '第二题' });
+  request.__skipBindings.push(['owner', 'binding2']);
+  const { service, calls } = fixture([request]);
+  const [ticket] = await service.list('thread-1');
+  assert.equal(ticket.supportsSkip, true);
+  for (const body of [{ skipQuestionId: 'alien' }, { skipQuestionId: 'q', answers: { q: ['甲'] } },
+    { skipQuestionId: null }]) {
+    await assert.rejects(service.respond(ticket.id, { threadId: 'thread-1', ...body }), { statusCode: 400 });
+  }
+  assert.deepEqual(await service.respond(ticket.id, { threadId: 'thread-1', skipQuestionId: 'second' }), { resolved: true });
+  assert.deepEqual(calls[0].result, { skipQuestionId: 'second' });
+});
+
+test('missing capability and synchronous input never permit skip', async () => {
+  for (const method of ['desktop/asyncUserInput', 'item/tool/requestUserInput']) {
+    const request = input(); request.method = method;
+    const { service, calls } = fixture([request]);
+    const [ticket] = await service.list('thread-1');
+    assert.notEqual(ticket.supportsSkip, true);
+    await assert.rejects(service.respond(ticket.id, { threadId: 'thread-1', skipQuestionId: 'q' }), { statusCode: 422 });
+    assert.equal(calls.length, 0);
+  }
+});
+
+
+test('failed native skip expires its ticket and is never automatically retried', async () => {
+  const request = input(); request.method = 'desktop/asyncUserInput';
+  request.__skipBindings = [['owner', 'binding']];
+  const { service, client } = fixture([request]);
+  const [ticket] = await service.list('thread-1');
+  let attempts = 0;
+  client.respond = async () => { attempts++; throw new Error('unconfirmed'); };
+  await assert.rejects(service.respond(ticket.id, { threadId: 'thread-1', skipQuestionId: 'q' }), { statusCode: 503 });
+  await assert.rejects(service.respond(ticket.id, { threadId: 'thread-1', skipQuestionId: 'q' }), { statusCode: 409 });
+  assert.equal(attempts, 1);
+});
+
+test('skip cannot turn into an approval when a decision is also supplied', async () => {
+  const { service, calls } = fixture();
+  const [ticket] = await service.list('thread-1');
+  await assert.rejects(service.respond(ticket.id, { threadId: 'thread-1', decision: 'approved', skipQuestionId: 'q' }),
+    { statusCode: 422 });
+  assert.equal(calls.length, 0);
 });

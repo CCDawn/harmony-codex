@@ -53,7 +53,8 @@ function state(api = {}) {
   };
   for (const [name, args, async] of [
     ['desktopInteractionSessionId', ''], ['visibleDesktopInteractions', ''],
-    ['refreshDesktopInteractions', '', true], ['respondDesktopInteraction', 'request, decision', true],
+    ['refreshDesktopInteractions', '', true], ['respondDesktopInteraction', "request, decision, skipQuestionId = ''", true],
+    ['desktopAnswerScope', 'request'],
     ['isInteractionBusy', 'source, threadId, requestId'], ['setInteractionBusy', 'source, threadId, requestId, busy'],
     ['interactionAnswer', 'source, threadId, requestId, questionId'],
     ['setInteractionAnswer', 'source, threadId, requestId, questionId, value'],
@@ -72,7 +73,8 @@ test('current conversation reaches both desktop interactions and legacy question
   const conversation = methodBody(index, 'SessionConversationPanel');
   assert.equal((conversation.match(/this\.SessionPendingInteractions\(\)/g) ?? []).length, 2);
   const body = methodBody(index, 'SessionPendingInteractions');
-  assert.match(body, /SessionInteractionPanel\(/);
+  assert.match(body, /SessionDesktopInteractionView\(/);
+  assert.match(methodBody(index, 'SessionDesktopInteractionView'), /SessionInteractionPanel\(/);
   assert.match(body, /this\.UserInputForm\(\)/);
   assert.match(body, /Scroll\(\)/);
   assert.match(body, /constraintSize\(\{ maxHeight:/);
@@ -316,4 +318,54 @@ test('question panel reads the exact scoped answers produced by Index and indepe
   assert.equal(component.canSubmitAnswers(), false);
   component.request = { ...request, supportsResponse: false };
   assert.equal(component.canSubmitAnswers(), false);
+});
+
+test('skip uses native per-question action once and preserves remaining draft through ticket renewal', async () => {
+  const pending = deferred();
+  const calls = [];
+  const request = { ...interaction('old-ticket', 'user-input'), turnId: 'turn-1', itemId: 'item-1', supportsSkip: true,
+    questions: [{ id: 'q', question: 'First?' }, { id: 'q2', question: 'Second?' }] };
+  const renewed = { ...request, id: 'new-ticket', questions: [request.questions[1]] };
+  const value = state({ respondDesktopInteraction: (...args) => { calls.push(args); return pending.promise; },
+    listDesktopInteractions: async () => [renewed] });
+  value.desktopInteractions = [request];
+  value.setDesktopInteractionAnswer(request, 'q', 'discard this draft');
+  value.setDesktopInteractionAnswer(request, 'q2', 'keep second');
+  const skip = value.respondDesktopInteraction(request, '', 'q');
+  value.desktopInteractions = [renewed];
+  await value.respondDesktopInteraction(renewed, '', 'q2');
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0][2], { threadId: 'thread-a', skipQuestionId: 'q' });
+  pending.resolve();
+  await skip;
+  const scope = value.desktopAnswerScope(renewed);
+  assert.equal(value.interactionAnswer('desktop', 'thread-a', scope, 'q'), '');
+  assert.equal(value.interactionAnswer('desktop', 'thread-a', scope, 'q2'), 'keep second');
+  const component = { request: renewed, answers: value.userInputAnswers, answer: compile(panel, 'answer', 'questionId') };
+  assert.equal(component.answer('q2'), 'keep second');
+  assert.equal(value.message, '已跳过此问题');
+});
+
+test('a successful empty refresh clears settled submit errors but cannot erase a newer failure', async () => {
+  const first = deferred();
+  const value = state({ listDesktopInteractions: () => first.promise });
+  value.interactionSubmitError = 'previous failure';
+  const refresh = value.refreshDesktopInteractions();
+  value.interactionSubmitError = 'new failure';
+  first.resolve([]);
+  await refresh;
+  assert.equal(value.interactionSubmitError, 'new failure');
+  await value.refreshDesktopInteractions();
+  assert.equal(value.interactionSubmitError, '');
+});
+
+test('skip rejects foreign questions and unsupported native capability without sending any answer', async () => {
+  const calls = [];
+  const value = state({ respondDesktopInteraction: (...args) => calls.push(args) });
+  const request = { ...interaction('ask', 'user-input'), supportsSkip: true };
+  value.desktopInteractions = [request];
+  await value.respondDesktopInteraction(request, '', 'foreign');
+  request.supportsSkip = false;
+  await value.respondDesktopInteraction(request, '', 'q');
+  assert.equal(calls.length, 0);
 });

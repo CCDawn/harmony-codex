@@ -1,0 +1,47 @@
+{
+  "VerifiedAt": "2026-10-08T06:53:37.0050334Z",
+  "SnapshotAt": "2026-10-08T06:53:21.2489592Z",
+  "Severity": "degraded",
+  "CheckCount": 7,
+  "Checks": [
+    {
+      "id": "bridge",
+      "state": "ready"
+    },
+    {
+      "id": "desktop",
+      "state": "blocked"
+    },
+    {
+      "id": "sessions",
+      "state": "error"
+    },
+    {
+      "id": "companion",
+      "state": "error"
+    },
+    {
+      "id": "computer",
+      "state": "unknown"
+    },
+    {
+      "id": "voice",
+      "state": "unverified"
+    },
+    {
+      "id": "phone_debug",
+      "state": "waiting"
+    }
+  ],
+  "HeartbeatAgeSeconds": 4.426063,
+  "TrayPid": 48468,
+  "LatestWatchdogUpdate": {
+    "UpdatedAt": "2026-10-08T06:45:51.1288406Z",
+    "OldWatchdogPid": 16984,
+    "NewWatchdogPid": 54032,
+    "WatchdogRunning": true,
+    "ProtectedProcessCount": 38,
+    "ProtectedProcessesPreserved": true,
+    "SupervisorArmed": true
+  }
+}

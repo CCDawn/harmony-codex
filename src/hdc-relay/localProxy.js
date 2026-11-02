@@ -24,12 +24,14 @@ export function createLocalProxy({
     relaySocket.setNoDelay(true);
     activeSockets.add(hdcSocket);
     activeSockets.add(relaySocket);
-    const forgetSockets = () => {
+    hdcSocket.on('close', () => {
       activeSockets.delete(hdcSocket);
+      relaySocket.destroy();
+    });
+    relaySocket.on('close', () => {
       activeSockets.delete(relaySocket);
-    };
-    hdcSocket.on('close', forgetSockets);
-    relaySocket.on('close', forgetSockets);
+      hdcSocket.destroy();
+    });
     hdcSocket.on('error', () => {
       relaySocket.destroy();
     });

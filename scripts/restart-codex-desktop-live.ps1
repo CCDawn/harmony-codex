@@ -72,12 +72,11 @@ function Test-PlainCodexShellRunning {
 function Get-CodexDesktopProcesses {
   Get-CimInstance Win32_Process | Where-Object {
     $path = [string]$_.ExecutablePath
-    $cmd = [string]$_.CommandLine
-    $isPackagedChatGpt = $path -match '\\OpenAI\.Codex_[^\\]+\\app\\ChatGPT\.exe$' -or
-      $cmd -match '\\OpenAI\.Codex_[^\\]+\\app\\ChatGPT\.exe'
-    $isLegacyCodex = $path.EndsWith('\app\Codex.exe', [System.StringComparison]::OrdinalIgnoreCase) -or
-      ($cmd -match '\\app\\Codex\.exe"?(?:\s|$)')
-    $isPackagedChatGpt -or $isLegacyCodex
+    # A helper can mention the desktop path in its arguments. Only the actual
+    # executable identifies a desktop process; never match arbitrary arguments.
+    $isPackagedChatGpt = $path -match '\\OpenAI\.Codex_[^\\]+\\app\\ChatGPT\.exe$'
+    $isLegacyCodex = $path.EndsWith('\app\Codex.exe', [System.StringComparison]::OrdinalIgnoreCase)
+    $_.ProcessId -ne $PID -and ($isPackagedChatGpt -or $isLegacyCodex)
   }
 }
 
@@ -484,7 +483,7 @@ if ($KeepExistingCodex -and (Test-CdpReady -Port $selectedCdpPort)) {
   }
   if ($StartOnly -and @(Get-CodexDesktopProcesses).Count -gt 0) { exit 11 }
   Assert-GuardianDesktopRepairAllowed
-  Start-Process -FilePath $codexDesktopExe -ArgumentList $arguments -WorkingDirectory $codexAppDir
+  Start-Process -WindowStyle Minimized -FilePath $codexDesktopExe -ArgumentList $arguments -WorkingDirectory $codexAppDir
   Write-Host "已直接启动 Codex Electron 桌面壳并保留 CDP 参数: $codexDesktopExe" -ForegroundColor DarkGray
 }
 

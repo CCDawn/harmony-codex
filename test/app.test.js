@@ -325,12 +325,13 @@ test('interrupts a running task by Codex session id', async () => {
     assert.equal(interruptResponse.status, 200);
     const interrupted = await interruptResponse.json();
 
-    assert.equal(interrupted.run.id, created.task.id);
+    assert.notEqual(interrupted.run.id, created.task.id);
+    assert.equal(interrupted.run.syntheticInterrupt, true);
     assert.equal(interrupted.run.status, 'running');
     assert.equal(interrupted.run.interruptRequested, true);
     assert.equal(interrupted.run.interruptDispatching, true);
     assert.equal(interrupted.run.interruptState, 'dispatching');
-    const finalTask = await waitForTaskStatus(store, created.task.id, 'interrupted');
+    const finalTask = await waitForTaskStatus(store, interrupted.run.id, 'interrupted');
     assert.equal(finalTask.error, '已中断当前会话');
     assert.equal(adapter.interrupted.threadId, '019e-interrupt-thread');
     assert.equal(adapter.interrupted.turnId, 'turn-interrupt-1');
@@ -2140,6 +2141,12 @@ test('exposes Codex thread sync API with file cursors', async () => {
     assert.deepEqual(seen.params, { limit: '40', after: '123', before: '' });
     assert.equal(body.session.sync.cursorEnd, '20');
     assert.equal(body.session.entries[0].text, '增量回复');
+    assert.deepEqual(body.thread, body.session, 'legacy responses keep both aliases');
+    const compactResponse = await fetch(`${baseUrl}/api/codex/threads/019e-sync-thread/sync?limit=1&view=session`);
+    const compact = await compactResponse.json();
+    assert.equal(compactResponse.status, 200);
+    assert.equal(Object.hasOwn(compact, 'thread'), false);
+    assert.deepEqual(compact.session, body.session, 'phone opt-in keeps the complete canonical session once');
   } finally {
     server.close();
   }
@@ -2511,7 +2518,7 @@ test('outbox admits a desktop-owned running turn after bridge task memory is los
   config.sessions = new FakeSessionVerifier();
   const adapter = new DesktopVerifiedAdapter();
   adapter.steer = async () => ({ accepted: true });
-  const { server, store } = createApp({ config, adapter });
+  const { server, store, outbox } = createApp({ config, adapter });
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
   try {
@@ -2522,7 +2529,7 @@ test('outbox admits a desktop-owned running turn after bridge task memory is los
     });
     const body = await response.json();
     assert.equal(response.status, 202);
-    assert.equal(body.outbox.status, 'submitted');
+    await until(() => outbox.get(body.outbox.id)?.status === 'submitted');
     await until(() => adapter.runs.length === 1);
   } finally {
     server.close();
@@ -2573,7 +2580,7 @@ test('steers a running desktop task immediately instead of leaving guidance stuc
     }
   };
   const adapter = new HybridCodexAdapter({ desktopAdapter });
-  const { server, store } = createApp({ config, adapter });
+  const { server, store, outbox } = createApp({ config, adapter });
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
 
@@ -2602,6 +2609,7 @@ test('steers a running desktop task immediately instead of leaving guidance stuc
     assert.equal(response.status, 202);
     assert.equal(body.run.id, body.outbox.id);
     assert.equal(body.run.status, 'queued');
+    await until(() => outbox.get(body.outbox.id)?.resultId === running.id);
     assert.deepEqual(steered, [{
       taskId: running.id,
       prompt: '这是运行中的引导消息'
@@ -2609,8 +2617,10 @@ test('steers a running desktop task immediately instead of leaving guidance stuc
     assert.equal(store.getTask(running.id).id, running.id);
     assert.equal(store.getTask(running.id).prompt, '这是运行中的引导消息');
     assert.equal(store.listTasks().length, 1);
-    assert.equal(body.outbox.status, 'dispatching');
-    assert.equal(body.outbox.resultId, running.id);
+    await until(() => outbox.get(body.outbox.id).status === 'submitted');
+    assert.equal(outbox.get(body.outbox.id).result.deliveryPending, false);
+    assert.equal(store.getTask(running.id).status, 'running', 'delivery ACK does not wait for model completion');
+    assert.equal(outbox.get(body.outbox.id).resultId, running.id);
     finishRun();
     await waitForTaskStatus(store, running.id, 'completed');
     finishRun = () => {};
@@ -2637,11 +2647,13 @@ test('retries a safely failed strict desktop outbox submission with the same id'
         codexSessionId: context.task.codexSessionId,
         prompt: context.task.prompt
       });
-      throw new Error('Codex 桌面恢复会话后 CDP 未稳定：Codex 桌面 CDP 连接错误');
+      throw Object.assign(new Error('Codex 桌面恢复会话后 CDP 未稳定：Codex 桌面 CDP 连接错误'), {
+        deliveryAttempted: false
+      });
     }
     return await originalRun(context);
   };
-  const { server, store } = createApp({ config, adapter });
+  const { server, store, outbox } = createApp({ config, adapter });
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
 
@@ -2660,13 +2672,16 @@ test('retries a safely failed strict desktop outbox submission with the same id'
 
     const firstResponse = await send();
     const first = await firstResponse.json();
-    await waitForTaskStatus(store, first.run.id, 'failed');
+    await until(() => Boolean(outbox.get(first.outbox.id)?.resultId));
+    const firstTaskId = outbox.get(first.outbox.id).resultId;
+    await waitForTaskStatus(store, firstTaskId, 'failed');
 
     const secondResponse = await send();
     const second = await secondResponse.json();
     assert.equal(secondResponse.status, 202);
-    assert.notEqual(second.run.id, first.run.id);
-    await waitForTaskStatus(store, second.run.id, 'completed');
+    await until(() => Boolean(outbox.get(second.outbox.id)?.resultId)
+      && outbox.get(second.outbox.id).resultId !== firstTaskId);
+    await waitForTaskStatus(store, outbox.get(second.outbox.id).resultId, 'completed');
     assert.equal(adapter.runs.length, 2);
     assert.equal(store.listTasks().length, 2);
   } finally {
@@ -4006,6 +4021,8 @@ function missingCodexDiagnostics(live) {
 }
 
 test('armed desktop app queues a phone send and relaunches when Codex is missing', async () => {
+  const previousAutoRelaunch = process.env.CODEX_BRIDGE_AUTO_RELAUNCH_MISSING_DESKTOP;
+  process.env.CODEX_BRIDGE_AUTO_RELAUNCH_MISSING_DESKTOP = '1';
   const config = createTestConfig();
   config.desktopSupervisor = { armed: true };
   config.sessions = new FakeSessionVerifier();
@@ -4070,6 +4087,11 @@ test('armed desktop app queues a phone send and relaunches when Codex is missing
     assert.equal(ran, true);
   } finally {
     server.close();
+    if (previousAutoRelaunch === undefined) {
+      delete process.env.CODEX_BRIDGE_AUTO_RELAUNCH_MISSING_DESKTOP;
+    } else {
+      process.env.CODEX_BRIDGE_AUTO_RELAUNCH_MISSING_DESKTOP = previousAutoRelaunch;
+    }
   }
 });
 
@@ -4193,6 +4215,8 @@ test('closed desktop app does not relaunch missing Codex from phone send or link
 });
 
 test('armed link recover starts a missing Codex without waiting for the restart', async () => {
+  const previousAutoRelaunch = process.env.CODEX_BRIDGE_AUTO_RELAUNCH_MISSING_DESKTOP;
+  process.env.CODEX_BRIDGE_AUTO_RELAUNCH_MISSING_DESKTOP = '1';
   const config = createTestConfig();
   config.desktopSupervisor = { armed: true };
   config.sessions = {
@@ -4239,6 +4263,11 @@ test('armed link recover starts a missing Codex without waiting for the restart'
     assert.equal(recoverMode, 'hard');
   } finally {
     server.close();
+    if (previousAutoRelaunch === undefined) {
+      delete process.env.CODEX_BRIDGE_AUTO_RELAUNCH_MISSING_DESKTOP;
+    } else {
+      process.env.CODEX_BRIDGE_AUTO_RELAUNCH_MISSING_DESKTOP = previousAutoRelaunch;
+    }
   }
 });
 
@@ -4653,6 +4682,8 @@ class InterruptibleAdapter {
     emit('codex.app_server.thread.ready', {
       threadId: '019e-interrupt-thread'
     });
+    this.activeTurnId = 'turn-interrupt-1';
+    this.runEmit = emit;
     emit('codex.app_server.turn.started', {
       turn: {
         id: 'turn-interrupt-1'
@@ -4664,16 +4695,21 @@ class InterruptibleAdapter {
     throw new Error('interrupted by test');
   }
 
-  async interrupt({ task, emit }) {
+  async interrupt({ task, emit, interruptScope = 'task' }) {
+    const turnId = interruptScope === 'thread' ? this.activeTurnId : task.activeCodexTurnId;
+    if (interruptScope === 'thread') {
+      emit('codex.app_server.turn.active_found_for_interrupt', { threadId: task.codexSessionId, turnId });
+    }
     this.interrupted = {
       threadId: task.codexSessionId,
-      turnId: task.activeCodexTurnId,
+      turnId,
       status: 'interrupted',
       observedAt: new Date().toISOString()
     };
     emit('codex.app_server.turn.interrupted', this.interrupted);
+    this.runEmit?.('codex.app_server.turn.interrupted', this.interrupted);
     this.releaseRun?.();
-    return { ok: true };
+    return { ok: true, accepted: true, confirmed: true, ...this.interrupted };
   }
 }
 
@@ -5513,5 +5549,105 @@ test('paths outside desktop and health keep full 2FA on loopback without forward
     server.close();
     restoreEnv('CODEX_BRIDGE_TOKEN', previousToken);
     restoreEnv('CODEX_BRIDGE_TOTP_SECRET', previousSecret);
+  }
+});
+
+// —— 桌面在线判定以 CDP 真实应答为准（2026-10-19 半死外壳事故） ——
+
+test('desktop live status demotes a desktopLive claim when CDP never truly answers', async () => {
+  const config = createTestConfig();
+  const adapter = {
+    async getDesktopLiveStatus() {
+      // 半死桌面外壳形态：脚本桥心跳仍在，上游已误判 desktopLive=true。
+      return {
+        ok: true,
+        desktopLive: true,
+        status: 'ready',
+        currentSessionId: null,
+        targetSessionId: '',
+        sessionVerified: false,
+        transport: 'script',
+        message: '桌面脚本桥已连接',
+        checkedAt: new Date().toISOString()
+      };
+    }
+  };
+  config.desktopLiveDiagnostics = {
+    async inspect() {
+      return {
+        available: true,
+        desktopProcessMode: 'cdp',
+        cdpPort: 9229,
+        candidateCdpPorts: [9229],
+        cdpResponsive: false,
+        cdpLiveness: {
+          checked: true,
+          ok: false,
+          ports: [9229],
+          reason: 'CDP 端口有监听但无真实应答（127.0.0.1:9229）：请求 Codex 桌面 CDP 入口超时'
+        },
+        failureClass: 'desktop_cdp_unavailable',
+        requiresDesktopCdp: false,
+        mobileRecoverable: true
+      };
+    }
+  };
+  const { server } = createApp({ config, adapter });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+
+  try {
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    const response = await fetch(`${baseUrl}/desktop/live/status`);
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(body.desktop.desktopLive, false);
+    assert.equal(body.desktop.status, 'unavailable');
+    assert.equal(body.desktop.demotedByCdpLiveness, true);
+    assert.equal(body.desktop.cdpResponsive, false);
+    assert.equal(body.desktop.failureClass, 'desktop_cdp_unavailable');
+    assert.match(body.desktop.message, /CDP 真实应答/);
+  } finally {
+    server.close();
+  }
+});
+
+test('desktop script status reports online only when CDP liveness truly answers', async () => {
+  const config = createTestConfig();
+  let livenessOk = false;
+  config.desktopCdpLivenessProbe = async () => ({
+    checked: true,
+    ok: livenessOk,
+    ports: [9229],
+    reason: livenessOk ? '' : 'CDP 端口有监听但无真实应答（127.0.0.1:9229）'
+  });
+  const { server } = createApp({ config, adapter: new MockCodexAdapter() });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+
+  try {
+    desktopScriptBridge.reset();
+    const baseUrl = `http://127.0.0.1:${server.address().port}`;
+    // live-host 仍在心跳：脚本桥自身处于 online 状态。
+    desktopScriptBridge.connect({
+      scriptId: 'zombie-live-host',
+      currentSessionId: null
+    }, { replace: true });
+
+    const dead = await fetch(`${baseUrl}/desktop/script/status`);
+    assert.equal(dead.status, 200);
+    const deadBody = await dead.json();
+    assert.equal(deadBody.bridge.cdpLiveness.ok, false);
+    assert.equal(deadBody.bridge.online, false, '端口通但 CDP 无应答时不得报告桌面在线');
+
+    livenessOk = true;
+    const alive = await fetch(`${baseUrl}/desktop/script/status`);
+    assert.equal(alive.status, 200);
+    const aliveBody = await alive.json();
+    assert.equal(aliveBody.bridge.cdpLiveness.ok, true);
+    assert.equal(aliveBody.bridge.online, true, 'CDP 正常应答时才报告桌面在线');
+  } finally {
+    desktopScriptBridge.reset();
+    server.close();
   }
 });

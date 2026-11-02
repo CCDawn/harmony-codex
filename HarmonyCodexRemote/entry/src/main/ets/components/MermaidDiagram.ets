@@ -2,6 +2,14 @@ import { webview } from '@kit.ArkWeb';
 import { MarkdownDocumentService } from '../services/MarkdownDocumentService';
 import { scaleFontSize } from '../theme/AppTypography';
 
+class MermaidRenderBridge {
+  onCompleted: (revision: number, result: string) => void = () => {};
+
+  completed(revision: number, result: string): void {
+    this.onCompleted(revision, result);
+  }
+}
+
 /**
  * Renders a vetted Mermaid flowchart in a bundled ArkWeb document. Mermaid
  * itself never receives network access and any unsupported or invalid source
@@ -18,16 +26,37 @@ export struct MermaidDiagram {
   @Local rendererReady: boolean = false;
   @Local renderError: string = '';
   @Local renderRevision: number = 0;
+  @Local rendererVisible: boolean = false;
+  @Local rendererGeneration: number = 0;
 
   private webController: webview.WebviewController = new webview.WebviewController();
+  private renderBridge: MermaidRenderBridge = new MermaidRenderBridge();
+  private componentActive: boolean = false;
 
   aboutToAppear(): void {
+    this.componentActive = true;
+    this.renderBridge.onCompleted = (revision: number, result: string): void => {
+      this.onRenderCompleted(revision, result);
+    };
     this.renderError = MarkdownDocumentService.mermaidSourceError(this.source);
+  }
+
+  aboutToDisappear(): void {
+    this.componentActive = false;
+    this.rendererVisible = false;
+    this.invalidateRenderer();
   }
 
   @Monitor('source')
   private onSourceChanged(): void {
+    const hadError = this.renderError.length > 0;
     this.renderError = MarkdownDocumentService.mermaidSourceError(this.source);
+    if (hadError || this.renderError.length > 0) {
+      this.invalidateRenderer();
+      if (this.rendererVisible && this.renderError.length === 0) {
+        this.webController = new webview.WebviewController();
+      }
+    }
     this.requestRender();
   }
 
@@ -36,29 +65,44 @@ export struct MermaidDiagram {
     this.requestRender();
   }
 
+  private invalidateRenderer(): void {
+    this.renderRevision += 1;
+    this.rendererGeneration += 1;
+    this.rendererReady = false;
+  }
+
+  private onVisibilityChanged(isVisible: boolean, ratio: number): void {
+    const visible = this.componentActive && isVisible && ratio > 0;
+    if (visible === this.rendererVisible) return;
+    this.rendererVisible = visible;
+    this.invalidateRenderer();
+    if (visible) {
+      this.renderError = MarkdownDocumentService.mermaidSourceError(this.source);
+      this.webController = new webview.WebviewController();
+    }
+  }
+
+  private onRendererPageEnd(generation: number): void {
+    if (!this.componentActive || !this.rendererVisible || generation !== this.rendererGeneration
+      || this.renderError.length > 0) return;
+    this.rendererReady = true;
+    this.requestRender();
+  }
+
   build() {
     Column({ space: 8 }) {
       this.Header()
       if (this.renderError.length > 0) {
         this.FallbackCard(this.renderError)
+      } else if (this.rendererVisible) {
+        this.Renderer(this.rendererGeneration)
       } else {
-        Web({
-          src: $rawfile('mermaid/mermaid_renderer.html'),
-          controller: this.webController
-        })
+        Column() {}
           .width('100%')
           .height(this.diagramHeight())
-          .javaScriptAccess(true)
-          .domStorageAccess(false)
-          .fileAccess(false)
-          .blockNetwork(true)
           .backgroundColor(this.surfaceColor())
           .border({ width: 1, color: this.diagramBorderColor() })
           .borderRadius(12)
-          .onPageEnd(() => {
-            this.rendererReady = true;
-            this.requestRender();
-          })
       }
       if (this.sourceVisible) {
         this.SourceCard()
@@ -66,6 +110,31 @@ export struct MermaidDiagram {
     }
     .width('100%')
     .padding({ top: 8, bottom: 8 })
+    .onVisibleAreaChange([0.0, 1.0], (isVisible: boolean, ratio: number) => {
+      this.onVisibilityChanged(isVisible, ratio);
+    })
+  }
+
+  @Builder
+  private Renderer(generation: number) {
+    Web({
+      src: $rawfile('mermaid/mermaid_renderer.html'),
+      controller: this.webController
+    })
+      .width('100%')
+      .height(this.diagramHeight())
+      .javaScriptAccess(true)
+      .javaScriptProxy({ object: this.renderBridge, name: 'MermaidNative', methodList: ['completed'],
+        controller: this.webController })
+      .domStorageAccess(false)
+      .fileAccess(false)
+      .blockNetwork(true)
+      .backgroundColor(this.surfaceColor())
+      .border({ width: 1, color: this.diagramBorderColor() })
+      .borderRadius(12)
+      .onPageEnd(() => {
+        this.onRendererPageEnd(generation);
+      })
   }
 
   @Builder
@@ -124,6 +193,7 @@ export struct MermaidDiagram {
   private SourceCard() {
     Scroll() {
       Text(this.source)
+        .copyOption(CopyOptions.LocalDevice)
         .fontSize(this.uiFontSize(10))
         .fontColor(this.darkMode ? '#C8D4E3' : '#273849')
         .fontFamily('monospace')
@@ -140,10 +210,10 @@ export struct MermaidDiagram {
   }
 
   private requestRender(): void {
-    if (!this.rendererReady || this.renderError.length > 0) {
+    this.renderRevision += 1;
+    if (!this.componentActive || !this.rendererVisible || !this.rendererReady || this.renderError.length > 0) {
       return;
     }
-    this.renderRevision += 1;
     void this.renderDiagram(this.renderRevision);
   }
 
@@ -155,20 +225,22 @@ export struct MermaidDiagram {
       revision
     });
     try {
-      const result = await this.webController.runJavaScript(
+      await this.webController.runJavaScript(
         `window.renderMermaid(${JSON.stringify(payload)})`
       );
-      if (revision !== this.renderRevision) {
-        return;
-      }
-      const normalized = String(result ?? '');
-      if (!normalized.includes('MERMAID_RENDERED')) {
-        this.renderError = this.readRendererError(normalized);
-      }
     } catch (_error) {
-      if (revision === this.renderRevision) {
+      if (this.componentActive && this.rendererVisible && revision === this.renderRevision) {
         this.renderError = '离线 Mermaid 渲染器暂不可用，请展开源码查看。';
+        this.invalidateRenderer();
       }
+    }
+  }
+
+  private onRenderCompleted(revision: number, result: string): void {
+    if (!this.componentActive || !this.rendererVisible || revision !== this.renderRevision) return;
+    if (result !== 'MERMAID_RENDERED') {
+      this.renderError = this.readRendererError(result);
+      this.invalidateRenderer();
     }
   }
 

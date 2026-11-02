@@ -1,0 +1,194 @@
+{
+  "version": 2,
+  "checkedAt": "2026-10-11T16:27:02.0417865Z",
+  "paused": false,
+  "bridgeHealthy": true,
+  "runtimeMode": "desktop",
+  "desktopLive": false,
+  "services": [
+    {
+      "role": "watch-local-bridge",
+      "pid": 42400,
+      "createdAt": "2026-10-10T01:33:16.137326Z",
+      "ownership": "managed"
+    },
+    {
+      "role": "voice",
+      "pid": 58420,
+      "createdAt": "2026-10-11T16:24:04.927448Z",
+      "ownership": "managed"
+    },
+    {
+      "role": "bridge-host",
+      "pid": 50020,
+      "createdAt": "2026-10-11T13:09:11.037375Z",
+      "ownership": "managed"
+    },
+    {
+      "role": "start-hdc-relay",
+      "pid": 9504,
+      "createdAt": "2026-10-11T16:16:56.087365Z",
+      "ownership": "managed"
+    },
+    {
+      "role": "start-hdc-relay",
+      "pid": 48312,
+      "createdAt": "2026-10-10T01:33:17.315577Z",
+      "ownership": "managed"
+    },
+    {
+      "role": "hdc-proxy",
+      "pid": 53880,
+      "createdAt": "2026-10-11T16:16:57.129963Z",
+      "ownership": "managed"
+    },
+    {
+      "role": "watch-hdc-connection",
+      "pid": 58000,
+      "createdAt": "2026-10-10T01:33:23.973103Z",
+      "ownership": "managed"
+    },
+    {
+      "role": "watch-voice-tunnel",
+      "pid": 29952,
+      "createdAt": "2026-10-10T01:33:29.149458Z",
+      "ownership": "managed"
+    },
+    {
+      "role": "public-proxy",
+      "pid": 17092,
+      "createdAt": "2026-10-10T01:33:18.205832Z",
+      "ownership": "managed"
+    },
+    {
+      "role": "watch-desktop-live",
+      "pid": 32760,
+      "createdAt": "2026-10-10T01:33:29.13636Z",
+      "ownership": "managed"
+    },
+    {
+      "role": "watch-bridge-proxy",
+      "pid": 12480,
+      "createdAt": "2026-10-10T01:33:19.649534Z",
+      "ownership": "managed"
+    },
+    {
+      "role": "voice",
+      "pid": 20952,
+      "createdAt": "2026-10-11T16:24:04.905442Z",
+      "ownership": "managed"
+    },
+    {
+      "role": "hdc-proxy",
+      "pid": 60688,
+      "createdAt": "2026-10-11T16:16:56.99552Z",
+      "ownership": "managed"
+    },
+    {
+      "role": "public-proxy",
+      "pid": 57984,
+      "createdAt": "2026-10-10T01:33:18.226899Z",
+      "ownership": "managed"
+    },
+    {
+      "role": "hdc-proxy",
+      "pid": 40704,
+      "createdAt": "2026-10-11T16:16:57.119691Z",
+      "ownership": "managed"
+    },
+    {
+      "role": "public-proxy",
+      "pid": 6116,
+      "createdAt": "2026-10-10T01:33:18.008041Z",
+      "ownership": "managed"
+    },
+    {
+      "role": "bridge",
+      "pid": 50544,
+      "createdAt": "2026-10-11T13:09:11.491569Z",
+      "ownership": "managed"
+    }
+  ],
+  "ports": [
+    {
+      "port": 8787,
+      "pid": 50544,
+      "ownership": "managed"
+    },
+    {
+      "port": 8790,
+      "pid": 58420,
+      "ownership": "managed"
+    },
+    {
+      "port": 11078,
+      "pid": 53880,
+      "ownership": "managed"
+    }
+  ],
+  "voiceTunnel": {
+    "configured": true,
+    "available": true,
+    "running": true,
+    "taskRunning": true,
+    "transportConnected": true,
+    "state": "Running",
+    "taskState": "Running",
+    "taskName": "CodexHarmonyVoiceTunnel",
+    "message": "远端 SSH 转发已确认建立；实际通话尚未验证"
+  },
+  "diagnostics": {
+    "checks": [
+      {
+        "id": "bridge",
+        "title": "本地桥接",
+        "state": "ready",
+        "message": "健康检查通过，使用桌面模式"
+      },
+      {
+        "id": "desktop",
+        "title": "Codex 桌面连接",
+        "state": "blocked",
+        "message": "当前 Codex 没有可用的远程连接端口；恢复需要先确认重启，安全修复不会自动重启它"
+      },
+      {
+        "id": "sessions",
+        "title": "普通会话",
+        "state": "error",
+        "message": "请求失败（HTTP 500）；本机 Codex 远程接口未就绪，请先恢复桌面连接"
+      },
+      {
+        "id": "companion",
+        "title": "个人助手会话",
+        "state": "error",
+        "message": "请求失败（HTTP 502）；本机 Codex 远程接口未就绪，请先恢复桌面连接"
+      },
+      {
+        "id": "computer",
+        "title": "助手云电脑",
+        "state": "unknown",
+        "message": "个人助手尚未连接，未继续检测云环境"
+      },
+      {
+        "id": "voice",
+        "title": "语音",
+        "state": "unverified",
+        "message": "SSH 反向转发已建立；实际通话和锁屏语音尚未验证"
+      },
+      {
+        "id": "phone_debug",
+        "title": "手机安装与调试",
+        "state": "waiting",
+        "message": "未发现在线调试设备，暂不能安装；不代表手机会话离线"
+      }
+    ],
+    "restartRequired": true,
+    "severity": "degraded",
+    "summary": "连接需要处理：Codex 桌面连接、普通会话、个人助手会话",
+    "nextAction": "desktop_restart_required"
+  },
+  "desktopRecovery": null,
+  "config": "BridgeConfig.ets + hdc-relay.local.psd1 + voice-tunnel.local.psd1",
+  "logDirectory": "C:\\Users\\Administrator\\Documents\\Codex\\2026-09-08\\https-github-com-ccdawn-codex-harmony-2\\work\\codex-harmony-local-1.0.14\\logs",
+  "officialCodex": "external-host"
+}

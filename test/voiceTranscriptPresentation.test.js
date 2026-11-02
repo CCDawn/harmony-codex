@@ -30,7 +30,11 @@ test('literal words quotes official messages and assistant explanations are pres
 test('both views filter originals and render through the same presentation helper',()=>{
  for(const file of ['VoiceCallPanel','CompanionConversationPanel']){
  const component=fs.readFileSync(new URL(`../HarmonyCodexRemote/entry/src/main/ets/components/${file}.ets`,import.meta.url),'utf8');
- assert.match(component,/ForEach\(VoiceTranscriptPresentation\.visible\(this\.(transcripts|entries)\)/);
+ if (file === 'VoiceCallPanel') assert.match(component,/ForEach\(VoiceTranscriptPresentation\.visible\(this\.transcripts\)/);
+ else {
+   assert.match(component,/composeCompanionTimeline\(VoiceTranscriptPresentation\.visible\(this\.entries\), this\.textMessages\)/);
+   assert.match(component,/ForEach\(this\.timeline\(\)/);
+ }
  assert.match(component,/VoiceTranscriptPresentation\.text\(entry\)/);
  }
 });

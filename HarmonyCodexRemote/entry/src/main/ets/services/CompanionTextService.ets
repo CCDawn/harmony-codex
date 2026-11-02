@@ -136,8 +136,14 @@ export class CompanionTextService {
   /** Text similarity, assistant responses, and submitted receipts are never acknowledgements. */
   static reconcile(partition: CompanionTextPartition, history: VoiceTranscriptEntry[]): boolean {
     const previous = CompanionTextService.messages(partition);
-    const remaining = previous.filter((message: CompanionTextMessage) => message.itemId === null
-      || !history.some((entry: VoiceTranscriptEntry) => entry.itemId === message.itemId && entry.role === 'user'));
+    const remaining = previous.filter((message: CompanionTextMessage) =>
+      !history.some((entry: VoiceTranscriptEntry) => entry.role === 'user' && entry.phoneTranscript !== true
+        && (entry.itemId ?? '').startsWith('room:')
+        && ((message.itemId !== null && entry.itemId === message.itemId)
+          || (typeof entry.requestId === 'string'
+            && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(entry.requestId)
+            && entry.requestId.toLowerCase() === message.requestId.toLowerCase()
+            && entry.text === message.text))));
     CompanionTextService.cache.set(CompanionTextService.partitionKey(partition), remaining);
     return previous.length !== remaining.length;
   }

@@ -1,0 +1,103 @@
+diff --git a/HarmonyCodexRemote/entry/src/main/ets/pages/Index.ets b/HarmonyCodexRemote/entry/src/main/ets/pages/Index.ets
+index f85961c..4d73c7e 100644
+--- a/HarmonyCodexRemote/entry/src/main/ets/pages/Index.ets
++++ b/HarmonyCodexRemote/entry/src/main/ets/pages/Index.ets
+@@ -3,7 +3,7 @@ import { VoiceTranscriptReducer } from '../services/VoiceTranscriptReducer';
+ import { CompanionProfile } from '../model/CompanionModels';
+ import { CompanionConversationPanel } from '../components/CompanionConversationPanel';
+ import { AppLogPayload, BridgeClient } from '../services/BridgeClient';
+-import { BridgeEvent, BridgeOutboxItem, BridgeProject, BridgeRuntimeStatus, BridgeTask, BridgeTaskSummary, BridgeUserInput, BridgeUserInputOption, BridgeUserInputQuestion, CodexAccountUsage, CodexAccountUsageItem, CodexModelOption, CodexRuntimeSnapshot, CodexSessionAgentRef, CodexSessionDetail, CodexSessionEntry, CodexSessionFingerprint, CodexSessionSummary, CodexSessionSync, DesktopLiveStatus, DesktopScreenshotImage, MobileFileUpload, MobileImageUpload, RemoteSessionFile, SlashIndexItem, SystemLinkStatus, SystemRepairStatus, VoiceCallStatus, VoiceTranscriptEntry } from '../model/BridgeModels';
++import { BridgeEvent, BridgeOutboxItem, BridgeProject, BridgeRuntimeStatus, BridgeTask, BridgeTaskSummary, BridgeUserInput, BridgeUserInputOption, BridgeUserInputQuestion, CodexAccountUsage, CodexAccountUsageItem, CodexModelOption, CodexRuntimeSnapshot, CodexSessionAgentRef, CodexSessionDetail, CodexSessionEntry, CodexSessionFingerprint, CodexSessionSummary, CodexSessionSync, DesktopLiveStatus, DesktopScreenshotImage, MobileFileUpload, MobileImageUpload, RemoteSessionFile, SlashIndexItem, SystemLinkStatus, SystemRepairStatus, VoiceCallStage, VoiceCallFailure, VoiceCallStatus, VoiceTranscriptEntry } from '../model/BridgeModels';
+ import { HdcRelayConfig, HdcRelayState, HdcRelayTunnel } from '../services/HdcRelayTunnel';
+ import { ContentActionService } from '../services/ContentActionService';
+ import { AttachmentService, PickedMobileFile } from '../services/AttachmentService';
+@@ -294,6 +294,11 @@ struct Index {
+   @State desktopMonitorBatteryPercent: number = 0;
+   @State voiceCallVisible: boolean = false;
+   @State voiceCallStatus: VoiceCallStatus = 'idle';
++  @State voiceCallStage: VoiceCallStage = 'channel';
++  @State voiceCallStageStartedAt: number = 0;
++  @State voiceCallFailure: VoiceCallFailure = '';
++  private voiceCallStartPending: boolean = false;
++  private voiceCallStartGeneration: number = 0;
+   @State voiceCallStatusDetail: string = '';
+   @State voiceCallAssistantName: string = '熊大';
+   @State voiceCallTranscripts: VoiceTranscriptEntry[] = [];
+@@ -587,6 +592,18 @@ struct Index {
+     VoiceCallPanel({
+       status: this.voiceCallStatus,
+       statusDetail: this.voiceCallStatusDetail,
++      stage: this.voiceCallStage,
++      stageStartedAt: this.voiceCallStageStartedAt,
++      failure: this.voiceCallFailure,
++      onRetry: () => { void this.startVoiceCallSession('retry'); },
++      onRecovery: () => {
++        if (this.voiceCallFailure === 'mic') {
++          void this.startVoiceCallSession('permission_retry');
++        } else {
++          this.voiceCallVisible = false;
++          this.pairingGuideVisible = true;
++        }
++      },
+       assistantName: this.voiceCallAssistantName,
+       transcripts: this.voiceCallTranscripts,
+       speaking: this.voiceCallSpeaking,
+@@ -8847,6 +8864,11 @@ struct Index {
+ 
+   private registerVoiceCallCallbacks(): void {
+     VoiceCallService.setCallbacks({
++      onProgress: (stage: VoiceCallStage, startedAt: number, failure: VoiceCallFailure) => {
++        this.voiceCallStage = stage;
++        this.voiceCallStageStartedAt = startedAt;
++        this.voiceCallFailure = failure;
++      },
+       onStatus: (status: VoiceCallStatus, detail: string) => {
+         this.voiceCallStatus = status;
+         this.voiceCallStatusDetail = detail;
+@@ -8909,20 +8931,36 @@ struct Index {
+     if (phase === 'connecting' || phase === 'ready' || phase === 'active') {
+       return;
+     }
+-    // This menu action opens the configured personal-assistant voice room; it never follows selectedSession.
+-    const context = getContext(this) as common.UIAbilityContext;
+-    const granted = await VoiceCallService.requestMicPermission(context);
+-    if (!granted) {
+-      this.voiceCallStatus = 'error';
+-      this.voiceCallStatusDetail = '未获得麦克风权限，无法进行语音通话';
+-      this.log('warn', 'voice_call.permission.denied', `source=${source}`);
+-      return;
++    if (this.voiceCallStartPending) { return; }
++    this.voiceCallStartPending = true;
++    const startGeneration = ++this.voiceCallStartGeneration;
++    this.voiceCallStatus = 'connecting';
++    this.voiceCallStatusDetail = '正在检查麦克风权限';
++    this.voiceCallStage = 'channel';
++    this.voiceCallStageStartedAt = Date.now();
++    this.voiceCallFailure = '';
++    try {
++      // This menu action opens the configured personal-assistant voice room; it never follows selectedSession.
++      const context = getContext(this) as common.UIAbilityContext;
++      const granted = await VoiceCallService.requestMicPermission(context, source === 'permission_retry');
++      if (startGeneration !== this.voiceCallStartGeneration) { return; }
++      if (!granted) {
++        this.voiceCallFailure = 'mic';
++        this.voiceCallStatus = 'error';
++        this.voiceCallStatusDetail = '未获得麦克风权限，无法进行语音通话';
++        this.log('warn', 'voice_call.permission.denied', `source=${source}`);
++        return;
++      }
++      this.log('info', 'voice_call.permission.granted', `source=${source}`);
++      await VoiceCallService.connect(this.normalizedBridgeUrl(), this.bridgeToken);
++    } finally {
++      if (startGeneration === this.voiceCallStartGeneration) { this.voiceCallStartPending = false; }
+     }
+-    this.log('info', 'voice_call.permission.granted', `source=${source}`);
+-    await VoiceCallService.connect(this.normalizedBridgeUrl(), this.bridgeToken);
+   }
+ 
+   private closeVoiceCall(source: string): void {
++    this.voiceCallStartGeneration += 1;
++    this.voiceCallStartPending = false;
+     const wasVisible = this.voiceCallVisible;
+     this.voiceCallVisible = false;
+     this.voiceCallSpeaking = false;

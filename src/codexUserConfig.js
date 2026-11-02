@@ -1,7 +1,7 @@
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { normalizeModelId, normalizeReasoningEffort } from './sessionSettingsStore.js';
+import { normalizeModelId, normalizeReasoningEffort, normalizeServiceTier } from './sessionSettingsStore.js';
 
 export async function readCodexDefaultReasoningEffort(options = {}) {
   const configPath = options.configPath ?? resolveCodexConfigPath(options.env ?? process.env);
@@ -21,6 +21,25 @@ export async function readCodexDefaultModel(options = {}) {
   } catch {
     return '';
   }
+}
+
+export async function readCodexDefaultServiceTier(options = {}) {
+  const configPath = options.configPath ?? resolveCodexConfigPath(options.env ?? process.env);
+  try {
+    return extractServiceTierFromConfig(await fs.readFile(configPath, 'utf8'));
+  } catch {
+    return '';
+  }
+}
+
+export function extractServiceTierFromConfig(text) {
+  // Only root config keys are global defaults; profile/table entries are not.
+  for (const line of String(text ?? '').replace(/^\uFEFF/, '').split(/\r?\n/)) {
+    if (/^\s*\[/.test(line)) break;
+    const match = line.match(/^\s*service_tier\s*=\s*(?:"([^"]*)"|'([^']*)'|([A-Za-z0-9_-]+))/);
+    if (match) return safeNormalizeServiceTier(match[1] ?? match[2] ?? match[3]) || 'default';
+  }
+  return 'default';
 }
 
 export function resolveCodexConfigPath(env = process.env) {
@@ -84,6 +103,7 @@ export function effectiveCodexSettings(settings, defaults = {}) {
   const normalizedSettings = {
     model: safeNormalizeModelId(settings?.model ?? ''),
     reasoningEffort: normalizeReasoningEffort(settings?.reasoningEffort ?? ''),
+    serviceTier: normalizeServiceTier(settings?.serviceTier),
     updatedAt: String(settings?.updatedAt ?? '')
   };
   const defaultModel = safeNormalizeModelId(defaults?.model ?? '');
@@ -93,8 +113,17 @@ export function effectiveCodexSettings(settings, defaults = {}) {
   const providedModelCatalogRevision = String(defaults?.modelCatalogRevision ?? '').trim();
   const modelCatalogRevision = providedModelCatalogRevision
     || buildModelCatalogRevision(defaultModel, modelOptions);
+  const defaultServiceTier = safeNormalizeServiceTier(defaults?.serviceTier);
+  const effectiveModel = normalizedSettings.model || defaultModel;
+  const serviceTierOptions = modelOptions.find((option) => option.id === effectiveModel)?.serviceTiers ?? [];
+  const defaultServiceTierSource = defaults?.serviceTierSource === 'thread' ? 'thread' : 'desktop';
   return {
     ...normalizedSettings,
+    defaultServiceTier,
+    effectiveServiceTier: normalizedSettings.serviceTier || defaultServiceTier,
+    defaultServiceTierSource,
+    serviceTierSource: normalizedSettings.serviceTier ? 'session' : defaultServiceTierSource,
+    serviceTierOptions,
     defaultModel,
     effectiveModel: normalizedSettings.model || defaultModel,
     modelSource: normalizedSettings.model ? 'session' : 'desktop',
@@ -110,7 +139,7 @@ export function effectiveCodexSettings(settings, defaults = {}) {
 function buildModelCatalogRevision(defaultModel, modelOptions) {
   return [
     defaultModel,
-    ...modelOptions.map((option) => option.id)
+    ...modelOptions.map((option) => option.id + (option.serviceTiers.length ? ':' + JSON.stringify(option.serviceTiers) : ''))
   ].join('|');
 }
 
@@ -146,7 +175,8 @@ function normalizeModelOptions(models, defaultModel = '') {
       description: String(model?.description ?? ''),
       isDefault: model?.isDefault === true || id === defaultModel,
       defaultReasoningEffort: safeNormalizeReasoningEffort(model?.defaultReasoningEffort ?? ''),
-      supportedReasoningEfforts: normalizeSupportedReasoningEfforts(model?.supportedReasoningEfforts)
+      supportedReasoningEfforts: normalizeSupportedReasoningEfforts(model?.supportedReasoningEfforts),
+      serviceTiers: normalizeServiceTierOptions(model?.serviceTiers)
     });
   }
   if (defaultModel && !seen.has(defaultModel)) {
@@ -157,7 +187,8 @@ function normalizeModelOptions(models, defaultModel = '') {
       description: '当前 Codex 桌面默认模型',
       isDefault: true,
       defaultReasoningEffort: '',
-      supportedReasoningEfforts: []
+      supportedReasoningEfforts: [],
+      serviceTiers: []
     });
   }
   return options;
@@ -172,4 +203,18 @@ function normalizeSupportedReasoningEfforts(values) {
     }
   }
   return efforts;
+}
+
+function safeNormalizeServiceTier(value) {
+  try { return normalizeServiceTier(value); } catch { return ''; }
+}
+
+function normalizeServiceTierOptions(values) {
+  const seen = new Set();
+  return (Array.isArray(values) ? values : []).flatMap((value) => {
+    const id = safeNormalizeServiceTier(value?.id);
+    if (!id || seen.has(id)) return [];
+    seen.add(id);
+    return [{ ...value, id, name: String(value?.name ?? id), description: String(value?.description ?? '') }];
+  });
 }

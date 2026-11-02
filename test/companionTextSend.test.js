@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { Readable } from 'node:stream';
-import { CompanionDesktopClient } from '../src/companionDesktopClient.js';
+import { CompanionDesktopClient, historyEntries } from '../src/companionDesktopClient.js';
 import { CompanionConversationService, handleCompanionRoute } from '../src/companionConversationService.js';
 
 const requestId = '12345678-1234-4123-8123-123456789abc';
@@ -37,13 +37,8 @@ function desktopWithApi(api) {
       const end = expression.indexOf(';\n', start);
       const catchStart = expression.lastIndexOf('}catch(error){');
       assert.ok(end > start && catchStart > end);
-      const params = JSON.parse(expression.slice(start, end));
-      const body = expression.slice(end + 2, catchStart);
-      try {
-        return await new Function('params', 'api', 'AbortSignal', `return (async()=>{${body}})()`)(params, api, AbortSignal);
-      } catch (error) {
-        return { __companionError: true, status: Number(error?.status) || 0, name: String(error?.name || 'Error') };
-      }
+      // Retain the production catch wrapper, including fixed classifications.
+      return new Function('api', 'AbortSignal', `return (async()=>{try{${expression.slice(expression.indexOf(marker))}`)(api, AbortSignal);
     },
     close() {}
   });
@@ -246,4 +241,129 @@ test('the POST route returns identity conflict before sending and safely represe
     assert.equal(response.statusCode, status);
     assert.deepEqual(response.payload, expected);
   }
+});
+
+test('missing safePost is a deterministic compatibility failure through desktop, service and HTTP', async () => {
+  let reads = 0;
+  const { client } = desktopWithApi({ async safeGet() { reads++; return primary(); } });
+  const service = new CompanionConversationService({ clientFactory: () => client });
+  const response = responseCapture();
+  const request = Readable.from([Buffer.from(JSON.stringify(input))]);
+  request.method = 'POST';
+  await handleCompanionRoute({ request, response, url: '/companion/messages', service });
+  assert.equal(response.statusCode, 422);
+  assert.deepEqual(response.payload, { error: 'Companion request failed', failureClass: 'api_compatibility' });
+  await assert.rejects(service.sendText(input), error => error.failureClass === 'api_compatibility');
+  assert.equal(reads, 1, 'unsupported write capability is detected before write-time identity reads');
+});
+
+test('known HTTP rejection preserves its fixed auth classification through the POST route', async () => {
+  const { service } = fakeService({ send() {
+    throw Object.assign(new Error('private rejection'), { status: 403 });
+  } });
+  const request = Readable.from([Buffer.from(JSON.stringify(input))]);
+  request.method = 'POST';
+  const response = responseCapture();
+  await handleCompanionRoute({ request, response, url: '/companion/messages', service });
+  assert.equal(response.statusCode, 403);
+  assert.deepEqual(response.payload, { error: 'Companion request failed', failureClass: 'auth' });
+});
+
+test('verified official request identity resolves an uncertain receipt without another POST', async () => {
+  let writes = 0;
+  let entries = [];
+  const service = new CompanionConversationService({ clientFactory: () => ({
+    async discover() { return { id: input.profileId, roomId: input.roomId }; },
+    async sendText() { writes++; throw new Error('response lost after acceptance'); },
+    async messages() { return { entries, nextCursor: null }; },
+    close() {}
+  }) });
+  assert.equal((await service.sendText(input)).state, 'uncertain');
+  entries = historyEntries([{ id: 'server-message', request_id: requestId.toUpperCase(),
+    role: 'user', created_at: '2026-10-19T00:00:00Z', content: { text: input.text } }]);
+  const page = await service.getMessages(input);
+  assert.equal(page.entries[0].requestId, requestId);
+  assert.deepEqual(await service.sendText(input), submitted);
+  assert.equal(writes, 1);
+});
+
+test('historical text similarity, wrong author, wrong content or invalid identity cannot resolve uncertainty', async () => {
+  let entries = [];
+  let writes = 0;
+  const service = new CompanionConversationService({ clientFactory: () => ({
+    async discover() { return { id: input.profileId, roomId: input.roomId }; },
+    async sendText() { writes++; return { requestId, state: 'uncertain', itemId: null }; },
+    async messages() { return { entries }; },
+    close() {}
+  }) });
+  await service.sendText(input);
+  for (const change of [{ requestId: undefined }, { requestId: 'invalid' }, { role: 'assistant' },
+    { text: input.text + 'different' }, { itemId: 'room:' }]) {
+    entries = [{ ...submitted, role: 'user', text: input.text, final: true, ...change }];
+    await service.getMessages(input);
+    assert.equal((await service.sendText(input)).state, 'uncertain');
+  }
+  assert.equal(writes, 1);
+});
+
+test('module discovery incompatibility remains deterministic before any text write', async () => {
+  let writes = 0;
+  const service = new CompanionConversationService({ clientFactory: () => ({
+    async discover() { throw Object.assign(new Error('private loader detail'), { failureClass: 'api_compatibility' }); },
+    async sendText() { writes++; },
+    close() {}
+  }) });
+  await assert.rejects(service.sendText(input), error => error.statusCode === 422
+    && error.failureClass === 'api_compatibility' && !error.message.includes('private'));
+  assert.equal(writes, 0);
+});
+
+test('official history observed before a lost send response confirms the pending receipt', async () => {
+  const gate = Promise.withResolvers();
+  let writes = 0;
+  const service = new CompanionConversationService({ clientFactory: () => ({
+    async discover() { return { id: input.profileId, roomId: input.roomId }; },
+    async sendText() { writes++; return gate.promise; },
+    async messages() { return { entries: [{ itemId: submitted.itemId, requestId,
+      role: 'user', text: input.text, final: true }] }; },
+    close() {}
+  }) });
+  const pending = service.sendText(input);
+  await new Promise(resolve => setImmediate(resolve));
+  await service.getMessages(input);
+  gate.reject(new Error('response lost'));
+  assert.deepEqual(await pending, submitted);
+  assert.deepEqual(await service.sendText(input), submitted);
+  assert.equal(writes, 1);
+});
+
+test('matching request IDs in another verified room cannot confirm this room receipt', async () => {
+  let roomId = input.roomId;
+  const service = new CompanionConversationService({ clientFactory: () => ({
+    async discover() { return { id: input.profileId, roomId }; },
+    async sendText() { return { requestId, state: 'uncertain', itemId: null }; },
+    async messages() { return { entries: [{ itemId: submitted.itemId, requestId,
+      role: 'user', text: input.text, final: true }] }; },
+    close() {}
+  }) });
+  await service.sendText(input);
+  roomId = 'another-official-room';
+  await service.getMessages({ ...input, roomId });
+  assert.equal((await service.sendText(input)).state, 'uncertain');
+});
+
+test('official rows without a valid original message ID never create a submitted receipt', async () => {
+  const entries = historyEntries([undefined, null, '', ' ', 123, {}, 'a'.repeat(513)].map(id => ({
+    id, request_id: requestId, role: 'user', content: { text: input.text }
+  })));
+  const service = new CompanionConversationService({ clientFactory: () => ({
+    async discover() { return { id: input.profileId, roomId: input.roomId }; },
+    async sendText() { return { requestId, state: 'uncertain', itemId: null }; },
+    async messages() { return { entries }; },
+    close() {}
+  }) });
+  await service.sendText(input);
+  await service.getMessages(input);
+  assert.equal((await service.sendText(input)).state, 'uncertain');
+  assert.deepEqual(entries, []);
 });

@@ -26,9 +26,22 @@ export class DesktopInteractionService {
     try {
       requests = await this.client.listRequests(threadId);
       if (!Array.isArray(requests)) throw new Error('Invalid desktop request snapshot');
-    } catch {
+    } catch (error) {
       this.expireThread(threadId);
-      throw statusError('无法读取桌面待处理请求，请检查桌面连接后重试', 503);
+      const failure = statusError('无法读取桌面待处理请求，请检查桌面连接后重试', 503);
+      // Keep only fixed diagnostics. The original exception can include CDP
+      // payloads, conversation IDs or source text and must not become a cause.
+      const stages = ['entry', 'asset-discovery', 'mounted-manager', 'mounted-manager-ambiguous', 'mounted-manager-scan-timeout',
+        'manager-open', 'conversation-read', 'renderer', 'transport'];
+      const stage = stages.includes(error?.stage) ? error.stage : 'transport';
+      const cause = new Error('DESKTOP_INTERACTIONS_UNAVAILABLE');
+      cause.code = 'DESKTOP_INTERACTIONS_UNAVAILABLE';
+      cause.stage = stage;
+      failure.code = cause.code;
+      failure.stage = stage;
+      failure.diagnostic = { code: cause.code, stage };
+      failure.cause = cause;
+      throw failure;
     }
     const retained = new Set();
     const result = [];
@@ -100,6 +113,7 @@ function projectRequest(ticket) {
   let title = '需要在电脑上处理';
   let supportsResponse = false;
   let questions = [];
+  let rejectLabel;
   const details = [];
   if (params.reason) details.push(String(params.reason));
   if (request.method === COMMAND) {
@@ -109,9 +123,9 @@ function projectRequest(ticket) {
     if (params.cwd) details.push('工作目录：' + String(params.cwd));
     if (params.networkApprovalContext) details.push('网络访问：\n' + JSON.stringify(params.networkApprovalContext, null, 2));
     if (params.additionalPermissions) details.push('附加权限：\n' + JSON.stringify(params.additionalPermissions, null, 2));
-    const decisions = params.availableDecisions;
-    supportsResponse = (!decisions || (Array.isArray(decisions) && decisions.includes('accept') && decisions.includes('decline')))
-      && Boolean(params.command || params.networkApprovalContext);
+    const denial = commandDenial(params.availableDecisions);
+    supportsResponse = Boolean(denial && (params.command || params.networkApprovalContext));
+    if (supportsResponse && denial === 'cancel') rejectLabel = '取消';
     details.push('同意仅用于这一次操作。');
   } else if (request.method === FILE) {
     kind = 'approval';
@@ -137,7 +151,22 @@ function projectRequest(ticket) {
     supportsResponse = questions.length > 0 && questions.length === params.questions?.length;
   }
   if (!supportsResponse) details.push('此请求暂不能在手机安全处理，请在 Codex 桌面中查看并处理。');
-  return { id, threadId, kind, status: 'pending', title, detail: details.join('\n\n'), questions, supportsResponse };
+  return { id, threadId, kind, status: 'pending', title, detail: details.join('\n\n'), questions, supportsResponse,
+    ...(rejectLabel ? { rejectLabel } : {}),
+    ...(request.method === ASYNC_INPUT ? { supportsSkip: supportsResponse
+      && Array.isArray(request.__skipBindings) && request.__skipBindings.length === questions.length } : {}),
+    ...(request.method === ASYNC_INPUT && typeof params.itemId === 'string' ? { itemId: params.itemId } : {}),
+    ...(request.method === ASYNC_INPUT && typeof params.turnId === 'string' ? { turnId: params.turnId } : {}) };
+}
+
+function commandDenial(decisions) {
+  // Preserve the existing accept/decline fallback when the optional list is
+  // absent. An explicit list must advertise both actions.
+  if (decisions == null) return 'decline';
+  if (!Array.isArray(decisions)) return null;
+  if (!decisions.includes('accept')) return null;
+  if (decisions.includes('decline')) return 'decline';
+  return decisions.includes('cancel') ? 'cancel' : null;
 }
 
 function normalizeQuestions(value) {
@@ -161,8 +190,23 @@ function responseFor(ticket, body) {
   const projected = projectRequest(ticket);
   if (!projected.supportsResponse) throw statusError('该请求需要在电脑上处理', 422);
   const request = ticket.request;
+  if (Object.hasOwn(body, 'skipQuestionId')) {
+    if (request.method !== ASYNC_INPUT || !projected.supportsSkip) throw statusError('该问题需要在电脑上跳过', 422);
+    if (Object.hasOwn(body, 'answers') || Object.hasOwn(body, 'decision')
+      || typeof body.skipQuestionId !== 'string'
+      || !projected.questions.some(question => question.id === body.skipQuestionId)) {
+      throw statusError('请选择当前请求中的问题', 400);
+    }
+    return { skipQuestionId: body.skipQuestionId };
+  }
   if (projected.kind === 'approval') {
     if (!['approved', 'denied'].includes(body.decision)) throw statusError('请选择同意或拒绝', 400);
+    if (request.method === COMMAND) {
+      const decisions = request.params?.availableDecisions;
+      const denial = commandDenial(decisions);
+      if (!denial) throw statusError('该请求需要在电脑上处理', 422);
+      return { decision: body.decision === 'approved' ? 'accept' : denial };
+    }
     if (request.method === PERMISSIONS) return {
       permissions: body.decision === 'approved' ? structuredClone(request.params.permissions) : {},
       scope: 'turn'

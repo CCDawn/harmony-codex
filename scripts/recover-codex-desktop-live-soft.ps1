@@ -89,9 +89,12 @@ function Invoke-JsonSafe {
 
 function Stop-DesktopLiveHost {
   Write-Step "停止旧的桌面 live-host 进程"
+  # A relative script name cannot establish which checkout owns the process.
+  $ownedScriptPath = [IO.Path]::GetFullPath((Join-Path $repoRoot 'scripts\start-desktop-cdp-live-host.mjs'))
+  $ownedScriptPattern = '(?i)(?:^|[\s"''])' + [regex]::Escape($ownedScriptPath) + '(?=[\s"'']|$)'
   $processes = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
-    $cmd = [string]$_.CommandLine
-    $cmd -match 'start-desktop-cdp-live-host\.mjs'
+    $cmd = ([string]$_.CommandLine).Replace('/', '\')
+    $cmd -match $ownedScriptPattern
   })
 
   foreach ($process in $processes) {
@@ -153,25 +156,39 @@ function Test-CdpReady {
   param([int]$Port)
 
   $lastError = ''
-  foreach ($path in @('/json', '/json/list')) {
-    $probe = Invoke-JsonSafe -Uri "http://127.0.0.1:$Port$path" -TimeoutSec 2
-    if (-not $probe.Ok) {
-      $lastError = $probe.Error
-      continue
-    }
-    foreach ($target in @($probe.Value)) {
-      $type = [string](Get-ObjectValue -Object $target -Name 'type' -Fallback '')
-      $webSocketUrl = [string](Get-ObjectValue -Object $target -Name 'webSocketDebuggerUrl' -Fallback '')
-      if ($type -eq 'page' -and -not [string]::IsNullOrWhiteSpace($webSocketUrl)) {
-        return [pscustomobject]@{
-          Ok = $true
-          Port = $Port
-          Target = $target
-          Error = ''
+  # Keep the previous four-second per-port budget across both loopbacks.
+  $deadline = [DateTime]::UtcNow.AddSeconds(4)
+  foreach ($loopbackHost in @('127.0.0.1', '[::1]')) {
+    foreach ($path in @('/json', '/json/list')) {
+      if ([DateTime]::UtcNow -ge $deadline) { break }
+      $probe = Invoke-JsonSafe -Uri "http://${loopbackHost}:$Port$path" -TimeoutSec 1
+      if (-not $probe.Ok) {
+        $lastError = $probe.Error
+        continue
+      }
+      foreach ($target in @($probe.Value)) {
+        $type = [string](Get-ObjectValue -Object $target -Name 'type' -Fallback '')
+        $webSocketUrl = [string](Get-ObjectValue -Object $target -Name 'webSocketDebuggerUrl' -Fallback '')
+        $targetUrl = $null
+        $urlValue = [string](Get-ObjectValue -Object $target -Name 'url' -Fallback '')
+        if (-not [Uri]::TryCreate($urlValue, [UriKind]::Absolute, [ref]$targetUrl)) { continue }
+        $hasInitialRoute = @($targetUrl.Query.TrimStart('?').Split('&') | Where-Object {
+          [Uri]::UnescapeDataString(($_ -split '=', 2)[0]) -ceq 'initialRoute'
+        }).Count -gt 0
+        if ($type -ceq 'page' -and -not [string]::IsNullOrWhiteSpace($webSocketUrl) -and
+            $targetUrl.Scheme -eq 'app' -and $targetUrl.Host -eq '-' -and
+            $targetUrl.AbsolutePath -ceq '/index.html' -and -not $hasInitialRoute) {
+          return [pscustomobject]@{
+            Ok = $true
+            Port = $Port
+            Host = $loopbackHost
+            Target = $target
+            Error = ''
+          }
         }
       }
+      $lastError = "CDP $path 没有 Codex 主窗口 target"
     }
-    $lastError = "CDP $path 没有 page target"
   }
   return [pscustomobject]@{
     Ok = $false
@@ -187,7 +204,7 @@ function Select-ExistingCdpPort {
   foreach ($port in Get-CandidateCdpPorts) {
     $result = Test-CdpReady -Port $port
     if ($result.Ok) {
-      Write-Info "复用现有 CDP: http://127.0.0.1:$port"
+      Write-Info "复用现有 CDP: http://$($result.Host):$port"
       return [int]$port
     }
     $lastError = "$($result.Port): $($result.Error)"
@@ -252,11 +269,12 @@ Write-Step "启动桌面 CDP live-host"
 $hostStdout = Join-Path $repoRoot 'logs\startup\desktop-cdp-live-host.stdout.log'
 $hostStderr = Join-Path $repoRoot 'logs\startup\desktop-cdp-live-host.stderr.log'
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $hostStdout) | Out-Null
+$liveHostScriptLiteral = (Join-Path $repoRoot 'scripts\start-desktop-cdp-live-host.mjs').Replace("'", "''")
 $hostCommand = @"
 `$env:CODEX_BRIDGE_URL='$BridgeUrl'
 `$env:CODEX_BRIDGE_TOKEN='$BridgeToken'
 `$env:CODEX_DESKTOP_CDP_PORT='$selectedCdpPort'
-node .\scripts\start-desktop-cdp-live-host.mjs
+node '$liveHostScriptLiteral'
 "@
 Start-Process -WindowStyle Hidden -FilePath $powerShellHostPath -ArgumentList @(
   '-NoProfile',

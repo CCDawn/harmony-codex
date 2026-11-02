@@ -7,7 +7,7 @@ function fixture(assets) {
   const imports = [];
   const api = {safeGet: async () => ({profile:{id:'p',messaging_room_id:'r',aeon_kind:'orbit',status:'active',display_name:'Assistant'}}), postResponse() {}};
   const client = new CompanionDesktopClient({ensureConnected:async()=>{},close(){},evaluate:async expression => {
-    const fetch = async url => ({text:async()=>url === entry ? Object.keys(assets).join(',') : assets[new URL(url).pathname.split('/').at(-1)]?.source || ''});
+    const fetch = async url => ({text:async()=>url === entry ? Object.keys(assets).map(name => `import "./${name}";`).join('\n') : assets[new URL(url).pathname.split('/').at(-1)]?.source || ''});
     const loadModule = async url => {const asset=assets[new URL(url).pathname.split('/').at(-1)]; imports.push(url); return asset.exports(api)};
     return new Function('document','fetch','URL','loadModule',`return ${expression.replaceAll('await import(assetUrl)','await loadModule(assetUrl)')}`)(
       {scripts:[{type:'module',src:entry}]},fetch,URL,loadModule);

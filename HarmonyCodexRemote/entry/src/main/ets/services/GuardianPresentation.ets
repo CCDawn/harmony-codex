@@ -1,6 +1,15 @@
 import { GuardianStatus } from '../model/BridgeModels';
 
 export class GuardianPresentation {
+  static restartPolicy(status: GuardianStatus | null): string {
+    if (status === null || typeof status.allowForceRestart !== 'boolean') {
+      return '自动恢复权限尚未确认';
+    }
+    return status.allowForceRestart
+      ? '允许自动重启 Codex，可能中断任务或通话。'
+      : '自动恢复仅重连和恢复服务，不会自动重启 Codex。';
+  }
+
   static localTime(value: string | null | undefined, missing: string = '时间未记录'): string {
     if (!value || value.trim().length === 0) { return missing; }
     const date = new Date(value);

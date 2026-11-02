@@ -1,6 +1,12 @@
 export class EventBus {
   constructor() {
     this.listeners = new Map();
+    this.observers = new Set();
+  }
+
+  subscribeAll(listener) {
+    this.observers.add(listener);
+    return () => this.observers.delete(listener);
   }
 
   subscribe(taskId, listener) {
@@ -18,12 +24,9 @@ export class EventBus {
 
   publish(taskId, event) {
     const listeners = this.listeners.get(taskId);
-    if (!listeners) {
-      return;
-    }
-
-    for (const listener of listeners) {
+    for (const listener of listeners ?? []) {
       listener(event);
     }
+    for (const observer of this.observers) observer(event);
   }
 }

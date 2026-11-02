@@ -1,0 +1,2 @@
+import {CodexDesktopCdpClient} from '../src/codexDesktopCdpClient.js';
+const c=new CodexDesktopCdpClient();try{await c.ensureConnected();console.log(JSON.stringify(await c.evaluate(`({voiceControls:[...document.querySelectorAll('button')].map(b=>b.getAttribute('aria-label')||b.getAttribute('title')||b.textContent).filter(s=>s&&/end.*(call|voice)|hang up|mute microphone|结束通话|挂断|静音|语音通话/i.test(s)).map(s=>s.slice(0,80))})`)));}finally{c.close();}

@@ -49,6 +49,9 @@ export class SessionRuntimeStore {
     });
     const merged: CodexSessionSummary[] = this.currentSnapshot.sessions.map((runtime: CodexRuntimeSession) => {
       const legacy = legacyById[runtime.threadId];
+      if (this.currentSnapshot?.stale === true && legacy !== undefined) {
+        return legacy;
+      }
       const summary: CodexSessionSummary = {
         id: runtime.threadId,
         title: runtime.title,
@@ -58,19 +61,22 @@ export class SessionRuntimeStore {
         projectLabel: runtime.projectLabel,
         sidebarSection: runtime.sidebarSection,
         source: legacy?.source ?? runtime.source,
-        activitySource: runtime.source,
-        activityStatus: runtime.state,
-        activityUpdatedAt: runtime.stateUpdatedAt,
-        runtimeState: runtime.state,
-        runtimeSource: runtime.source,
-        runtimeUpdatedAt: runtime.stateUpdatedAt,
-        activeTurnId: runtime.activeTurnId,
-        canInterrupt: runtime.canInterrupt,
-        terminalReason: runtime.terminalReason,
-        lastVisibleRole: runtime.lastVisibleRole,
         pinned: runtime.pinned,
         detailAvailable: runtime.detailAvailable
       };
+      // A failed runtime read leaves list metadata cached, not authoritative activity.
+      if (this.currentSnapshot?.stale !== true) {
+        summary.activitySource = runtime.source;
+        summary.activityStatus = runtime.state;
+        summary.activityUpdatedAt = runtime.stateUpdatedAt;
+        summary.runtimeState = runtime.state;
+        summary.runtimeSource = runtime.source;
+        summary.runtimeUpdatedAt = runtime.stateUpdatedAt;
+        summary.activeTurnId = runtime.activeTurnId;
+        summary.canInterrupt = runtime.canInterrupt;
+        summary.terminalReason = runtime.terminalReason;
+        summary.lastVisibleRole = runtime.lastVisibleRole;
+      }
       return summary;
     });
     const runtimeIds = this.currentSnapshot.sessions.map((session: CodexRuntimeSession) => session.threadId);
@@ -83,7 +89,7 @@ export class SessionRuntimeStore {
   }
 
   activeSessionIds(): string[] {
-    if (this.currentSnapshot === null) {
+    if (this.currentSnapshot === null || this.currentSnapshot.stale === true) {
       return [];
     }
     return this.currentSnapshot.sessions

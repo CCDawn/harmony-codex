@@ -1,0 +1,11 @@
+from pathlib import Path
+p=Path('voice/companion_rpc.mjs');s=p.read_text(encoding='utf-8')
+s=s.replace("import readline from 'node:readline';", "import readline from 'node:readline';\nimport { fileURLToPath } from 'node:url';\nimport { CompanionCallJournal, CompanionCallLifecycle } from '../src/companionCallLifecycle.js';")
+s=s.replace('const client = new CompanionDesktopClient();','const client = new CompanionDesktopClient();\nconst lifecycle = new CompanionCallLifecycle(client, new CompanionCallJournal(\n  fileURLToPath(new URL(\'./voice-scratch/owned-calls/\', import.meta.url))));')
+s=s.replace('const result = await client[request.method](request.params ?? {});', "const owner = request.method === 'start' || request.method === 'stop' ? lifecycle : client;\n      const result = await owner[request.method](request.params ?? {});")
+s=s.replace('try { await client.stop(); } catch {}','try { await lifecycle.stop(); } catch {}')
+p.write_text(s,encoding='utf-8')
+p=Path('voice/companion_session.py');s=p.read_text(encoding='utf-8')
+s=s.replace('RPC_STOP_TIMEOUT_S = 5.0','RPC_STOP_TIMEOUT_S = RPC_TIMEOUT_S')
+s=s.replace('            log("companion-stop-failed")\n        finally:\n            self._owns_call = False','            log("companion-stop-pending")\n        else:\n            self._owns_call = False')
+p.write_text(s,encoding='utf-8')

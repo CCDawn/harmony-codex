@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+// relaunch is opt-in via env; enable it for these assertions (default is off)
+process.env.CODEX_BRIDGE_AUTO_RELAUNCH_MISSING_DESKTOP = '1';
 import {
   canAutoRelaunchMissingCodex,
   evaluateSupervisorArm

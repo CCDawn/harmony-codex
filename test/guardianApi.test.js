@@ -3,6 +3,8 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { once } from 'node:events';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import test from 'node:test';
 import { MobileLinkGuardianService } from '../src/mobileLinkGuardianService.js';
 import { createApp } from '../src/app.js';
@@ -38,6 +40,77 @@ test('partially damaged status arrays remain readable without exposing raw value
   assert.equal(result.guardian.history.length, 1);
   assert.equal(result.guardian.enabled, false);
 });
+
+test('GET exposes the persisted force restart choice and PUT keeps the enabled-only contract', async t => {
+  const f = await fixture(t);
+  const service = new MobileLinkGuardianService({ repoRoot: f.repoRoot });
+  for (const enabled of [false, true]) {
+    for (const allowForceRestart of [false, true]) {
+      await f.write('config', { version: 1, enabled, allowForceRestart });
+      assert.equal((await service.status()).guardian.allowForceRestart, allowForceRestart);
+    }
+  }
+  await assert.rejects(service.setEnabled({ enabled: true, allowForceRestart: true }), { statusCode: 400 });
+});
+
+test('isolated real guardian CLI preserves policy, changes it explicitly, and rejects a superseded Enable',
+  { skip: process.platform !== 'win32' }, async t => {
+    const f = await fixture(t);
+    const windows = path.join(f.repoRoot, 'tools', 'windows');
+    await fs.mkdir(windows, { recursive: true });
+    for (const name of ['mobile-link-guardian.ps1', 'mobile-link-lifecycle.ps1', 'mobile-voice-tunnel.ps1']) {
+      await fs.copyFile(new URL('../tools/windows/' + name, import.meta.url), path.join(windows, name));
+    }
+    // Only the fixture handoff is replaced; configuration locking, version
+    // checks, atomic writes, CLI dispatch and public projection are real.
+    await fs.writeFile(path.join(windows, 'mobile-link-control.ps1'), `
+param($Action,$BridgePort)
+$root=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\\..'))
+$race=Join-Path $root 'race.txt'
+if(Test-Path -LiteralPath $race){
+  $operation=Get-Content -Raw -LiteralPath $race
+  if($operation -eq 'Disable'){ & (Join-Path $PSScriptRoot 'mobile-link-guardian.ps1') -Action Disable | Out-Null }
+  if($operation -eq 'Deny'){ & (Join-Path $PSScriptRoot 'mobile-link-guardian.ps1') -Action SetPolicy -RestartPolicy Deny | Out-Null }
+}
+@{reloaded=$true}|ConvertTo-Json -Compress
+`);
+    await f.write('config', { version: 1, enabled: true, allowForceRestart: false, updatedAt: '2026-10-18T00:00:00Z' });
+    const wrapper = path.join(f.repoRoot, 'policy-test.ps1');
+    await fs.writeFile(wrapper, `
+$ErrorActionPreference='Stop'
+$script:schedulerReads=0
+function Get-ScheduledTask {param($TaskName,$ErrorAction) $script:schedulerReads++;[pscustomobject]@{State='Running'}}
+$guardian=Join-Path $PSScriptRoot 'tools\\windows\\mobile-link-guardian.ps1'
+function Read-Policy($Action,$Policy='Preserve') { (& $guardian -Action $Action -RestartPolicy $Policy)|ConvertFrom-Json }
+$results=@()
+$results+=Read-Policy Status
+$results+=Read-Policy Enable
+$results+=Read-Policy Disable
+$before=$script:schedulerReads
+$results+=Read-Policy SetPolicy Allow
+if($script:schedulerReads -ne $before){throw 'SetPolicy launched a worker'}
+$results+=Read-Policy Enable
+$results+=Read-Policy SetPolicy Deny
+$results+=Read-Policy Disable Allow
+$results+=Read-Policy Enable Deny
+[IO.File]::WriteAllText((Join-Path $PSScriptRoot 'race.txt'),'Disable')
+$results+=Read-Policy Enable Allow
+[IO.File]::WriteAllText((Join-Path $PSScriptRoot 'race.txt'),'Deny')
+$results+=Read-Policy Enable Allow
+@{results=$results}|ConvertTo-Json -Depth 12 -Compress
+`);
+    // A Node runner launched by PowerShell 7 can inherit its bundled module
+    // search path. Let Windows PowerShell initialize its own standard modules.
+    const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => key.toLowerCase() !== 'psmodulepath'));
+    const { stdout } = await promisify(execFile)('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', wrapper],
+      { windowsHide: true, timeout: 25000, maxBuffer: 256 * 1024, env });
+    const results = JSON.parse(stdout).results.map(value => [value.guardian.enabled, value.guardian.allowForceRestart]);
+    assert.deepEqual(results, [[true, false], [true, false], [false, false], [false, true], [true, true],
+      [true, false], [false, true], [true, false], [false, true], [false, false]]);
+    const persisted = JSON.parse(await fs.readFile(path.join(f.directory, 'mobile-link-guardian-config.json'), 'utf8'));
+    assert.equal(persisted.enabled, false);
+    assert.equal(persisted.allowForceRestart, false);
+  });
 
 test('toggle uses a fixed hidden CLI action and only confirms persisted settings', async t => {
   const f = await fixture(t); const calls = [];

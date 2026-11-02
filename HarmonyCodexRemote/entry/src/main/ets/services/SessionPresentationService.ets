@@ -13,18 +13,7 @@ export interface SessionMarkdownTableData {
   alignments: string[];
 }
 
-export interface SessionToolPresentationItem {
-  id: string;
-  name: string;
-  verb: string;
-  target: string;
-  detail: string;
-  status: string;
-  retryCount?: number;
-  args?: string;
-  taskName?: string;
-  agents?: CodexSessionAgentRef[];
-}
+export interface SessionToolPresentationItem extends CodexSessionToolItem {}
 
 interface InlineToken {
   start: number;
@@ -105,7 +94,7 @@ export function parseSessionMarkdownTable(text: string): SessionMarkdownTableDat
 export function sessionToolPresentationItems(entry: CodexSessionEntry): SessionToolPresentationItem[] {
   const structured = Array.isArray(entry.toolItems) ? entry.toolItems : [];
   if (structured.length > 0) {
-    return structured.slice(0, 50).map((item: CodexSessionToolItem, index: number) => normalizeToolItem(item, index));
+    return structured.map((item: CodexSessionToolItem, index: number) => normalizeToolItem(item, index));
   }
   return legacyToolPresentationItems(entry.text);
 }
@@ -127,6 +116,8 @@ function shouldMergeSessionToolEntries(previous: CodexSessionEntry, entry: Codex
   if (previous.role !== 'tool' || entry.role !== 'tool') {
     return false;
   }
+  if ((previous.toolItems ?? []).some((item: CodexSessionToolItem) => item.name === 'subAgentActivity')
+    || (entry.toolItems ?? []).some((item: CodexSessionToolItem) => item.name === 'subAgentActivity')) return false;
   if (previous.threadId && entry.threadId && previous.threadId !== entry.threadId) {
     return false;
   }
@@ -143,7 +134,6 @@ function mergeSessionToolEntries(previous: CodexSessionEntry, entry: CodexSessio
   );
   const running = items.some((item: CodexSessionToolItem) => item.status === 'running');
   const firstId = items.length > 0 ? items[0].id : 'tool';
-  const lastId = items.length > 0 ? items[items.length - 1].id : 'tool';
   return {
     timestamp: entry.timestamp,
     type: running ? 'tool_call' : 'tool_result',
@@ -152,7 +142,7 @@ function mergeSessionToolEntries(previous: CodexSessionEntry, entry: CodexSessio
     liveKind: entry.liveKind ?? previous.liveKind,
     threadId: entry.threadId ?? previous.threadId,
     turnId: entry.turnId ?? previous.turnId,
-    itemId: `tool-group-${firstId}-${lastId}-${items.length}`,
+    itemId: `tool-group-${JSON.stringify([previous.threadId ?? '', previous.turnId ?? '', firstId])}`,
     toolItems: items
   };
 }
@@ -162,54 +152,57 @@ function mergeSessionToolItems(
   nextItems: SessionToolPresentationItem[]
 ): CodexSessionToolItem[] {
   const merged: CodexSessionToolItem[] = [];
-  const sourceItems = previousItems.concat(nextItems).slice(0, 50);
+  const sourceItems = previousItems.concat(nextItems);
   sourceItems.forEach((source: SessionToolPresentationItem) => {
+    // File-page aggregates change their range and entry type as a call settles.
+    // Its real call identity still denotes one operation across those snapshots.
+    const identityIndex = isLegacyToolItemId(source.id) ? -1
+      : merged.findIndex((item: CodexSessionToolItem) => item.id === source.id);
+    if (identityIndex >= 0) {
+      const previous = merged[identityIndex];
+      const stale = source.status === 'running'
+        && (previous.status === 'completed' || previous.status === 'failed' || previous.status === 'stopped');
+      const combined = copySessionToolItem(stale ? previous : source, stale ? source : previous);
+      combined.id = previous.id;
+      merged[identityIndex] = combined;
+      return;
+    }
     const retryIndex = retryTargetIndex(merged, source);
     if (retryIndex >= 0) {
       const failed = merged[retryIndex];
-      merged[retryIndex] = {
-        id: failed.id,
-        name: source.name,
-        verb: source.verb,
-        target: source.target,
-        detail: retryDetail(failed, source),
-        status: 'completed',
-        retryCount: (failed.retryCount ?? 0) + 1,
-        args: source.args ?? failed.args,
-        taskName: source.taskName ?? failed.taskName,
-        agents: source.agents ?? failed.agents
-      };
+      const retried = copySessionToolItem(source, failed);
+      retried.id = failed.id;
+      retried.detail = retryDetail(failed, source);
+      retried.status = 'completed';
+      retried.retryCount = (failed.retryCount ?? 0) + 1;
+      merged[retryIndex] = retried;
       return;
     }
-    merged.push({
-      id: uniqueToolItemId(merged, source.id),
-      name: source.name,
-      verb: source.verb,
-      target: source.target,
-      detail: source.detail,
-      status: source.status,
-      retryCount: source.retryCount,
-      args: source.args,
-      taskName: source.taskName,
-      agents: source.agents
-    });
+    const appended = copySessionToolItem(source);
+    appended.id = uniqueToolItemId(merged, source.id);
+    merged.push(appended);
   });
   return merged;
 }
 
 function retryTargetIndex(items: CodexSessionToolItem[], candidate: SessionToolPresentationItem): number {
-  if (candidate.status !== 'completed') {
+  if (candidate.status !== 'completed' || !isLegacyToolItemId(candidate.id)) {
     return -1;
   }
   for (let index = items.length - 1; index >= 0; index -= 1) {
     const item = items[index];
     if ((item.status === 'failed' || item.status === 'stopped')
+      && isLegacyToolItemId(item.id)
       && item.name === candidate.name
       && item.target === candidate.target) {
       return index;
     }
   }
   return -1;
+}
+
+function isLegacyToolItemId(id: string): boolean {
+  return id.length === 0 || id.startsWith('legacy-') || /^tool-\d+(?:-\d+)*$/.test(id);
 }
 
 function retryDetail(failed: CodexSessionToolItem, succeeded: SessionToolPresentationItem): string {
@@ -313,10 +306,17 @@ function emphasisTokenAt(value: string, index: number): InlineToken {
   if (marker !== '*' && marker !== '_') {
     return emptyInlineToken();
   }
+  if (marker === '_' && (isEscapedInlineMarker(value, index) || isWordCharacter(value[index - 1]) && isWordCharacter(value[index + 1]))) {
+    return emptyInlineToken();
+  }
   if (value[index + 1] === marker || (index > 0 && value[index - 1] === marker)) {
     return emptyInlineToken();
   }
-  const end = value.indexOf(marker, index + 1);
+  let end = value.indexOf(marker, index + 1);
+  while (marker === '_' && end >= 0
+    && (isEscapedInlineMarker(value, end) || isWordCharacter(value[end - 1]) && isWordCharacter(value[end + 1]))) {
+    end = value.indexOf(marker, end + 1);
+  }
   if (end <= index + 1) {
     return emptyInlineToken();
   }
@@ -327,6 +327,18 @@ function emphasisTokenAt(value: string, index: number): InlineToken {
     text: value.slice(index + 1, end),
     href: ''
   };
+}
+
+function isWordCharacter(value: string | undefined): boolean {
+  return value !== undefined && /^[A-Za-z0-9_]$/.test(value);
+}
+
+function isEscapedInlineMarker(value: string, index: number): boolean {
+  let backslashCount = 0;
+  for (let cursor = index - 1; cursor >= 0 && value.charCodeAt(cursor) === 92; cursor -= 1) {
+    backslashCount += 1;
+  }
+  return backslashCount % 2 === 1;
 }
 
 function emptyInlineToken(): InlineToken {
@@ -378,17 +390,41 @@ function markdownTableAlignment(separator: string): string {
 }
 
 function normalizeToolItem(item: CodexSessionToolItem, index: number): SessionToolPresentationItem {
+  const normalized = copySessionToolItem(item);
+  normalized.id = item.id.length > 0 ? item.id : `tool-${index}`;
+  normalized.verb = item.verb.length > 0 ? item.verb : 'Called';
+  normalized.target = item.target.length > 0 ? item.target : item.name;
+  normalized.status = item.status.length > 0 ? item.status : 'completed';
+  return normalized;
+}
+
+function copySessionToolItem(item: CodexSessionToolItem, fallback?: CodexSessionToolItem): CodexSessionToolItem {
   return {
-    id: item.id.length > 0 ? item.id : `tool-${index}`,
+    id: item.id,
     name: item.name,
-    verb: item.verb.length > 0 ? item.verb : 'Called',
-    target: item.target.length > 0 ? item.target : item.name,
+    verb: item.verb,
+    target: item.target,
     detail: item.detail,
-    status: item.status.length > 0 ? item.status : 'completed',
-    retryCount: item.retryCount,
-    args: item.args,
-    taskName: item.taskName,
-    agents: item.agents
+    status: item.status,
+    retryCount: item.retryCount ?? fallback?.retryCount,
+    args: item.args ?? fallback?.args,
+    displayCommand: item.displayCommand ?? fallback?.displayCommand,
+    taskName: item.taskName ?? fallback?.taskName,
+    agents: item.agents ?? fallback?.agents,
+    agentThreadId: item.agentThreadId ?? fallback?.agentThreadId,
+    agentPath: item.agentPath ?? fallback?.agentPath,
+    kind: item.kind ?? fallback?.kind,
+    model: item.model ?? fallback?.model,
+    reasoningEffort: item.reasoningEffort ?? fallback?.reasoningEffort,
+    source: item.source ?? fallback?.source,
+    pluginId: item.pluginId !== undefined ? item.pluginId : fallback?.pluginId,
+    scriptPath: item.scriptPath !== undefined ? item.scriptPath : fallback?.scriptPath,
+    rawType: item.rawType ?? fallback?.rawType,
+    rawTool: item.rawTool ?? fallback?.rawTool,
+    senderThreadId: item.senderThreadId ?? fallback?.senderThreadId,
+    receiverThreadIds: item.receiverThreadIds ?? fallback?.receiverThreadIds,
+    agentsStates: item.agentsStates ?? fallback?.agentsStates,
+    prompt: item.prompt ?? fallback?.prompt
   };
 }
 

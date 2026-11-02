@@ -357,6 +357,33 @@ function Get-ObjectValue {
   return $property.Value
 }
 
+function Get-HttpErrorStatusCode {
+  param($Exception)
+
+  # 提取 HTTP 状态码，无法识别时返回 0。PS7 是 HttpResponseException（Response 为
+  # HttpResponseMessage），PS5.1 是 WebException（Response 为 HttpWebResponse），
+  # 两者都有 StatusCode；经 PSObject.Properties 读取以兼容 StrictMode 与内层异常。
+  $current = $Exception
+  for ($depth = 0; $null -ne $current -and $depth -lt 4; $depth++) {
+    $responseProperty = $current.PSObject.Properties['Response']
+    if ($null -ne $responseProperty -and $null -ne $responseProperty.Value) {
+      $statusProperty = $responseProperty.Value.PSObject.Properties['StatusCode']
+      if ($null -ne $statusProperty -and $null -ne $statusProperty.Value) {
+        try {
+          return [int]$statusProperty.Value
+        } catch {
+        }
+      }
+    }
+    $innerProperty = $current.PSObject.Properties['InnerException']
+    if ($null -eq $innerProperty) {
+      break
+    }
+    $current = $innerProperty.Value
+  }
+  return 0
+}
+
 function Invoke-JsonSafe {
   param(
     [string]$Uri,
@@ -370,12 +397,14 @@ function Invoke-JsonSafe {
       Ok = $true
       Value = $value
       Error = ''
+      StatusCode = 0
     }
   } catch {
     return [pscustomobject]@{
       Ok = $false
       Value = $null
       Error = $_.Exception.Message
+      StatusCode = (Get-HttpErrorStatusCode -Exception $_.Exception)
     }
   }
 }
@@ -396,6 +425,20 @@ function Stop-ProcessTree {
   }
 }
 
+# 仓库根路径归属匹配 pattern：escaped 根路径（反斜杠/正斜杠两种命令行形式）+ 尾部分隔符。
+# 尾部分隔符防止同前缀兄弟 checkout（如 codex-harmony-local-1.0.14-backup-pre-speedup-20261023）
+# 被连树误杀，与 mobile-link-lifecycle.ps1 Get-MobileLinkOwnedProcesses 的 root\ / root/ 语义一致。
+function Get-RepoPathMatchPattern {
+  param([string]$RepoRoot)
+
+  $normalized = ([string]$RepoRoot).TrimEnd('\', '/')
+  if ([string]::IsNullOrWhiteSpace($normalized)) {
+    # 空根路径永不匹配：宁可漏杀也不能全杀。
+    return '(?!)'
+  }
+  return '(?:' + [Regex]::Escape($normalized) + '|' + [Regex]::Escape($normalized.Replace('\', '/')) + ')[\\/]'
+}
+
 function Get-MatchingProcesses {
   param(
     [string]$Pattern,
@@ -407,7 +450,7 @@ function Get-MatchingProcesses {
   if ($AllProcesses.Count -eq 0) {
     $AllProcesses = @(Get-CimInstance Win32_Process)
   }
-  $escapedRepo = [Regex]::Escape($repoRoot)
+  $escapedRepo = Get-RepoPathMatchPattern -RepoRoot $repoRoot
   return @($AllProcesses | Where-Object {
     $commandLine = [string]$_.CommandLine
     if ($_.ProcessId -eq $PID -or [string]::IsNullOrWhiteSpace($commandLine)) {
@@ -555,7 +598,8 @@ function Get-RepoAncestorProcessId {
     [object[]]$AllProcesses
   )
 
-  $escapedRepo = [Regex]::Escape($repoRoot)
+  # 同 Get-MatchingProcesses：带尾部分隔符匹配，防止同前缀兄弟 checkout 的祖先被误判为本仓库归属。
+  $escapedRepo = Get-RepoPathMatchPattern -RepoRoot $repoRoot
   $seen = @{}
   $currentId = $ProcessId
   while ($currentId -gt 0 -and -not $seen.ContainsKey("$currentId")) {
@@ -902,10 +946,31 @@ function Ensure-BridgeProxy {
   if ($stateProbe.Ok) {
     $bridgePc = [int](Get-ObjectValue -Object $stateProbe.Value.state -Name 'bridgePc' -Fallback 0)
   }
+  # 2026-11-02 anti-ghost: a raw bridgePc>0 can be stale seats left by a dead
+  # process. Only OUR device's fresh (<60s) waiting seats count as "our bridge
+  # is alive"; otherwise start a local bridge-proxy. Legacy relays without the
+  # bridgePool field fall back to the raw count.
+  $ownFreshSeats = 0
+  $poolEntries = $null
+  if ($stateProbe.Ok) {
+    $poolEntries = Get-ObjectValue -Object $stateProbe.Value.state -Name 'bridgePool' -Fallback $null
+  }
+  if ($null -ne $poolEntries) {
+    $localDeviceId = [string](Get-ConfigValue -Config $Config -Name 'DeviceId' -Fallback 'default')
+    foreach ($entry in @($poolEntries)) {
+      if ($null -ne $entry -and
+          [string](Get-ObjectValue -Object $entry -Name 'deviceId' -Fallback '') -eq $localDeviceId -and
+          [int](Get-ObjectValue -Object $entry -Name 'ageMs' -Fallback 999999) -lt 60000) {
+        $ownFreshSeats += 1
+      }
+    }
+  } else {
+    $ownFreshSeats = $bridgePc
+  }
 
-  if (-not $ForceRestart -and $stateProbe.Ok -and $bridgePc -gt 0) {
-    Write-Info "公网 bridge 代理已在线: bridgePc=$bridgePc"
-    Set-StartupStatus -Name 'PublicBridge' -State 'ok' -Message "bridgePc=$bridgePc"
+  if (-not $ForceRestart -and $stateProbe.Ok -and $ownFreshSeats -gt 0) {
+    Write-Info "公网 bridge 代理已在线(本设备新鲜席位): fresh=$ownFreshSeats"
+    Set-StartupStatus -Name 'PublicBridge' -State 'ok' -Message "fresh=$ownFreshSeats"
   } else {
     if (-not $stateProbe.Ok) {
       Write-Warn "公网 relay 状态暂不可读，将尝试补齐 bridge 代理: $($stateProbe.Error)"
@@ -1766,8 +1831,22 @@ function Test-BridgeApi {
 
   Write-Step "验证手机会话 API"
   $headers = Get-BridgeHeaders
-  $health = Wait-BridgeHealth -TimeoutSeconds 10
-  $run = Get-ObjectValue -Object $health -Name 'run' -Fallback $null
+  # 串行收尾不再用 Wait-BridgeHealth 轮询（旧实现在 10s 内多次命中 /health）：短暂
+  # 等待后单发探测，失败时退避补测一次，总等待预算保持在原 ~10s 量级。
+  # HTTP 429 按「限流待定」处理：/health 与 OTP 路由共用按源限流，同源此前密集
+  # 探测后单次 429 不是 bridge 故障，退避让限流窗口冷却后补测一次；两次皆失败
+  # （含两次皆 429）才按原语义抛错，走 trap 落 stack-fatal.log。
+  Start-Sleep -Seconds 1
+  $health = Get-LocalBridgeHealth
+  if (-not $health.Ok) {
+    $backoffSeconds = if ($health.StatusCode -eq 429) { 4 } else { 2 }
+    Start-Sleep -Seconds $backoffSeconds
+    $health = Get-LocalBridgeHealth
+  }
+  if (-not $health.Ok) {
+    throw "Bridge 健康检查失败: $BridgeUrl/health; $($health.Error)"
+  }
+  $run = Get-ObjectValue -Object $health.Value -Name 'run' -Fallback $null
   $runId = Get-ObjectValue -Object $run -Name 'runId' -Fallback 'unknown'
   Write-Info "Bridge health: run=$runId"
 

@@ -10,13 +10,42 @@ export function createRelayServer({
   const pendingPc = new Map();
   const activeHdc = new Map();
   const bridgePc = [];
+  const controlPc = new Map();
+  const sockets = new Set();
+  // 2026-11-02 anti-zombie: waiting pool entries have a hard TTL. Live clients
+  // recycle their waiting sockets every <=30s (bridgeProxy waitingSocketTtlMs),
+  // so any entry older than bridgeGraceMs is a dead peer that never sent FIN.
+  const bridgeGraceMs = 75000;
+  let reapTimer = null;
+
+  function reapStaleBridgeEntries() {
+    const now = Date.now();
+    const reapPool = (pool) => {
+      for (const item of [...pool]) {
+        if (item.registeredAt && now - item.registeredAt > bridgeGraceMs) {
+          if (process.env.HDC_RELAY_DEBUG === '1') {
+            console.error(`[hdc-relay] reap stale waiting entry device=${item.deviceId ?? 'default'} ageMs=${now - item.registeredAt}`);
+          }
+          item.socket.destroy();
+          removeBridgePc(item, pool);
+        }
+      }
+    };
+    reapPool(bridgePc);
+    for (const pool of controlPc.values()) {
+      reapPool(pool);
+    }
+  }
 
   const server = net.createServer((socket) => {
+    sockets.add(socket);
+    socket.once('close', () => sockets.delete(socket));
     void handleConnection(socket);
   });
 
   async function handleConnection(socket) {
     socket.setNoDelay(true);
+    socket.setKeepAlive(true, 30000);
     socket.on('error', () => {});
     let parsed;
     try {
@@ -36,7 +65,7 @@ export function createRelayServer({
           registerRelayAdminHttp(socket, line);
           return;
         }
-        registerBridgeHttp(socket, Buffer.concat([lineBuffer, rest]));
+        registerBridgeHttp(socket, line, Buffer.concat([lineBuffer, rest]));
         return;
       }
       socket.destroy();
@@ -59,6 +88,16 @@ export function createRelayServer({
     }
     if (hello.role === 'bridge-pc') {
       registerBridgePc(socket, hello, rest);
+      return;
+    }
+    if (hello.role === 'control-pc') {
+      if (typeof hello.targetId !== 'string' || !/^[a-zA-Z0-9_-]{1,64}$/.test(hello.targetId)) {
+        socket.end(`${JSON.stringify({ ok: false, error: 'invalid targetId' })}\n`);
+        return;
+      }
+      const pool = controlPc.get(hello.targetId) ?? [];
+      controlPc.set(hello.targetId, pool);
+      registerBridgePc(socket, hello, rest, pool);
       return;
     }
 
@@ -104,7 +143,7 @@ export function createRelayServer({
 
   function writeHttpJson(socket, statusCode, body) {
     const text = JSON.stringify(body);
-    const statusText = statusCode === 200 ? 'OK' : 'Unauthorized';
+    const statusText = { 200: 'OK', 400: 'Bad Request', 401: 'Unauthorized', 503: 'Service Unavailable' }[statusCode];
     socket.end([
       `HTTP/1.1 ${statusCode} ${statusText}`,
       'content-type: application/json; charset=utf-8',
@@ -117,11 +156,20 @@ export function createRelayServer({
   }
 
   function currentState() {
+    const now = Date.now();
+    const describe = (item) => ({
+      deviceId: item.deviceId ?? 'default',
+      instanceId: item.instanceId ?? '',
+      ageMs: now - (item.registeredAt ?? now)
+    });
     return {
       phones: [...phones.keys()],
       pendingPc: [...pendingPc.keys()],
       activeHdc: [...activeHdc.keys()],
-      bridgePc: bridgePc.length
+      bridgePc: bridgePc.length,
+      bridgePool: bridgePc.map(describe),
+      controlPc: [...controlPc.values()].reduce((count, pool) => count + pool.length, 0),
+      controlPool: Object.fromEntries([...controlPc.entries()].map(([targetId, pool]) => [targetId, pool.map(describe)]))
     };
   }
 
@@ -195,15 +243,37 @@ export function createRelayServer({
     });
   }
 
-  function registerBridgePc(socket, hello, rest) {
+  function registerBridgePc(socket, hello, rest, pool = bridgePc) {
     socket.on('error', () => {});
     const channelId = createChannelId();
-    const item = { socket, rest, channelId };
-    bridgePc.push(item);
+    const deviceId = String(hello.deviceId ?? 'default');
+    const instanceId = String(hello.instanceId ?? '');
+    // 2026-11-02 anti-zombie: a fresh process for the same device evicts every
+    // waiting entry left by an older process instance. Prevents ghost piles
+    // after stack restarts (client recycles sockets every 30s with the same
+    // instanceId, so this never touches a live pool).
+    if (instanceId) {
+      for (const otherPool of [bridgePc, ...controlPc.values()]) {
+        for (const other of [...otherPool]) {
+          if (other.deviceId === deviceId && other.instanceId && other.instanceId !== instanceId) {
+            other.socket.destroy();
+            removeBridgePc(other, otherPool);
+          }
+        }
+      }
+    }
+    const item = { socket, rest, channelId, deviceId, instanceId, registeredAt: Date.now() };
+    pool.push(item);
     writeJsonLine(socket, { ok: true, mode: 'waiting', channelId });
 
-    socket.on('close', () => removeBridgePc(item));
-    socket.on('error', () => removeBridgePc(item));
+    const cleanup = () => {
+      removeBridgePc(item, pool);
+      if (hello.role === 'control-pc' && pool.length === 0 && controlPc.get(hello.targetId) === pool) {
+        controlPc.delete(hello.targetId);
+      }
+    };
+    socket.on('close', cleanup);
+    socket.on('error', cleanup);
   }
 
   function rememberActiveHdc(deviceId, phoneSocket, pcSocket) {
@@ -225,10 +295,38 @@ export function createRelayServer({
     pcSocket.on('error', cleanup);
   }
 
-  function registerBridgeHttp(socket, initialData) {
+  function registerBridgeHttp(socket, line, initialData) {
     socket.on('error', () => {});
-    const waiting = bridgePc.shift();
+    const requestTarget = line.split(/\s+/)[1];
+    // Match the raw origin-form path: URL normalization must never change a target.
+    const controlMatch = requestTarget.match(/^\/control\/v1\/targets\/([a-zA-Z0-9_-]{1,64})\/[^\s?#]*(?:\?[^\s#]*)?$/);
+    let isControl = requestTarget.startsWith('/control');
+    try {
+      const pathname = new URL(requestTarget, 'http://relay.local').pathname;
+      isControl ||= pathname.startsWith('/control');
+      isControl ||= decodeURIComponent(pathname).startsWith('/control');
+      if (controlMatch && (pathname !== requestTarget.split('?')[0] || /[\\]/.test(decodeURIComponent(pathname)))) {
+        writeHttpJson(socket, 400, { ok: false, code: 'invalid_control_path' });
+        return;
+      }
+    } catch {
+      if (isControl) {
+        writeHttpJson(socket, 400, { ok: false, code: 'invalid_control_path' });
+        return;
+      }
+    }
+    if (isControl && !controlMatch) {
+      writeHttpJson(socket, 400, { ok: false, code: 'invalid_control_path' });
+      return;
+    }
+    const pool = controlMatch ? controlPc.get(controlMatch[1]) : bridgePc;
+    const waiting = pool?.shift();
+    if (controlMatch && pool?.length === 0) controlPc.delete(controlMatch[1]);
     if (!waiting) {
+      if (isControl) {
+        writeHttpJson(socket, 503, { ok: false, code: 'control_agent_offline' });
+        return;
+      }
       socket.end([
         'HTTP/1.1 503 Service Unavailable',
         'content-type: application/json; charset=utf-8',
@@ -243,10 +341,10 @@ export function createRelayServer({
     pipeBoth(socket, waiting.socket, initialData, waiting.rest);
   }
 
-  function removeBridgePc(item) {
-    const index = bridgePc.indexOf(item);
+  function removeBridgePc(item, pool) {
+    const index = pool.indexOf(item);
     if (index >= 0) {
-      bridgePc.splice(index, 1);
+      pool.splice(index, 1);
     }
   }
 
@@ -255,19 +353,25 @@ export function createRelayServer({
     listen() {
       return new Promise((resolve) => {
         server.listen(port, host, resolve);
+        if (!reapTimer) {
+          reapTimer = setInterval(() => reapStaleBridgeEntries(), 20000);
+          reapTimer.unref?.();
+        }
       });
     },
     close() {
-      for (const socket of phones.values()) {
+      if (reapTimer) {
+        clearInterval(reapTimer);
+        reapTimer = null;
+      }
+      for (const socket of sockets) {
         socket.destroy();
       }
-      for (const item of pendingPc.values()) {
-        item.socket.destroy();
-      }
-      for (const item of activeHdc.values()) {
-        item.phoneSocket.destroy();
-        item.pcSocket.destroy();
-      }
+      phones.clear();
+      pendingPc.clear();
+      activeHdc.clear();
+      bridgePc.length = 0;
+      controlPc.clear();
       return new Promise((resolve) => server.close(resolve));
     },
     state() {
